@@ -1,0 +1,41 @@
+[proxy]
+# 代理地址，例如 "socks5://127.0.0.1:1080"
+url = ""
+
+[auth]
+api_key     = ""
+api_secret  = ""
+passphrase  = ""
+private_key = ""   # EIP-712 签名私钥（0x 开头）
+funder      = ""   # 钱包地址
+
+[order]
+enabled   = false  # 改为 true 才会真正下单
+size_usdc = 10.0   # 每次套利投入的 USDC 总量
+
+[mid_requote]
+enabled = true
+file = "mid.csv"
+
+[app]
+# 日志文件名
+log_file = "alerts.log"
+# 资产配置文件名
+assets_file = "assets.csv"
+# 触发告警所需的最小套利空间：1 - (ask0 + ask1) > min_diff
+min_diff = 0.01
+# 单个 token 的最大价差上限（ask - bid），超过则跳过
+max_spread = 0.05
+# bid/ask 的有效价格区间，超出则跳过
+min_price = 0.02
+max_price = 0.98
+# 默认订阅连接数（未配置 topic 时使用）
+default_threads = 3
+# 监控报告打印间隔（秒）
+monitor_interval_secs = 30
+
+# 每个主题的订阅线程数，未列出的主题使用 default_threads
+[topic_threads]
+# cs = 2
+# sports = 4
+us_iran=1

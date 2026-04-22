@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "mcp__ide__getDiagnostics",
+      "Bash(cargo check *)"
+    ]
+  }
+}
