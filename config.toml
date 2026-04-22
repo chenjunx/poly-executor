@@ -18,8 +18,10 @@ enabled = true
 file = "mid.csv"
 
 [app]
-# 日志文件名
+# 告警日志文件名
 log_file = "alerts.log"
+# 订单日志文件名
+order_log_file = "orders.log"
 # 资产配置文件名
 assets_file = "assets.csv"
 # 触发告警所需的最小套利空间：1 - (ask0 + ask1) > min_diff

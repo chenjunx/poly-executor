@@ -1,6 +1,9 @@
 mod dispatcher;
 mod logging;
 mod market;
+mod order;
+mod order_ws;
+mod positions;
 mod price_store;
 mod proxy_ws;
 mod strategies;
@@ -8,15 +11,22 @@ mod strategy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use serde::Deserialize;
+
+use dashmap::DashMap;
+
 use config::{Config, File};
 use polymarket_client_sdk::types::Decimal;
-use tracing::{info, warn};
+use serde::Deserialize;
+use tracing::info;
 
 use dispatcher::Dispatcher;
+use positions::PositionRefreshTrigger;
 use strategies::mid_requote::MidRequoteStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
-use strategy::{build_token_topics, merge_topic_tokens, Filters, OrderSignal, Strategy, StrategyHandle};
+use strategy::{
+    build_token_topics, merge_topic_tokens, Filters, OrderCorrelationMap, OrderSignal, Strategy,
+    StrategyHandle,
+};
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -38,6 +48,7 @@ struct ProxySettings {
 #[derive(Debug, Deserialize)]
 struct AppSettings {
     log_file: String,
+    order_log_file: String,
     assets_file: String,
     min_diff: f64,
     max_spread: f64,
@@ -47,7 +58,7 @@ struct AppSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct AuthConfig {
+pub(crate) struct AuthConfig {
     api_key: String,
     api_secret: String,
     passphrase: String,
@@ -56,7 +67,7 @@ struct AuthConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct OrderConfig {
+pub(crate) struct OrderConfig {
     enabled: bool,
     size_usdc: f64,
 }
@@ -71,7 +82,6 @@ struct MidRequoteConfig {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. 加载配置
     let config_path = if std::path::Path::new("config.toml").exists() {
         "config.toml".to_string()
     } else if let Ok(mut exe_path) = std::env::current_exe() {
@@ -82,30 +92,50 @@ async fn main() -> anyhow::Result<()> {
         "config.toml".to_string()
     };
 
+    let local_config_path = if std::path::Path::new("config.local.toml").exists() {
+        "config.local.toml".to_string()
+    } else if let Ok(mut exe_path) = std::env::current_exe() {
+        exe_path.pop();
+        exe_path.push("config.local.toml");
+        exe_path.to_string_lossy().to_string()
+    } else {
+        "config.local.toml".to_string()
+    };
+
     let settings = Config::builder()
         .add_source(File::with_name(&config_path).required(false))
+        .add_source(File::with_name(&local_config_path).required(false))
         .build()?;
     let app_config: AppConfig = settings.try_deserialize()?;
 
-    // 2. 查找日志文件路径 (确保使用绝对路径)
     let log_filename = if !app_config.app.log_file.is_empty() {
         &app_config.app.log_file
     } else {
         "alerts.log"
     };
-
-    let log_path_obj = std::path::Path::new(log_filename);
-    let log_path = if log_path_obj.is_absolute() {
-        log_filename.to_string()
-    } else if let Ok(mut exe_path) = std::env::current_exe() {
-        exe_path.pop();
-        exe_path.push(log_filename);
-        exe_path.to_string_lossy().to_string()
+    let order_log_filename = if !app_config.app.order_log_file.is_empty() {
+        &app_config.app.order_log_file
     } else {
-        log_filename.to_string()
+        "orders.log"
     };
 
-    let _log_guards = logging::init_logging(&log_path)?;
+    let resolve_log_path = |filename: &str| {
+        let path_obj = std::path::Path::new(filename);
+        if path_obj.is_absolute() {
+            filename.to_string()
+        } else if let Ok(mut exe_path) = std::env::current_exe() {
+            exe_path.pop();
+            exe_path.push(filename);
+            exe_path.to_string_lossy().to_string()
+        } else {
+            filename.to_string()
+        }
+    };
+
+    let log_path = resolve_log_path(log_filename);
+    let order_log_path = resolve_log_path(order_log_filename);
+
+    let _log_guards = logging::init_logging(&log_path, &order_log_path)?;
 
     let dec = |v: f64| Decimal::try_from(v).unwrap_or_default();
     let filters = Arc::new(Filters {
@@ -120,8 +150,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "assets.csv"
     };
-    let (pair_strategy, pair_registration) =
-        PairArbitrageStrategy::from_config(filters.clone(), assets_file)?;
+    let pair_strategy = PairArbitrageStrategy::from_config(filters.clone(), assets_file)?;
+    let pair_registration = pair_strategy.registration().clone();
 
     let mid_file = if !app_config.mid_requote.file.is_empty() {
         app_config.mid_requote.file.as_str()
@@ -135,8 +165,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut registrations = vec![pair_registration.clone()];
-    if let Some((_, registration)) = &mid_requote {
-        registrations.push(registration.clone());
+    if let Some(strategy) = &mid_requote {
+        registrations.push(strategy.registration().clone());
     }
 
     let topic_tokens = Arc::new(merge_topic_tokens(&registrations));
@@ -158,29 +188,39 @@ async fn main() -> anyhow::Result<()> {
     let default_threads = app_config.app.default_threads.max(1);
 
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * topic_tokens.len().max(1));
-    let (market_tx, market_rx) = tokio::sync::mpsc::channel(1024);
-    let (order_tx, mut order_rx) = tokio::sync::mpsc::channel::<OrderSignal>(64);
+    let (strategy_tx, strategy_rx) = tokio::sync::mpsc::channel(1024);
+    let (order_tx, order_rx) = tokio::sync::mpsc::channel::<OrderSignal>(64);
+    let (positions_refresh_tx, positions_refresh_rx) = tokio::sync::mpsc::channel(64);
+    let order_correlations: OrderCorrelationMap = Arc::new(DashMap::new());
 
     let (pair_tx, pair_rx) = tokio::sync::mpsc::channel(256);
     let mut strategy_handles = vec![StrategyHandle {
         name: pair_registration.name.clone(),
         topics: pair_registration.topics.clone(),
+        related_tokens: pair_registration.related_tokens.clone(),
         tx: pair_tx,
     }];
 
     pair_strategy.spawn(pair_rx, order_tx.clone());
 
-    if let Some((mid_requote_strategy, mid_requote_registration)) = mid_requote {
+    if let Some(mid_requote_strategy) = mid_requote {
+        let mid_requote_registration = mid_requote_strategy.registration().clone();
         let (mid_requote_tx, mid_requote_rx) = tokio::sync::mpsc::channel(256);
         strategy_handles.push(StrategyHandle {
             name: mid_requote_registration.name.clone(),
             topics: mid_requote_registration.topics.clone(),
+            related_tokens: mid_requote_registration.related_tokens.clone(),
             tx: mid_requote_tx,
         });
         mid_requote_strategy.spawn(mid_requote_rx, order_tx.clone());
     }
-    tokio::spawn(Dispatcher::new(strategy_handles).run(market_rx));
-    tokio::spawn(market::run(token_topics.clone(), ws_rx, market_tx));
+    tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
+    tokio::spawn(market::run(token_topics.clone(), ws_rx, strategy_tx.clone()));
+    tokio::spawn(positions::run(
+        app_config.auth.clone(),
+        positions_refresh_rx,
+        strategy_tx.clone(),
+    ));
 
     {
         let topic_tokens = topic_tokens.clone();
@@ -197,83 +237,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    {
-        let auth = app_config.auth.clone();
-        let order_cfg = app_config.order.clone();
-        tokio::spawn(async move {
-            while let Some(signal) = order_rx.recv().await {
-                match &signal {
-                    OrderSignal::PairArbitrage { .. } => {
-                        if !order_cfg.enabled {
-                            continue;
-                        }
-                        if let Err(e) = place_order(&auth, &order_cfg, &signal).await {
-                            warn!(error = %e, "下单失败");
-                        }
-                    }
-                    OrderSignal::MidRequote {
-                        topic,
-                        token,
-                        mid,
-                        buy_price,
-                        sell_price,
-                        cancelled_order_ids,
-                        new_order_ids,
-                    } => {
-                        info!(
-                            target: "alerts",
-                            topic = %topic,
-                            token = %token,
-                            mid = %mid,
-                            buy_price = %buy_price,
-                            sell_price = %sell_price,
-                            cancelled_orders = ?cancelled_order_ids,
-                            new_orders = ?new_order_ids,
-                            "mid_requote 模拟撤单并重挂"
-                        );
-                    }
-                }
-            }
-        });
+    tokio::spawn(order::run(
+        order_rx,
+        app_config.auth.clone(),
+        app_config.order.clone(),
+        order_correlations.clone(),
+        positions_refresh_tx.clone(),
+    ));
+
+    let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::Startup);
+
+    if app_config.order.enabled {
+        tokio::spawn(order_ws::run(
+            app_config.auth.clone(),
+            order_correlations.clone(),
+            positions_refresh_tx.clone(),
+        ));
     }
 
     futures::future::pending::<()>().await;
-    Ok(())
-}
-
-/// 执行套利下单：同时买入 token0 和 token1。
-/// 认证信息从 AuthConfig 读取，下单数量从 OrderConfig 读取。
-async fn place_order(
-    auth: &AuthConfig,
-    cfg: &OrderConfig,
-    signal: &OrderSignal,
-) -> anyhow::Result<()> {
-    let OrderSignal::PairArbitrage {
-        token0,
-        token1,
-        ask0,
-        ask1,
-        gap,
-    } = signal else {
-        anyhow::bail!("place_order 只支持 PairArbitrage 信号");
-    };
-
-    info!(
-        gap = %gap,
-        token0 = %&token0[..12],
-        ask0 = %ask0,
-        token1 = %&token1[..12],
-        ask1 = %ask1,
-        size_usdc = cfg.size_usdc,
-        "提交下单信号"
-    );
-
-    // TODO: 调用 Polymarket CLOB REST API 下单
-    // 认证字段：auth.api_key / auth.api_secret / auth.passphrase
-    //           auth.private_key（用于 EIP-712 签名）/ auth.funder
-    // 下单参数：token0 / token1 / ask0 / ask1
-    //           cfg.size_usdc（总 USDC 金额，按价格折算成 token 数量）
-    let _ = auth;
-
     Ok(())
 }

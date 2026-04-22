@@ -3,7 +3,13 @@
     "allow": [
       "Bash(cargo build *)",
       "mcp__ide__getDiagnostics",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "Bash(git status --short)",
+      "Bash(git rev-parse HEAD)",
+      "Bash(git remote get-url origin)",
+      "Bash(bash scripts/deploy_prod.sh *)",
+      "Bash(bash scripts/ops_prod.sh *)",
+      "Bash(bash scripts/remote_bootstrap_prod.sh *)"
     ]
   }
 }

@@ -10,21 +10,18 @@ const PRICE_SCALE: u32 = 10_000;
 
 use crate::price_store::PriceStore;
 use crate::strategy::{
-    Filters, MarketEvent, OrderSignal, PairEntry, Strategy, StrategyRegistration,
+    Filters, OrderSignal, PairEntry, Strategy, StrategyEvent, StrategyRegistration,
     TopicRegistration,
 };
 
 pub struct PairArbitrageStrategy {
     filters: Arc<Filters>,
     pairs_by_topic: Arc<HashMap<Arc<str>, Arc<[PairEntry]>>>,
-    asset_ids: Arc<[String]>,
+    registration: Arc<StrategyRegistration>,
 }
 
 impl PairArbitrageStrategy {
-    pub fn from_config(
-        filters: Arc<Filters>,
-        assets_file: &str,
-    ) -> anyhow::Result<(Self, StrategyRegistration)> {
+    pub fn from_config(filters: Arc<Filters>, assets_file: &str) -> anyhow::Result<Self> {
         let assets_path = Path::new(assets_file);
         let csv_path = if assets_path.is_absolute() {
             assets_file.to_string()
@@ -105,18 +102,18 @@ impl PairArbitrageStrategy {
         let mut asset_ids: Vec<String> = asset_ids.into_iter().collect();
         asset_ids.sort();
 
-        let strategy = Self {
-            filters,
-            pairs_by_topic,
-            asset_ids: Arc::<[String]>::from(asset_ids),
-        };
-        let registration = StrategyRegistration {
-            name: Arc::from(strategy.name()),
+        let registration = Arc::new(StrategyRegistration {
+            name: Arc::from("pair_arbitrage"),
             topics: Arc::<[Arc<str>]>::from(subscriptions),
             topic_tokens: Arc::<[TopicRegistration]>::from(topic_token_regs),
-        };
+            related_tokens: Arc::<[String]>::from(asset_ids),
+        });
 
-        Ok((strategy, registration))
+        Ok(Self {
+            filters,
+            pairs_by_topic,
+            registration,
+        })
     }
 }
 
@@ -125,29 +122,42 @@ impl Strategy for PairArbitrageStrategy {
         "pair_arbitrage"
     }
 
+    fn registration(&self) -> &StrategyRegistration {
+        self.registration.as_ref()
+    }
+
     fn spawn(
         self,
-        mut rx: tokio::sync::mpsc::Receiver<MarketEvent>,
+        mut rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
         order_tx: tokio::sync::mpsc::Sender<OrderSignal>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let store = PriceStore::new();
-            store.register(self.asset_ids.as_ref());
+            store.register(self.registration.related_tokens.as_ref());
 
             while let Some(event) = rx.recv().await {
-                let updated = store.apply(event.asset_id.as_ref(), event.book);
-                if updated.is_empty() {
-                    continue;
-                }
+                match event {
+                    StrategyEvent::Market(event) => {
+                        let updated = store.apply(event.asset_id.as_ref(), event.book);
+                        if updated.is_empty() {
+                            continue;
+                        }
 
-                check_pairs(
-                    &store,
-                    &self.pairs_by_topic,
-                    &self.filters,
-                    &event.topic,
-                    &updated,
-                    &order_tx,
-                );
+                        check_pairs(
+                            &store,
+                            &self.pairs_by_topic,
+                            &self.filters,
+                            &event.topic,
+                            &updated,
+                            &order_tx,
+                        );
+                    }
+                    StrategyEvent::Positions(update) => {
+                        let Some(_update) = self.relevant_positions(&update) else {
+                            continue;
+                        };
+                    }
+                }
             }
         })
     }

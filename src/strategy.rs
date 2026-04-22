@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use polymarket_client_sdk::types::Decimal;
 
 #[derive(Clone)]
@@ -9,6 +11,12 @@ pub struct Filters {
     pub max_spread: Decimal,
     pub min_price: Decimal,
     pub max_price: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteSide {
+    Buy,
+    Sell,
 }
 
 #[derive(Debug, Clone)]
@@ -24,11 +32,68 @@ pub enum OrderSignal {
         topic: Arc<str>,
         token: String,
         mid: Decimal,
-        buy_price: Decimal,
-        sell_price: Decimal,
+        side: QuoteSide,
+        price: Decimal,
         cancelled_order_ids: Arc<[String]>,
         new_order_ids: Arc<[String]>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum UnifiedOrder {
+    PairArbitrage {
+        token0: String,
+        token1: String,
+        ask0: Decimal,
+        ask1: Decimal,
+        gap: Decimal,
+    },
+    MidRequote {
+        topic: Arc<str>,
+        token: String,
+        mid: Decimal,
+        side: QuoteSide,
+        price: Decimal,
+        cancelled_order_ids: Arc<[String]>,
+        new_order_ids: Arc<[String]>,
+    },
+}
+
+impl From<OrderSignal> for UnifiedOrder {
+    fn from(signal: OrderSignal) -> Self {
+        match signal {
+            OrderSignal::PairArbitrage {
+                token0,
+                token1,
+                ask0,
+                ask1,
+                gap,
+            } => Self::PairArbitrage {
+                token0,
+                token1,
+                ask0,
+                ask1,
+                gap,
+            },
+            OrderSignal::MidRequote {
+                topic,
+                token,
+                mid,
+                side,
+                price,
+                cancelled_order_ids,
+                new_order_ids,
+            } => Self::MidRequote {
+                topic,
+                token,
+                mid,
+                side,
+                price,
+                cancelled_order_ids,
+                new_order_ids,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +118,41 @@ pub struct MarketEvent {
     pub book: CleanOrderbook,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionView {
+    pub asset_id: String,
+    pub size: Decimal,
+    pub avg_price: Decimal,
+    pub cur_price: Decimal,
+    pub current_value: Decimal,
+    pub cash_pnl: Decimal,
+    pub title: Arc<str>,
+    pub outcome: Arc<str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionSnapshot {
+    pub by_asset: Arc<HashMap<String, PositionView>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionsUpdateEvent {
+    pub snapshot: Arc<PositionSnapshot>,
+    pub changed_assets: Arc<[String]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelevantPositionsUpdate {
+    pub snapshot: Arc<PositionSnapshot>,
+    pub changed_assets: Arc<[String]>,
+}
+
+#[derive(Debug, Clone)]
+pub enum StrategyEvent {
+    Market(MarketEvent),
+    Positions(PositionsUpdateEvent),
+}
+
 #[derive(Debug, Clone)]
 pub struct TopicRegistration {
     pub topic: Arc<str>,
@@ -64,13 +164,15 @@ pub struct StrategyRegistration {
     pub name: Arc<str>,
     pub topics: Arc<[Arc<str>]>,
     pub topic_tokens: Arc<[TopicRegistration]>,
+    pub related_tokens: Arc<[String]>,
 }
 
 #[derive(Clone)]
 pub struct StrategyHandle {
     pub name: Arc<str>,
     pub topics: Arc<[Arc<str>]>,
-    pub tx: tokio::sync::mpsc::Sender<MarketEvent>,
+    pub related_tokens: Arc<[String]>,
+    pub tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 }
 
 pub fn merge_topic_tokens(
@@ -110,11 +212,46 @@ pub fn build_token_topics(
         .collect()
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalOrderMeta {
+    pub local_order_id: String,
+    pub strategy: Arc<str>,
+    pub topic: Option<Arc<str>>,
+    pub token: String,
+    pub side: QuoteSide,
+    pub price: Decimal,
+}
+
+pub type OrderCorrelationMap = Arc<DashMap<String, LocalOrderMeta>>;
+
 pub trait Strategy: Send + 'static {
     fn name(&self) -> &str;
+    fn registration(&self) -> &StrategyRegistration;
+
+    fn relevant_positions(
+        &self,
+        event: &PositionsUpdateEvent,
+    ) -> Option<RelevantPositionsUpdate> {
+        let related_tokens = &self.registration().related_tokens;
+        let changed_assets: Vec<String> = event
+            .changed_assets
+            .iter()
+            .filter(|asset| related_tokens.iter().any(|token| token == *asset))
+            .cloned()
+            .collect();
+        if changed_assets.is_empty() {
+            return None;
+        }
+
+        Some(RelevantPositionsUpdate {
+            snapshot: event.snapshot.clone(),
+            changed_assets: changed_assets.into(),
+        })
+    }
+
     fn spawn(
         self,
-        rx: tokio::sync::mpsc::Receiver<MarketEvent>,
+        rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
         order_tx: tokio::sync::mpsc::Sender<OrderSignal>,
     ) -> tokio::task::JoinHandle<()>;
 }

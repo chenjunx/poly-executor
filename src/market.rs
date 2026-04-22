@@ -8,7 +8,7 @@ use polymarket_client_sdk::types::Decimal;
 use tracing::{info, warn};
 
 use crate::proxy_ws;
-use crate::strategy::{CleanOrderbook, MarketEvent};
+use crate::strategy::{CleanOrderbook, MarketEvent, StrategyEvent};
 
 pub async fn spawn_subscriptions(
     topic_groups: &HashMap<Arc<str>, Vec<String>>,
@@ -82,7 +82,7 @@ pub async fn spawn_subscriptions(
 pub async fn run(
     token_topics: Arc<HashMap<String, Arc<[Arc<str>]>>>,
     mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
-    market_tx: tokio::sync::mpsc::Sender<MarketEvent>,
+    market_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 ) {
     while let Some(msg) = ws_rx.recv().await {
         let Some((asset_id, book)) = extract_clean_orderbook(&msg) else {
@@ -95,11 +95,11 @@ pub async fn run(
 
         for topic in topics.iter().cloned() {
             if market_tx
-                .send(MarketEvent {
+                .send(StrategyEvent::Market(MarketEvent {
                     topic,
                     asset_id: asset_id.clone(),
                     book,
-                })
+                }))
                 .await
                 .is_err()
             {
