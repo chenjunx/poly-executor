@@ -23,7 +23,7 @@ pub struct StoredOrder {
     pub token: String,
     pub side: QuoteSide,
     pub price: Decimal,
-    pub min_order_size: Decimal,
+    pub order_size: Decimal,
     pub status: String,
     pub last_mid: Option<Decimal>,
 }
@@ -33,6 +33,11 @@ pub struct StoredMidRequoteState {
     pub token: String,
     pub topic: String,
     pub active_local_order_id: Option<String>,
+    pub pending_local_order_id: Option<String>,
+    pub pending_side: Option<QuoteSide>,
+    pub pending_price: Option<Decimal>,
+    pub pending_order_size: Option<Decimal>,
+    pub pending_mid: Option<Decimal>,
     pub last_mid: Option<Decimal>,
     pub last_best_bid: Option<Decimal>,
     pub last_best_ask: Option<Decimal>,
@@ -49,7 +54,7 @@ impl StoredOrder {
             token: self.token.clone(),
             side: self.side,
             price: self.price,
-            min_order_size: self.min_order_size,
+            order_size: self.order_size,
         }
     }
 }
@@ -96,6 +101,11 @@ impl OrderStore {
                     token TEXT PRIMARY KEY,
                     topic TEXT NOT NULL,
                     active_local_order_id TEXT,
+                    pending_local_order_id TEXT,
+                    pending_side TEXT,
+                    pending_price TEXT,
+                    pending_order_size TEXT,
+                    pending_mid TEXT,
                     last_mid TEXT,
                     last_best_bid TEXT,
                     last_best_ask TEXT,
@@ -104,6 +114,11 @@ impl OrderStore {
                 );
                 ",
             )?;
+            ensure_column(conn, "strategy_state_mid_requote", "pending_local_order_id", "TEXT")?;
+            ensure_column(conn, "strategy_state_mid_requote", "pending_side", "TEXT")?;
+            ensure_column(conn, "strategy_state_mid_requote", "pending_price", "TEXT")?;
+            ensure_column(conn, "strategy_state_mid_requote", "pending_order_size", "TEXT")?;
+            ensure_column(conn, "strategy_state_mid_requote", "pending_mid", "TEXT")?;
             Ok(())
         })
     }
@@ -142,7 +157,7 @@ impl OrderStore {
                     meta.token,
                     side_to_str(meta.side),
                     meta.price.to_string(),
-                    meta.min_order_size.to_string(),
+                    meta.order_size.to_string(),
                     status,
                     last_mid.map(|value| value.to_string()),
                     now,
@@ -230,6 +245,11 @@ impl OrderStore {
         token: &str,
         topic: &str,
         active_local_order_id: Option<&str>,
+        pending_local_order_id: Option<&str>,
+        pending_side: Option<QuoteSide>,
+        pending_price: Option<Decimal>,
+        pending_order_size: Option<Decimal>,
+        pending_mid: Option<Decimal>,
         last_mid: Option<Decimal>,
         last_best_bid: Option<Decimal>,
         last_best_ask: Option<Decimal>,
@@ -240,12 +260,18 @@ impl OrderStore {
             conn.execute(
                 "
                 INSERT INTO strategy_state_mid_requote (
-                    token, topic, active_local_order_id, last_mid, last_best_bid,
+                    token, topic, active_local_order_id, pending_local_order_id, pending_side,
+                    pending_price, pending_order_size, pending_mid, last_mid, last_best_bid,
                     last_best_ask, last_position_size, updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(token) DO UPDATE SET
                     topic = excluded.topic,
                     active_local_order_id = excluded.active_local_order_id,
+                    pending_local_order_id = excluded.pending_local_order_id,
+                    pending_side = excluded.pending_side,
+                    pending_price = excluded.pending_price,
+                    pending_order_size = excluded.pending_order_size,
+                    pending_mid = excluded.pending_mid,
                     last_mid = excluded.last_mid,
                     last_best_bid = excluded.last_best_bid,
                     last_best_ask = excluded.last_best_ask,
@@ -256,6 +282,11 @@ impl OrderStore {
                     token,
                     topic,
                     active_local_order_id,
+                    pending_local_order_id,
+                    pending_side.map(side_to_str),
+                    pending_price.map(|value| value.to_string()),
+                    pending_order_size.map(|value| value.to_string()),
+                    pending_mid.map(|value| value.to_string()),
                     last_mid.map(|value| value.to_string()),
                     last_best_bid.map(|value| value.to_string()),
                     last_best_ask.map(|value| value.to_string()),
@@ -286,7 +317,7 @@ impl OrderStore {
                     token: row.get(4)?,
                     side: side_from_str(&row.get::<_, String>(5)?).map_err(to_sql_error)?,
                     price: decimal_from_str(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
-                    min_order_size: decimal_from_str(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
+                    order_size: decimal_from_str(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
                     status: row.get(8)?,
                     last_mid: row
                         .get::<_, Option<String>>(9)?
@@ -302,7 +333,8 @@ impl OrderStore {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "
-                SELECT token, topic, active_local_order_id, last_mid, last_best_bid,
+                SELECT token, topic, active_local_order_id, pending_local_order_id, pending_side,
+                       pending_price, pending_order_size, pending_mid, last_mid, last_best_bid,
                        last_best_ask, last_position_size
                 FROM strategy_state_mid_requote
                 ",
@@ -312,19 +344,36 @@ impl OrderStore {
                     token: row.get(0)?,
                     topic: row.get(1)?,
                     active_local_order_id: row.get(2)?,
-                    last_mid: row
-                        .get::<_, Option<String>>(3)?
-                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
-                        .transpose()?,
-                    last_best_bid: row
+                    pending_local_order_id: row.get(3)?,
+                    pending_side: row
                         .get::<_, Option<String>>(4)?
-                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .map(|value| side_from_str(&value).map_err(to_sql_error))
                         .transpose()?,
-                    last_best_ask: row
+                    pending_price: row
                         .get::<_, Option<String>>(5)?
                         .map(|value| decimal_from_str(&value).map_err(to_sql_error))
                         .transpose()?,
-                    last_position_size: decimal_from_str(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
+                    pending_order_size: row
+                        .get::<_, Option<String>>(6)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    pending_mid: row
+                        .get::<_, Option<String>>(7)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    last_mid: row
+                        .get::<_, Option<String>>(8)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    last_best_bid: row
+                        .get::<_, Option<String>>(9)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    last_best_ask: row
+                        .get::<_, Option<String>>(10)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    last_position_size: decimal_from_str(&row.get::<_, String>(11)?).map_err(to_sql_error)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -373,6 +422,20 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
         "sell" => Ok(QuoteSide::Sell),
         other => Err(anyhow::anyhow!("未知 side: {other}")),
     }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> anyhow::Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let exists = columns.collect::<Result<Vec<_>, _>>()?.into_iter().any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn to_sql_error(error: anyhow::Error) -> rusqlite::Error {

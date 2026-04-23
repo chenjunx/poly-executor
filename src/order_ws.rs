@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -13,7 +14,7 @@ use crate::{
     AuthConfig,
     positions::PositionRefreshTrigger,
     storage::OrderStore,
-    strategy::OrderCorrelationMap,
+    strategy::{OrderCorrelationMap, OrderStatusEvent, StrategyEvent},
 };
 
 pub async fn run(
@@ -21,9 +22,10 @@ pub async fn run(
     correlations: OrderCorrelationMap,
     order_store: OrderStore,
     positions_refresh_tx: tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
+    strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 ) {
     loop {
-        match subscribe_orders(&auth, &correlations, &order_store, &positions_refresh_tx).await {
+        match subscribe_orders(&auth, &correlations, &order_store, &positions_refresh_tx, &strategy_tx).await {
             Ok(()) => warn!(target: "order", "订单 websocket 已断开，5 秒后重连"),
             Err(error) => warn!(target: "order", error = %error, "订单 websocket 监听失败，5 秒后重连"),
         }
@@ -36,6 +38,7 @@ async fn subscribe_orders(
     correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
     positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
+    strategy_tx: &tokio::sync::mpsc::Sender<StrategyEvent>,
 ) -> anyhow::Result<()> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
     let address = Address::from_str(&auth.funder)?;
@@ -95,7 +98,7 @@ async fn subscribe_orders(
                         token = %local_meta.token,
                         local_side = ?local_meta.side,
                         local_price = %local_meta.price,
-                        local_min_order_size = %local_meta.min_order_size,
+                        local_order_size = %local_meta.order_size,
                         market = %order.market,
                         asset_id = %order.asset_id,
                         side = ?order.side,
@@ -107,6 +110,14 @@ async fn subscribe_orders(
                         status = status,
                         "收到订单 websocket 更新，并成功关联本地订单"
                     );
+                    let is_terminal = matches!(status, "canceled" | "filled" | "rejected");
+                    if is_terminal {
+                        let _ = strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                            token: local_meta.token.clone(),
+                            local_order_id: local_meta.local_order_id.clone(),
+                            status: Arc::from(status),
+                        }));
+                    }
                 } else {
                     info!(
                         target: "order",

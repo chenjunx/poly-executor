@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
                 "token": local_meta.token,
                 "side": format!("{:?}", local_meta.side),
                 "price": local_meta.price.to_string(),
-                "min_order_size": local_meta.min_order_size.to_string(),
+                "order_size": local_meta.order_size.to_string(),
                 "status": stored_order.status,
                 "last_mid": stored_order.last_mid.map(|value| value.to_string()),
             }),
@@ -201,18 +201,44 @@ async fn main() -> anyhow::Result<()> {
     let restored_mid_requote_states: HashMap<String, MidRequoteRestoreState> = order_store
         .load_mid_requote_states()?
         .into_iter()
-        .filter(|state| {
-            state
-                .active_local_order_id
-                .as_ref()
-                .is_none_or(|order_id| order_correlations.contains_key(order_id))
-        })
         .map(|state| {
+            let active_local_order_id = state
+                .active_local_order_id
+                .filter(|order_id| order_correlations.contains_key(order_id));
+            let active_side = active_local_order_id
+                .as_ref()
+                .and_then(|order_id| order_correlations.get(order_id).map(|entry| entry.side));
+            let pending_local_order_id = state
+                .pending_local_order_id
+                .filter(|order_id| order_correlations.contains_key(order_id));
+            let has_pending_replacement = pending_local_order_id.is_some();
             (
                 state.token.clone(),
                 MidRequoteRestoreState {
                     topic: Arc::from(state.topic),
-                    active_local_order_id: state.active_local_order_id,
+                    active_local_order_id,
+                    active_side,
+                    pending_local_order_id,
+                    pending_side: if has_pending_replacement {
+                        state.pending_side
+                    } else {
+                        None
+                    },
+                    pending_price: if has_pending_replacement {
+                        state.pending_price
+                    } else {
+                        None
+                    },
+                    pending_order_size: if has_pending_replacement {
+                        state.pending_order_size
+                    } else {
+                        None
+                    },
+                    pending_mid: if has_pending_replacement {
+                        state.pending_mid
+                    } else {
+                        None
+                    },
                     last_mid: state.last_mid,
                     last_best_bid: state.last_best_bid,
                     last_best_ask: state.last_best_ask,
@@ -233,6 +259,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    let mid_tokens: Arc<std::collections::HashSet<String>> = Arc::new(
+        mid_requote
+            .as_ref()
+            .map(|strategy| {
+                strategy
+                    .registration()
+                    .related_tokens
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default(),
+    );
 
     let mut registrations = vec![pair_registration.clone()];
     if let Some(strategy) = &mid_requote {
@@ -285,7 +325,12 @@ async fn main() -> anyhow::Result<()> {
         mid_requote_strategy.spawn(mid_requote_rx, order_tx.clone());
     }
     tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
-    tokio::spawn(market::run(token_topics.clone(), ws_rx, strategy_tx.clone()));
+    tokio::spawn(market::run(
+        token_topics.clone(),
+        mid_tokens.clone(),
+        ws_rx,
+        strategy_tx.clone(),
+    ));
     if app_config.simulation.enabled {
         tokio::spawn(positions::run_simulated(sim_fill_rx, strategy_tx.clone()));
     } else {
@@ -332,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
             order_correlations.clone(),
             order_store.clone(),
             positions_refresh_tx.clone(),
+            strategy_tx.clone(),
         ));
     }
 

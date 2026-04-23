@@ -32,6 +32,15 @@ struct ActiveOrder {
 }
 
 #[derive(Debug, Clone)]
+struct PendingReplacement {
+    order_id: String,
+    side: QuoteSide,
+    price: Decimal,
+    order_size: Decimal,
+    mid: Decimal,
+}
+
+#[derive(Debug, Clone)]
 struct RequoteState {
     topic: Arc<str>,
     last_mid: Option<Decimal>,
@@ -39,12 +48,19 @@ struct RequoteState {
     last_best_ask: Option<Decimal>,
     last_position_size: Decimal,
     active_order: Option<ActiveOrder>,
+    pending_replacement: Option<PendingReplacement>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MidRequoteRestoreState {
     pub topic: Arc<str>,
     pub active_local_order_id: Option<String>,
+    pub active_side: Option<QuoteSide>,
+    pub pending_local_order_id: Option<String>,
+    pub pending_side: Option<QuoteSide>,
+    pub pending_price: Option<Decimal>,
+    pub pending_order_size: Option<Decimal>,
+    pub pending_mid: Option<Decimal>,
     pub last_mid: Option<Decimal>,
     pub last_best_bid: Option<Decimal>,
     pub last_best_ask: Option<Decimal>,
@@ -190,10 +206,31 @@ impl Strategy for MidRequoteStrategy {
                             last_best_bid: restored.last_best_bid,
                             last_best_ask: restored.last_best_ask,
                             last_position_size: restored.last_position_size,
-                            active_order: restored.active_local_order_id.map(|order_id| ActiveOrder {
-                                order_id,
-                                side: QuoteSide::Buy,
+                            active_order: restored.active_local_order_id.and_then(|order_id| {
+                                restored.active_side.map(|side| ActiveOrder { order_id, side })
                             }),
+                            pending_replacement: match (
+                                restored.pending_local_order_id,
+                                restored.pending_side,
+                                restored.pending_price,
+                                restored.pending_order_size,
+                                restored.pending_mid,
+                            ) {
+                                (
+                                    Some(order_id),
+                                    Some(side),
+                                    Some(price),
+                                    Some(order_size),
+                                    Some(mid),
+                                ) => Some(PendingReplacement {
+                                    order_id,
+                                    side,
+                                    price,
+                                    order_size,
+                                    mid,
+                                }),
+                                _ => None,
+                            },
                         },
                     )
                 })
@@ -219,6 +256,7 @@ impl Strategy for MidRequoteStrategy {
                                 last_best_ask: None,
                                 last_position_size: Decimal::ZERO,
                                 active_order: None,
+                                pending_replacement: None,
                             });
                         let is_first_snapshot = state.last_mid.is_none();
                         let mid_changed = state.last_mid != Some(mid);
@@ -271,12 +309,52 @@ impl Strategy for MidRequoteStrategy {
                             bid,
                             ask,
                             mid,
+                            rule.min_order_size,
                             event.book.timestamp_ms,
                             &order_tx,
                         ) {
                             warn!(token = %rule.token, error = %err, "mid_requote 发送模拟挂单事件失败");
                         }
                         persist_state(order_store.as_ref(), &rule.token, state);
+                    }
+                    StrategyEvent::OrderStatus(status_event) => {
+                        let Some(state) = states.get_mut(status_event.token.as_str()) else {
+                            continue;
+                        };
+                        let is_terminal = matches!(status_event.status.as_ref(), "canceled" | "filled" | "rejected");
+                        if !is_terminal {
+                            continue;
+                        }
+                        let Some(active_order) = state.active_order.as_ref() else {
+                            continue;
+                        };
+                        if active_order.order_id != status_event.local_order_id {
+                            continue;
+                        }
+                        let Some(pending) = state.pending_replacement.clone() else {
+                            state.active_order = None;
+                            persist_state(order_store.as_ref(), &status_event.token, state);
+                            continue;
+                        };
+                        if let Err(err) = order_tx.try_send(OrderSignal::MidRequotePlace {
+                            topic: state.topic.clone(),
+                            token: status_event.token.clone(),
+                            mid: pending.mid,
+                            side: pending.side,
+                            price: pending.price,
+                            order_size: pending.order_size,
+                            local_order_id: pending.order_id.clone(),
+                        }) {
+                            warn!(token = %status_event.token, error = %err, "mid_requote 收到撤单确认后发送 replacement 失败");
+                            persist_state(order_store.as_ref(), &status_event.token, state);
+                            continue;
+                        }
+                        state.active_order = Some(ActiveOrder {
+                            order_id: pending.order_id,
+                            side: pending.side,
+                        });
+                        state.pending_replacement = None;
+                        persist_state(order_store.as_ref(), &status_event.token, state);
                     }
                     StrategyEvent::Positions(update) => {
                         let changed_assets: Vec<String> = update
@@ -285,11 +363,26 @@ impl Strategy for MidRequoteStrategy {
                             .filter(|asset| related_tokens.iter().any(|token| token == *asset))
                             .cloned()
                             .collect();
-                        if changed_assets.is_empty() {
+
+                        let mut restored_pending_tokens: Vec<String> = states
+                            .iter()
+                            .filter(|(_, state)| {
+                                state.active_order.is_none() && state.pending_replacement.is_some()
+                            })
+                            .map(|(token, _)| token.clone())
+                            .collect();
+                        restored_pending_tokens.sort();
+                        restored_pending_tokens.dedup();
+
+                        let mut tokens_to_process = changed_assets;
+                        tokens_to_process.extend(restored_pending_tokens);
+                        tokens_to_process.sort();
+                        tokens_to_process.dedup();
+                        if tokens_to_process.is_empty() {
                             continue;
                         }
 
-                        for token in changed_assets.iter() {
+                        for token in tokens_to_process.iter() {
                             let Some(rule) = rules.get(token.as_str()) else {
                                 continue;
                             };
@@ -302,9 +395,35 @@ impl Strategy for MidRequoteStrategy {
                                     last_best_ask: None,
                                     last_position_size: Decimal::ZERO,
                                     active_order: None,
+                                    pending_replacement: None,
                                 });
 
                             state.topic = rule.topic.clone();
+
+                            if state.active_order.is_none() {
+                                if let Some(pending) = state.pending_replacement.clone() {
+                                    if let Err(err) = order_tx.try_send(OrderSignal::MidRequotePlace {
+                                        topic: state.topic.clone(),
+                                        token: token.clone(),
+                                        mid: pending.mid,
+                                        side: pending.side,
+                                        price: pending.price,
+                                        order_size: pending.order_size,
+                                        local_order_id: pending.order_id.clone(),
+                                    }) {
+                                        warn!(token = %rule.token, error = %err, "mid_requote 恢复 pending replacement 时发送挂单失败");
+                                        persist_state(order_store.as_ref(), &rule.token, state);
+                                        continue;
+                                    }
+                                    state.active_order = Some(ActiveOrder {
+                                        order_id: pending.order_id,
+                                        side: pending.side,
+                                    });
+                                    state.pending_replacement = None;
+                                    persist_state(order_store.as_ref(), &rule.token, state);
+                                    continue;
+                                }
+                            }
 
                             let new_position_size = update
                                 .snapshot
@@ -315,21 +434,26 @@ impl Strategy for MidRequoteStrategy {
                             let old_position_size = state.last_position_size;
                             state.last_position_size = new_position_size;
 
+                            let position_delta = (new_position_size - old_position_size).abs();
                             let side = if new_position_size > old_position_size {
                                 QuoteSide::Sell
                             } else if new_position_size < old_position_size {
                                 QuoteSide::Buy
                             } else {
+                                persist_state(order_store.as_ref(), &rule.token, state);
                                 continue;
                             };
 
                             let Some(mid) = state.last_mid else {
+                                persist_state(order_store.as_ref(), &rule.token, state);
                                 continue;
                             };
                             let Some(best_bid) = state.last_best_bid else {
+                                persist_state(order_store.as_ref(), &rule.token, state);
                                 continue;
                             };
                             let Some(best_ask) = state.last_best_ask else {
+                                persist_state(order_store.as_ref(), &rule.token, state);
                                 continue;
                             };
 
@@ -339,12 +463,18 @@ impl Strategy for MidRequoteStrategy {
                                 topic = %rule.topic,
                                 old_position_size = %old_position_size,
                                 new_position_size = %new_position_size,
+                                position_delta = %position_delta,
                                 next_side = ?side,
                                 best_bid = %best_bid,
                                 best_ask = %best_ask,
                                 mid = %mid,
                                 "mid_requote 根据仓位变化切换挂单方向"
                             );
+
+                            if position_delta.is_zero() {
+                                persist_state(order_store.as_ref(), &rule.token, state);
+                                continue;
+                            }
 
                             if let Err(err) = submit_quote(
                                 rule,
@@ -353,6 +483,7 @@ impl Strategy for MidRequoteStrategy {
                                 best_bid,
                                 best_ask,
                                 mid,
+                                position_delta,
                                 0,
                                 &order_tx,
                             ) {
@@ -374,6 +505,7 @@ fn submit_quote(
     best_bid: Decimal,
     best_ask: Decimal,
     mid: Decimal,
+    order_size: Decimal,
     ts: u64,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
 ) -> Result<(), tokio::sync::mpsc::error::TrySendError<OrderSignal>> {
@@ -385,32 +517,52 @@ fn submit_quote(
         warn!(token = %rule.token, side = ?side, mid = %mid, price = %price, "mid_requote 计算出的挂单价格无效");
         return Ok(());
     }
+    if order_size <= Decimal::ZERO {
+        warn!(token = %rule.token, side = ?side, mid = %mid, order_size = %order_size, "mid_requote 计算出的挂单数量无效");
+        return Ok(());
+    }
 
-    let cancelled_order_ids: Arc<[String]> = state
-        .active_order
-        .take()
-        .map(|order| vec![order.order_id])
-        .unwrap_or_default()
-        .into();
     let order_side = match side {
         QuoteSide::Buy => "buy",
         QuoteSide::Sell => "sell",
     };
     let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
     let order_id = format!("{}-{}-{}-{}", rule.token, ts, order_side, seq);
-    let new_order_ids: Arc<[String]> = vec![order_id.clone()].into();
 
-    state.active_order = Some(ActiveOrder { order_id, side });
+    if let Some(active_order) = state.active_order.as_ref() {
+        state.pending_replacement = Some(PendingReplacement {
+            order_id: order_id.clone(),
+            side,
+            price,
+            order_size,
+            mid,
+        });
+        return order_tx.try_send(OrderSignal::MidRequoteStageReplacement {
+            topic: rule.topic.clone(),
+            token: rule.token.clone(),
+            mid,
+            side,
+            price,
+            order_size,
+            active_local_order_id: active_order.order_id.clone(),
+            pending_local_order_id: order_id,
+            request_cancel: state.pending_replacement.is_some(),
+        });
+    }
 
-    order_tx.try_send(OrderSignal::MidRequote {
+    state.active_order = Some(ActiveOrder {
+        order_id: order_id.clone(),
+        side,
+    });
+
+    order_tx.try_send(OrderSignal::MidRequotePlace {
         topic: rule.topic.clone(),
         token: rule.token.clone(),
         mid,
         side,
         price,
-        min_order_size: rule.min_order_size,
-        cancelled_order_ids,
-        new_order_ids,
+        order_size,
+        local_order_id: order_id,
     })
 }
 
@@ -423,6 +575,11 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &RequoteS
         token,
         state.topic.as_ref(),
         state.active_order.as_ref().map(|order| order.order_id.as_str()),
+        state.pending_replacement.as_ref().map(|pending| pending.order_id.as_str()),
+        state.pending_replacement.as_ref().map(|pending| pending.side),
+        state.pending_replacement.as_ref().map(|pending| pending.price),
+        state.pending_replacement.as_ref().map(|pending| pending.order_size),
+        state.pending_replacement.as_ref().map(|pending| pending.mid),
         state.last_mid,
         state.last_best_bid,
         state.last_best_ask,

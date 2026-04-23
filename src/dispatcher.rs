@@ -70,6 +70,20 @@ impl Dispatcher {
                         }
                     }
                 }
+                StrategyEvent::OrderStatus(order_event) => {
+                    if let Some(strategies) = self.position_routes.get(&order_event.token) {
+                        for strategy in strategies {
+                            if let Err(err) = strategy.tx.try_send(event.clone()) {
+                                warn!(
+                                    strategy = %strategy.name,
+                                    asset_id = %order_event.token,
+                                    error = %err,
+                                    "dispatcher 投递订单状态事件失败"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

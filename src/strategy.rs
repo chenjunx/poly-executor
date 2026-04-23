@@ -28,15 +28,25 @@ pub enum OrderSignal {
         ask1: Decimal,
         gap: Decimal,
     },
-    MidRequote {
+    MidRequotePlace {
         topic: Arc<str>,
         token: String,
         mid: Decimal,
         side: QuoteSide,
         price: Decimal,
-        min_order_size: Decimal,
-        cancelled_order_ids: Arc<[String]>,
-        new_order_ids: Arc<[String]>,
+        order_size: Decimal,
+        local_order_id: String,
+    },
+    MidRequoteStageReplacement {
+        topic: Arc<str>,
+        token: String,
+        mid: Decimal,
+        side: QuoteSide,
+        price: Decimal,
+        order_size: Decimal,
+        active_local_order_id: String,
+        pending_local_order_id: String,
+        request_cancel: bool,
     },
 }
 
@@ -49,15 +59,25 @@ pub enum UnifiedOrder {
         ask1: Decimal,
         gap: Decimal,
     },
-    MidRequote {
+    MidRequotePlace {
         topic: Arc<str>,
         token: String,
         mid: Decimal,
         side: QuoteSide,
         price: Decimal,
-        min_order_size: Decimal,
-        cancelled_order_ids: Arc<[String]>,
-        new_order_ids: Arc<[String]>,
+        order_size: Decimal,
+        local_order_id: String,
+    },
+    MidRequoteStageReplacement {
+        topic: Arc<str>,
+        token: String,
+        mid: Decimal,
+        side: QuoteSide,
+        price: Decimal,
+        order_size: Decimal,
+        active_local_order_id: String,
+        pending_local_order_id: String,
+        request_cancel: bool,
     },
 }
 
@@ -77,24 +97,43 @@ impl From<OrderSignal> for UnifiedOrder {
                 ask1,
                 gap,
             },
-            OrderSignal::MidRequote {
+            OrderSignal::MidRequotePlace {
                 topic,
                 token,
                 mid,
                 side,
                 price,
-                min_order_size,
-                cancelled_order_ids,
-                new_order_ids,
-            } => Self::MidRequote {
+                order_size,
+                local_order_id,
+            } => Self::MidRequotePlace {
                 topic,
                 token,
                 mid,
                 side,
                 price,
-                min_order_size,
-                cancelled_order_ids,
-                new_order_ids,
+                order_size,
+                local_order_id,
+            },
+            OrderSignal::MidRequoteStageReplacement {
+                topic,
+                token,
+                mid,
+                side,
+                price,
+                order_size,
+                active_local_order_id,
+                pending_local_order_id,
+                request_cancel,
+            } => Self::MidRequoteStageReplacement {
+                topic,
+                token,
+                mid,
+                side,
+                price,
+                order_size,
+                active_local_order_id,
+                pending_local_order_id,
+                request_cancel,
             },
         }
     }
@@ -152,9 +191,17 @@ pub struct RelevantPositionsUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrderStatusEvent {
+    pub token: String,
+    pub local_order_id: String,
+    pub status: Arc<str>,
+}
+
+#[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
     Positions(PositionsUpdateEvent),
+    OrderStatus(OrderStatusEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -225,7 +272,7 @@ pub struct LocalOrderMeta {
     pub token: String,
     pub side: QuoteSide,
     pub price: Decimal,
-    pub min_order_size: Decimal,
+    pub order_size: Decimal,
 }
 
 pub type OrderCorrelationMap = Arc<DashMap<String, LocalOrderMeta>>;
