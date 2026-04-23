@@ -10,8 +10,11 @@ private_key = ""   # EIP-712 签名私钥（0x 开头）
 funder      = ""   # 钱包地址
 
 [order]
-enabled   = false  # 改为 true 才会真正下单
+enabled   = false  # 改为 true 才会启动订单链路
 size_usdc = 10.0   # 每次套利投入的 USDC 总量
+
+[simulation]
+enabled = true    # true 时不走真实 order_ws / positions，改为本地模拟成交与仓位
 
 [mid_requote]
 enabled = true
@@ -35,7 +38,7 @@ max_price = 0.98
 default_threads = 3
 # 监控报告打印间隔（秒）
 monitor_interval_secs = 30
-
+sqlite_path = "/root/orders.db"
 # 每个主题的订阅线程数，未列出的主题使用 default_threads
 [topic_threads]
 # cs = 2

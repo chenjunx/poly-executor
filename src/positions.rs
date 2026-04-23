@@ -8,10 +8,19 @@ use tracing::{info, warn};
 
 use crate::{
     AuthConfig,
-    strategy::{PositionSnapshot, PositionView, PositionsUpdateEvent, StrategyEvent},
+    strategy::{PositionSnapshot, PositionView, PositionsUpdateEvent, QuoteSide, StrategyEvent},
 };
 
 const PAGE_LIMIT: i32 = 500;
+
+#[derive(Debug, Clone)]
+pub struct SimulatedFillEvent {
+    pub local_order_id: String,
+    pub token: String,
+    pub side: QuoteSide,
+    pub price: Decimal,
+    pub size: Decimal,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionRefreshTrigger {
@@ -90,6 +99,65 @@ pub async fn run(
     }
 }
 
+pub async fn run_simulated(
+    mut fill_rx: tokio::sync::mpsc::Receiver<SimulatedFillEvent>,
+    strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
+) {
+    let mut current_snapshot = Arc::new(PositionSnapshot {
+        by_asset: Arc::new(HashMap::new()),
+    });
+
+    while let Some(fill) = fill_rx.recv().await {
+        let next_snapshot = apply_simulated_fill(current_snapshot.as_ref(), &fill);
+        let changed_assets = diff_assets(current_snapshot.by_asset.as_ref(), next_snapshot.by_asset.as_ref());
+        let position_count = next_snapshot.by_asset.len();
+
+        if changed_assets.is_empty() {
+            info!(
+                target = "order",
+                order_id = %fill.local_order_id,
+                token = %fill.token,
+                side = ?fill.side,
+                price = %fill.price,
+                size = %fill.size,
+                position_count,
+                "simulation 成交已处理，但仓位无变化"
+            );
+            current_snapshot = next_snapshot;
+            continue;
+        }
+
+        let changed_count = changed_assets.len();
+        let changed_assets: Arc<[String]> = changed_assets.into();
+        current_snapshot = next_snapshot.clone();
+
+        info!(
+            target = "order",
+            order_id = %fill.local_order_id,
+            token = %fill.token,
+            side = ?fill.side,
+            price = %fill.price,
+            size = %fill.size,
+            position_count,
+            changed_count,
+            changed_assets = ?changed_assets,
+            "simulation 成交已写入内存仓位，并广播仓位变化"
+        );
+
+        if strategy_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: next_snapshot,
+                changed_assets,
+            }))
+            .await
+            .is_err()
+        {
+            warn!("simulation 广播仓位事件失败，策略通道已关闭");
+            return;
+        }
+    }
+}
+
 async fn sync_positions(
     client: &Client,
     address: Address,
@@ -142,6 +210,42 @@ fn normalize_position(position: polymarket_client_sdk::data::types::response::Po
         title: Arc::from(position.title),
         outcome: Arc::from(position.outcome),
     }
+}
+
+fn apply_simulated_fill(
+    current_snapshot: &PositionSnapshot,
+    fill: &SimulatedFillEvent,
+) -> Arc<PositionSnapshot> {
+    let mut next_positions = current_snapshot.by_asset.as_ref().clone();
+    let mut position = next_positions
+        .remove(&fill.token)
+        .unwrap_or_else(|| PositionView {
+            asset_id: fill.token.clone(),
+            size: Decimal::ZERO,
+            avg_price: fill.price,
+            cur_price: fill.price,
+            current_value: Decimal::ZERO,
+            cash_pnl: Decimal::ZERO,
+            title: Arc::from("simulation"),
+            outcome: Arc::from("simulation"),
+        });
+
+    let delta = match fill.side {
+        QuoteSide::Buy => fill.size,
+        QuoteSide::Sell => -fill.size,
+    };
+    position.size += delta;
+    position.avg_price = fill.price;
+    position.cur_price = fill.price;
+    position.current_value = position.size * fill.price;
+
+    if position.size != Decimal::ZERO {
+        next_positions.insert(fill.token.clone(), position);
+    }
+
+    Arc::new(PositionSnapshot {
+        by_asset: Arc::new(next_positions),
+    })
 }
 
 fn diff_assets(

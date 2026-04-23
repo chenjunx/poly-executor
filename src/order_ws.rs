@@ -2,24 +2,28 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use polymarket_client_sdk::auth::{Credentials, Uuid};
+use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk::clob::ws::Client;
 use polymarket_client_sdk::types::Address;
+use polymarket_client_sdk::POLYGON;
+use serde_json::json;
 use tracing::{info, warn};
 
 use crate::{
     AuthConfig,
     positions::PositionRefreshTrigger,
+    storage::OrderStore,
     strategy::OrderCorrelationMap,
 };
 
 pub async fn run(
     auth: AuthConfig,
     correlations: OrderCorrelationMap,
+    order_store: OrderStore,
     positions_refresh_tx: tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
 ) {
     loop {
-        match subscribe_orders(&auth, &correlations, &positions_refresh_tx).await {
+        match subscribe_orders(&auth, &correlations, &order_store, &positions_refresh_tx).await {
             Ok(()) => warn!(target: "order", "订单 websocket 已断开，5 秒后重连"),
             Err(error) => warn!(target: "order", error = %error, "订单 websocket 监听失败，5 秒后重连"),
         }
@@ -30,15 +34,18 @@ pub async fn run(
 async fn subscribe_orders(
     auth: &AuthConfig,
     correlations: &OrderCorrelationMap,
+    order_store: &OrderStore,
     positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
 ) -> anyhow::Result<()> {
-    let api_key = Uuid::parse_str(&auth.api_key)?;
+    let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
     let address = Address::from_str(&auth.funder)?;
-    let credentials = Credentials::new(
-        api_key,
-        auth.api_secret.clone(),
-        auth.passphrase.clone(),
-    );
+    let rest_client = polymarket_client_sdk::clob::Client::new(
+        "https://clob.polymarket.com",
+        polymarket_client_sdk::clob::Config::builder()
+            .use_server_time(true)
+            .build(),
+    )?;
+    let credentials = rest_client.create_or_derive_api_key(&signer, None).await?;
 
     let client = Client::default().authenticate(credentials, address)?;
     let mut stream = Box::pin(client.subscribe_orders(Vec::new())?);
@@ -48,16 +55,47 @@ async fn subscribe_orders(
     while let Some(message) = stream.next().await {
         match message {
             Ok(order) => {
-                if let Some(local_meta) = correlations.get(&order.id) {
+                let local_meta = correlations.get(&order.id).map(|entry| entry.clone());
+                let local_order_id = local_meta
+                    .as_ref()
+                    .map(|meta| meta.local_order_id.clone())
+                    .or_else(|| order_store.find_local_order_id_by_remote(&order.id).ok().flatten());
+                let status = classify_ws_status(
+                    &format!("{:?}", order.msg_type),
+                    order.original_size.as_ref().map(|value| value.to_string()).as_deref(),
+                    order.size_matched.as_ref().map(|value| value.to_string()).as_deref(),
+                );
+
+                let _ = order_store.append_order_event(
+                    local_order_id.as_deref(),
+                    Some(&order.id),
+                    "ws_update",
+                    json!({
+                        "market": order.market,
+                        "asset_id": order.asset_id,
+                        "side": format!("{:?}", order.side),
+                        "price": order.price.to_string(),
+                        "msg_type": format!("{:?}", order.msg_type),
+                        "original_size": order.original_size.map(|value| value.to_string()),
+                        "size_matched": order.size_matched.map(|value| value.to_string()),
+                        "timestamp": order.timestamp,
+                        "status": status,
+                    }),
+                );
+                let _ = order_store.update_order_status_by_remote(&order.id, status);
+
+                if let Some(local_meta) = local_meta {
                     info!(
                         target: "order",
                         order_id = %order.id,
                         local_order_id = %local_meta.local_order_id,
+                        remote_order_id = ?local_meta.remote_order_id,
                         strategy = %local_meta.strategy,
                         topic = ?local_meta.topic,
                         token = %local_meta.token,
                         local_side = ?local_meta.side,
                         local_price = %local_meta.price,
+                        local_min_order_size = %local_meta.min_order_size,
                         market = %order.market,
                         asset_id = %order.asset_id,
                         side = ?order.side,
@@ -66,12 +104,14 @@ async fn subscribe_orders(
                         original_size = ?order.original_size,
                         size_matched = ?order.size_matched,
                         timestamp = ?order.timestamp,
+                        status = status,
                         "收到订单 websocket 更新，并成功关联本地订单"
                     );
                 } else {
                     info!(
                         target: "order",
                         order_id = %order.id,
+                        local_order_id = ?local_order_id,
                         market = %order.market,
                         asset_id = %order.asset_id,
                         side = ?order.side,
@@ -80,6 +120,7 @@ async fn subscribe_orders(
                         original_size = ?order.original_size,
                         size_matched = ?order.size_matched,
                         timestamp = ?order.timestamp,
+                        status = status,
                         "收到订单 websocket 更新，但未匹配到本地订单"
                     );
                 }
@@ -93,4 +134,23 @@ async fn subscribe_orders(
     }
 
     Ok(())
+}
+
+fn classify_ws_status(msg_type: &str, original_size: Option<&str>, size_matched: Option<&str>) -> &'static str {
+    let msg_type = msg_type.to_ascii_lowercase();
+    if msg_type.contains("cancel") {
+        return "canceled";
+    }
+    if msg_type.contains("reject") {
+        return "rejected";
+    }
+    if let (Some(original_size), Some(size_matched)) = (original_size, size_matched) {
+        if original_size == size_matched {
+            return "filled";
+        }
+        if size_matched != "0" {
+            return "partially_filled";
+        }
+    }
+    "open"
 }

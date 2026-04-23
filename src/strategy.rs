@@ -34,6 +34,7 @@ pub enum OrderSignal {
         mid: Decimal,
         side: QuoteSide,
         price: Decimal,
+        min_order_size: Decimal,
         cancelled_order_ids: Arc<[String]>,
         new_order_ids: Arc<[String]>,
     },
@@ -54,6 +55,7 @@ pub enum UnifiedOrder {
         mid: Decimal,
         side: QuoteSide,
         price: Decimal,
+        min_order_size: Decimal,
         cancelled_order_ids: Arc<[String]>,
         new_order_ids: Arc<[String]>,
     },
@@ -81,6 +83,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 mid,
                 side,
                 price,
+                min_order_size,
                 cancelled_order_ids,
                 new_order_ids,
             } => Self::MidRequote {
@@ -89,6 +92,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 mid,
                 side,
                 price,
+                min_order_size,
                 cancelled_order_ids,
                 new_order_ids,
             },
@@ -215,11 +219,13 @@ pub fn build_token_topics(
 #[derive(Debug, Clone)]
 pub struct LocalOrderMeta {
     pub local_order_id: String,
+    pub remote_order_id: Option<String>,
     pub strategy: Arc<str>,
     pub topic: Option<Arc<str>>,
     pub token: String,
     pub side: QuoteSide,
     pub price: Decimal,
+    pub min_order_size: Decimal,
 }
 
 pub type OrderCorrelationMap = Arc<DashMap<String, LocalOrderMeta>>;

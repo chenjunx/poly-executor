@@ -114,8 +114,8 @@ fn extract_clean_orderbook(msg: &WsMessage) -> Option<(Arc<str>, CleanOrderbook)
         return None;
     };
 
-    let best_bid = book.bids.first()?;
-    let best_ask = book.asks.first()?;
+    let best_bid = book.bids.last()?;
+    let best_ask = book.asks.last()?;
 
     Some((
         Arc::from(book.asset_id.as_str()),
