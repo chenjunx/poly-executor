@@ -11,7 +11,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::{
-    AuthConfig,
+    config::AuthConfig,
     positions::PositionRefreshTrigger,
     storage::OrderStore,
     strategy::{OrderCorrelationMap, OrderStatusEvent, StrategyEvent},

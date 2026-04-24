@@ -23,7 +23,7 @@ pub struct MidRequoteRule {
     pub token: String,
     pub offset: Decimal,
     pub mid_change_threshold: Decimal,
-    pub min_order_size: Decimal,
+    pub target_order_size: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -117,18 +117,18 @@ impl MidRequoteStrategy {
             let token = record[0].trim();
             let offset = record[1].trim();
             let mid_change_threshold = record[2].trim();
-            let min_order_size = record[3].trim();
+            let target_order_size = record[3].trim();
             if token.is_empty()
                 || offset.is_empty()
                 || mid_change_threshold.is_empty()
-                || min_order_size.is_empty()
+                || target_order_size.is_empty()
             {
                 continue;
             }
 
             let offset = Decimal::try_from(offset.parse::<f64>()?)?;
             let mid_change_threshold = Decimal::try_from(mid_change_threshold.parse::<f64>()?)?;
-            let min_order_size = Decimal::try_from(min_order_size.parse::<f64>()?)?;
+            let target_order_size = Decimal::try_from(target_order_size.parse::<f64>()?)?;
             let topic: Arc<str> = if record.len() >= 5 && !record[4].trim().is_empty() {
                 Arc::from(record[4].trim())
             } else {
@@ -140,7 +140,7 @@ impl MidRequoteStrategy {
                 token: token.to_string(),
                 offset,
                 mid_change_threshold,
-                min_order_size,
+                target_order_size,
             });
         }
 
@@ -283,20 +283,27 @@ impl Strategy for MidRequoteStrategy {
                             );
                         }
 
-                        if side_needs_quote(&state.buy, mid, rule.mid_change_threshold) {
-                            if let Err(err) = submit_side_quote(
-                                rule,
-                                state,
-                                QuoteSide::Buy,
-                                bid,
-                                ask,
-                                mid,
-                                rule.min_order_size,
-                                event.book.timestamp_ms,
-                                &order_tx,
-                            ) {
-                                warn!(token = %rule.token, error = %err, "mid_requote 发送买侧挂单事件失败");
+                        let buy_target = buy_target_size(rule, state.last_position_size);
+                        if buy_target > Decimal::ZERO {
+                            if side_needs_quote(&state.buy, mid, rule.mid_change_threshold) {
+                                if let Err(err) = submit_side_quote(
+                                    rule,
+                                    state,
+                                    QuoteSide::Buy,
+                                    bid,
+                                    ask,
+                                    mid,
+                                    buy_target,
+                                    event.book.timestamp_ms,
+                                    &order_tx,
+                                ) {
+                                    warn!(token = %rule.token, error = %err, "mid_requote 发送买侧挂单事件失败");
+                                }
                             }
+                        } else if let Err(err) =
+                            cancel_side_quote(rule, state, QuoteSide::Buy, &order_tx)
+                        {
+                            warn!(token = %rule.token, error = %err, "mid_requote 发送买侧撤单事件失败");
                         }
 
                         if state.last_position_size > Decimal::ZERO {
@@ -433,20 +440,28 @@ impl Strategy for MidRequoteStrategy {
 
                             promote_unblocked_pending(rule, state, QuoteSide::Buy, &order_tx);
 
-                            if side_is_empty(&state.buy) {
-                                if let Err(err) = submit_side_quote(
-                                    rule,
-                                    state,
-                                    QuoteSide::Buy,
-                                    best_bid,
-                                    best_ask,
-                                    mid,
-                                    rule.min_order_size,
-                                    0,
-                                    &order_tx,
-                                ) {
-                                    warn!(token = %rule.token, error = %err, "mid_requote 仓位刷新后补挂买侧失败");
+                            let buy_target = buy_target_size(rule, new_position_size);
+                            if buy_target > Decimal::ZERO {
+                                let buy_target_changed = side_target_size(&state.buy) != Some(buy_target);
+                                if side_is_empty(&state.buy) || buy_target_changed {
+                                    if let Err(err) = submit_side_quote(
+                                        rule,
+                                        state,
+                                        QuoteSide::Buy,
+                                        best_bid,
+                                        best_ask,
+                                        mid,
+                                        buy_target,
+                                        0,
+                                        &order_tx,
+                                    ) {
+                                        warn!(token = %rule.token, error = %err, "mid_requote 仓位刷新后同步买侧失败");
+                                    }
                                 }
+                            } else if let Err(err) =
+                                cancel_side_quote(rule, state, QuoteSide::Buy, &order_tx)
+                            {
+                                warn!(token = %rule.token, error = %err, "mid_requote 仓位达到目标后撤买侧失败");
                             }
 
                             if new_position_size > Decimal::ZERO {
@@ -556,6 +571,10 @@ fn side_state_mut(state: &mut RequoteState, side: QuoteSide) -> &mut SideQuoteSt
         QuoteSide::Buy => &mut state.buy,
         QuoteSide::Sell => &mut state.sell,
     }
+}
+
+fn buy_target_size(rule: &MidRequoteRule, position_size: Decimal) -> Decimal {
+    rule.target_order_size - position_size
 }
 
 fn quoted_mid_delta(side_state: &SideQuoteState, mid: Decimal) -> Option<Decimal> {

@@ -1,17 +1,12 @@
-use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer as _};
 use polymarket_client_sdk::clob::types::request::UserRewardsEarningRequest;
-use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::Decimal;
 use tracing::{info, warn};
 
-use crate::AuthConfig;
-
-const CLOB_HOST: &str = "https://clob.polymarket.com";
+use crate::clob_client::build_authenticated_clob_client;
+use crate::config::AuthConfig;
 
 pub async fn run_mid_reward_monitor(auth: AuthConfig, interval_secs: u64) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -72,17 +67,3 @@ async fn poll_user_rewards(auth: &AuthConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_authenticated_clob_client(
-    auth: &AuthConfig,
-) -> anyhow::Result<ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>> {
-    let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
-    Ok(ClobClient::new(
-        CLOB_HOST,
-        ClobConfig::builder().use_server_time(true).build(),
-    )?
-    .authentication_builder(&signer)
-    .funder(auth.funder.parse()?)
-    .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
-    .authenticate()
-    .await?)
-}

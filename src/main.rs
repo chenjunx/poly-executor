@@ -1,3 +1,5 @@
+mod clob_client;
+mod config;
 mod dispatcher;
 mod logging;
 mod market;
@@ -7,136 +9,30 @@ mod order_ws;
 mod positions;
 mod price_store;
 mod proxy_ws;
+mod recovery;
 mod storage;
 mod strategies;
 mod strategy;
 
-use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use dashmap::DashMap;
-
-use config::{Config, File};
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer as _};
-use polymarket_client_sdk::clob::types::request::{OrdersRequest, TradesRequest};
-use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
-use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_client_sdk::error::{Kind as PmErrorKind, Status as PmStatus, StatusCode};
 use polymarket_client_sdk::types::Decimal;
-use serde::Deserialize;
 use tracing::info;
 
+use config::load_app_config;
 use dispatcher::Dispatcher;
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
+use recovery::RecoveryCoordinator;
 use storage::OrderStore;
-use strategies::mid_requote::{
-    MidRequoteRestoreSideState, MidRequoteRestoreState, MidRequoteStrategy,
-};
+use strategies::mid_requote::MidRequoteStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
-    Filters, OrderCorrelationMap, OrderSignal, Strategy, StrategyHandle, build_token_topics,
-    merge_topic_tokens,
+    Filters, OrderSignal, Strategy, StrategyHandle, build_token_topics, merge_topic_tokens,
 };
-
-#[derive(Debug, Deserialize)]
-struct AppConfig {
-    proxy: ProxySettings,
-    app: AppSettings,
-    auth: AuthConfig,
-    order: OrderConfig,
-    #[serde(default)]
-    simulation: SimulationConfig,
-    #[serde(default)]
-    mid_requote: MidRequoteConfig,
-    #[serde(default)]
-    topic_threads: HashMap<String, usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProxySettings {
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AppSettings {
-    log_file: String,
-    order_log_file: String,
-    assets_file: String,
-    #[serde(default)]
-    sqlite_path: String,
-    min_diff: f64,
-    max_spread: f64,
-    min_price: f64,
-    max_price: f64,
-    default_threads: usize,
-    #[serde(default = "default_monitor_interval_secs")]
-    monitor_interval_secs: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub(crate) struct AuthConfig {
-    api_key: String,
-    api_secret: String,
-    passphrase: String,
-    private_key: String,
-    funder: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub(crate) struct OrderConfig {
-    enabled: bool,
-    size_usdc: f64,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-struct SimulationConfig {
-    #[serde(default)]
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-struct MidRequoteConfig {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    monitor_enabled: bool,
-}
-
-fn default_monitor_interval_secs() -> u64 {
-    30
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = if std::path::Path::new("config.toml").exists() {
-        "config.toml".to_string()
-    } else if let Ok(mut exe_path) = std::env::current_exe() {
-        exe_path.pop();
-        exe_path.push("config.toml");
-        exe_path.to_string_lossy().to_string()
-    } else {
-        "config.toml".to_string()
-    };
-
-    let local_config_path = if std::path::Path::new("config.local.toml").exists() {
-        "config.local.toml".to_string()
-    } else if let Ok(mut exe_path) = std::env::current_exe() {
-        exe_path.pop();
-        exe_path.push("config.local.toml");
-        exe_path.to_string_lossy().to_string()
-    } else {
-        "config.local.toml".to_string()
-    };
-
-    let settings = Config::builder()
-        .add_source(File::with_name(&config_path).required(false))
-        .add_source(File::with_name(&local_config_path).required(false))
-        .build()?;
-    let app_config: AppConfig = settings.try_deserialize()?;
+    let app_config = load_app_config()?;
 
     let log_filename = if !app_config.app.log_file.is_empty() {
         &app_config.app.log_file
@@ -191,110 +87,15 @@ async fn main() -> anyhow::Result<()> {
     let pair_strategy = PairArbitrageStrategy::from_config(filters.clone(), assets_file)?;
     let pair_registration = pair_strategy.registration().clone();
 
-    let order_correlations: OrderCorrelationMap = Arc::new(DashMap::new());
-
-    let stored_active_orders = order_store.load_active_orders()?;
-    let reconciled_active_orders = if app_config.simulation.enabled {
-        stored_active_orders
-    } else {
-        reconcile_startup_orders(&app_config.auth, &order_store, stored_active_orders).await?
-    };
-
-    for stored_order in reconciled_active_orders {
-        let local_meta = stored_order.to_local_order_meta();
-        order_correlations.insert(local_meta.local_order_id.clone(), local_meta.clone());
-        if let Some(remote_order_id) = &local_meta.remote_order_id {
-            order_correlations.insert(remote_order_id.clone(), local_meta.clone());
-        }
-        order_store.append_order_event(
-            Some(&local_meta.local_order_id),
-            local_meta.remote_order_id.as_deref(),
-            "recovered_on_startup",
-            serde_json::json!({
-                "strategy": local_meta.strategy.as_ref(),
-                "topic": local_meta.topic.as_ref().map(|topic| topic.as_ref()),
-                "token": local_meta.token,
-                "side": format!("{:?}", local_meta.side),
-                "price": local_meta.price.to_string(),
-                "order_size": local_meta.order_size.to_string(),
-                "status": stored_order.status,
-                "last_mid": stored_order.last_mid.map(|value| value.to_string()),
-            }),
-        )?;
-    }
-
-    let mut restored_mid_requote_states: HashMap<String, MidRequoteRestoreState> = order_store
-        .load_mid_requote_shared_states()?
-        .into_iter()
-        .map(|state| {
-            (
-                state.token.clone(),
-                MidRequoteRestoreState {
-                    topic: Arc::from(state.topic),
-                    buy: MidRequoteRestoreSideState::default(),
-                    sell: MidRequoteRestoreSideState::default(),
-                    last_mid: state.last_mid,
-                    last_best_bid: state.last_best_bid,
-                    last_best_ask: state.last_best_ask,
-                    last_position_size: state.last_position_size,
-                },
-            )
-        })
-        .collect();
-
-    for side_state in order_store.load_mid_requote_side_states()? {
-        let restore_state = restored_mid_requote_states
-            .entry(side_state.token.clone())
-            .or_insert_with(|| MidRequoteRestoreState {
-                topic: Arc::from("mid"),
-                buy: MidRequoteRestoreSideState::default(),
-                sell: MidRequoteRestoreSideState::default(),
-                last_mid: None,
-                last_best_bid: None,
-                last_best_ask: None,
-                last_position_size: Decimal::ZERO,
-            });
-        let lane = match side_state.side {
-            strategy::QuoteSide::Buy => &mut restore_state.buy,
-            strategy::QuoteSide::Sell => &mut restore_state.sell,
-        };
-
-        lane.active_local_order_id = side_state.active_local_order_id.filter(|order_id| {
-            order_correlations
-                .get(order_id)
-                .is_some_and(|entry| entry.side == side_state.side)
-        });
-        lane.active_order_size = lane.active_local_order_id.as_ref().and_then(|order_id| {
-            order_correlations
-                .get(order_id)
-                .map(|entry| entry.order_size)
-        });
-
-        lane.pending_local_order_id = side_state.pending_local_order_id.filter(|order_id| {
-            order_correlations
-                .get(order_id)
-                .is_some_and(|entry| entry.side == side_state.side)
-        });
-        let has_pending_replacement = lane.pending_local_order_id.is_some();
-        lane.pending_price = if has_pending_replacement {
-            side_state.pending_price
-        } else {
-            None
-        };
-        lane.pending_order_size = if has_pending_replacement {
-            side_state.pending_order_size
-        } else {
-            None
-        };
-        lane.pending_mid = if has_pending_replacement {
-            side_state.pending_mid
-        } else {
-            None
-        };
-        lane.last_quoted_mid = side_state.last_quoted_mid;
-        lane.cancel_requested = side_state.cancel_requested;
-    }
-
+    let recovery = RecoveryCoordinator::new(
+        order_store.clone(),
+        app_config.auth.clone(),
+        app_config.simulation.enabled,
+    )
+    .recover()
+    .await?;
+    let order_correlations = recovery.order_correlations;
+    let restored_mid_requote_states = recovery.mid_requote_restore_states;
     let mid_file = if !app_config.mid_requote.file.is_empty() {
         app_config.mid_requote.file.as_str()
     } else {
@@ -446,174 +247,3 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reconcile_startup_orders(
-    auth: &AuthConfig,
-    order_store: &OrderStore,
-    stored_orders: Vec<storage::StoredOrder>,
-) -> anyhow::Result<Vec<storage::StoredOrder>> {
-    let client = build_authenticated_clob_client(auth).await?;
-    let mut remote_open_orders = HashMap::new();
-    let mut cursor: Option<String> = None;
-
-    loop {
-        let page = client
-            .orders(&OrdersRequest::default(), cursor.clone())
-            .await?;
-        for order in page.data {
-            remote_open_orders.insert(order.id.clone(), order);
-        }
-        if page.next_cursor == "LTE=" {
-            break;
-        }
-        cursor = Some(page.next_cursor);
-    }
-
-    let mut reconciled = Vec::new();
-    for stored_order in stored_orders {
-        let Some(remote_order_id) = stored_order.remote_order_id.as_deref() else {
-            order_store.update_order_status_by_local(&stored_order.local_order_id, "unknown")?;
-            order_store.append_order_event(
-                Some(&stored_order.local_order_id),
-                None,
-                "startup_reconciled",
-                serde_json::json!({
-                    "result": "missing_remote_order_id",
-                    "status": "unknown",
-                }),
-            )?;
-            continue;
-        };
-
-        if let Some(open_order) = remote_open_orders.get(remote_order_id) {
-            let status = map_open_order_status(open_order);
-            order_store.update_order_status_by_remote(remote_order_id, status)?;
-            order_store.append_order_event(
-                Some(&stored_order.local_order_id),
-                Some(remote_order_id),
-                "startup_reconciled",
-                serde_json::json!({
-                    "result": "present_in_open_orders",
-                    "status": status,
-                    "original_size": open_order.original_size.to_string(),
-                    "size_matched": open_order.size_matched.to_string(),
-                    "price": open_order.price.to_string(),
-                }),
-            )?;
-            let mut updated = stored_order.clone();
-            updated.status = status.to_string();
-            reconciled.push(updated);
-            continue;
-        }
-
-        match client.order(remote_order_id).await {
-            Ok(order) => {
-                let status = map_single_order_status(&order);
-                order_store.update_order_status_by_remote(remote_order_id, status)?;
-                order_store.append_order_event(
-                    Some(&stored_order.local_order_id),
-                    Some(remote_order_id),
-                    "startup_reconciled",
-                    serde_json::json!({
-                        "result": "resolved_by_order_lookup",
-                        "status": status,
-                        "original_size": order.original_size.to_string(),
-                        "size_matched": order.size_matched.to_string(),
-                        "price": order.price.to_string(),
-                    }),
-                )?;
-                if !matches!(
-                    status,
-                    "filled" | "canceled" | "rejected" | "failed" | "unknown"
-                ) {
-                    let mut updated = stored_order.clone();
-                    updated.status = status.to_string();
-                    reconciled.push(updated);
-                }
-            }
-            Err(error) if is_not_found_status(&error) => {
-                let terminal_status =
-                    infer_missing_remote_terminal_status(&client, &stored_order).await?;
-                order_store
-                    .update_order_status_by_local(&stored_order.local_order_id, terminal_status)?;
-                order_store.append_order_event(
-                    Some(&stored_order.local_order_id),
-                    Some(remote_order_id),
-                    "startup_reconciled",
-                    serde_json::json!({
-                        "result": "missing_from_remote",
-                        "status": terminal_status,
-                    }),
-                )?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Ok(reconciled)
-}
-
-async fn build_authenticated_clob_client(
-    auth: &AuthConfig,
-) -> anyhow::Result<ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>> {
-    let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
-    Ok(ClobClient::new(
-        "https://clob.polymarket.com",
-        ClobConfig::builder().use_server_time(true).build(),
-    )?
-    .authentication_builder(&signer)
-    .funder(auth.funder.parse()?)
-    .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
-    .authenticate()
-    .await?)
-}
-
-fn map_open_order_status(order: &OpenOrderResponse) -> &'static str {
-    if order.size_matched == Decimal::ZERO {
-        "open"
-    } else {
-        "partially_filled"
-    }
-}
-
-fn map_single_order_status(order: &OpenOrderResponse) -> &'static str {
-    use polymarket_client_sdk::clob::types::OrderStatusType;
-
-    match order.status {
-        OrderStatusType::Canceled => "canceled",
-        OrderStatusType::Matched => {
-            if order.size_matched == order.original_size {
-                "filled"
-            } else {
-                "partially_filled"
-            }
-        }
-        OrderStatusType::Live | OrderStatusType::Delayed | OrderStatusType::Unmatched => {
-            map_open_order_status(order)
-        }
-        OrderStatusType::Unknown => "unknown",
-        _ => "unknown",
-    }
-}
-
-async fn infer_missing_remote_terminal_status(
-    client: &ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>,
-    stored_order: &storage::StoredOrder,
-) -> anyhow::Result<&'static str> {
-    let request = TradesRequest::builder()
-        .asset_id(stored_order.token.clone())
-        .build();
-    let page = client.trades(&request, None).await?;
-    let has_full_fill = page.data.iter().any(|trade| {
-        trade.maker_orders.iter().any(|maker_order| {
-            maker_order.order_id == stored_order.remote_order_id.clone().unwrap_or_default()
-        })
-    });
-    Ok(if has_full_fill { "filled" } else { "unknown" })
-}
-
-fn is_not_found_status(error: &polymarket_client_sdk::error::Error) -> bool {
-    error.kind() == PmErrorKind::Status
-        && error
-            .downcast_ref::<PmStatus>()
-            .is_some_and(|status| status.status_code == StatusCode::NOT_FOUND)
-}

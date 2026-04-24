@@ -7,7 +7,7 @@ use polymarket_client_sdk::types::{Address, Decimal};
 use tracing::{info, warn};
 
 use crate::{
-    AuthConfig,
+    config::AuthConfig,
     strategy::{PositionSnapshot, PositionView, PositionsUpdateEvent, QuoteSide, StrategyEvent},
 };
 

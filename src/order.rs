@@ -10,7 +10,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::{
-    AuthConfig, OrderConfig,
+    config::{AuthConfig, OrderConfig},
     positions::{PositionRefreshTrigger, SimulatedFillEvent},
     storage::OrderStore,
     strategy::{LocalOrderMeta, OrderCorrelationMap, OrderSignal, QuoteSide, UnifiedOrder},
