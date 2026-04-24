@@ -4,7 +4,9 @@ use std::sync::Arc;
 use futures::StreamExt as _;
 use polymarket_client_sdk::clob::types::Side;
 use polymarket_client_sdk::clob::ws::Client;
-use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, PriceChangeBatchEntry, WsMessage};
+use polymarket_client_sdk::clob::ws::types::response::{
+    BookUpdate, PriceChangeBatchEntry, WsMessage,
+};
 use polymarket_client_sdk::types::Decimal;
 use tracing::{info, warn};
 
@@ -112,7 +114,10 @@ pub async fn spawn_subscriptions(
                 .unwrap_or(default_threads)
                 .max(1);
             let chunk_size = (tokens.len() + n - 1) / n;
-            tokens.chunks(chunk_size).map(|c| c.to_vec()).collect::<Vec<_>>()
+            tokens
+                .chunks(chunk_size)
+                .map(|c| c.to_vec())
+                .collect::<Vec<_>>()
         })
         .collect();
 

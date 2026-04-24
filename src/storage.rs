@@ -29,19 +29,26 @@ pub struct StoredOrder {
 }
 
 #[derive(Debug, Clone)]
-pub struct StoredMidRequoteState {
+pub struct StoredMidRequoteSharedState {
     pub token: String,
     pub topic: String,
-    pub active_local_order_id: Option<String>,
-    pub pending_local_order_id: Option<String>,
-    pub pending_side: Option<QuoteSide>,
-    pub pending_price: Option<Decimal>,
-    pub pending_order_size: Option<Decimal>,
-    pub pending_mid: Option<Decimal>,
     pub last_mid: Option<Decimal>,
     pub last_best_bid: Option<Decimal>,
     pub last_best_ask: Option<Decimal>,
     pub last_position_size: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredMidRequoteSideState {
+    pub token: String,
+    pub side: QuoteSide,
+    pub active_local_order_id: Option<String>,
+    pub pending_local_order_id: Option<String>,
+    pub pending_price: Option<Decimal>,
+    pub pending_order_size: Option<Decimal>,
+    pub pending_mid: Option<Decimal>,
+    pub last_quoted_mid: Option<Decimal>,
+    pub cancel_requested: bool,
 }
 
 impl StoredOrder {
@@ -61,7 +68,8 @@ impl StoredOrder {
 
 impl OrderStore {
     pub fn open(path: &str) -> anyhow::Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("无法打开 SQLite 文件: {path}"))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("无法打开 SQLite 文件: {path}"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self {
@@ -112,13 +120,38 @@ impl OrderStore {
                     last_position_size TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS strategy_state_mid_requote_side (
+                    token TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    active_local_order_id TEXT,
+                    pending_local_order_id TEXT,
+                    pending_price TEXT,
+                    pending_order_size TEXT,
+                    pending_mid TEXT,
+                    last_quoted_mid TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (token, side)
+                );
                 ",
             )?;
-            ensure_column(conn, "strategy_state_mid_requote", "pending_local_order_id", "TEXT")?;
+            ensure_column(
+                conn,
+                "strategy_state_mid_requote",
+                "pending_local_order_id",
+                "TEXT",
+            )?;
             ensure_column(conn, "strategy_state_mid_requote", "pending_side", "TEXT")?;
             ensure_column(conn, "strategy_state_mid_requote", "pending_price", "TEXT")?;
-            ensure_column(conn, "strategy_state_mid_requote", "pending_order_size", "TEXT")?;
+            ensure_column(
+                conn,
+                "strategy_state_mid_requote",
+                "pending_order_size",
+                "TEXT",
+            )?;
             ensure_column(conn, "strategy_state_mid_requote", "pending_mid", "TEXT")?;
+            migrate_mid_requote_side_state(conn)?;
             Ok(())
         })
     }
@@ -198,7 +231,11 @@ impl OrderStore {
         })
     }
 
-    pub fn update_order_status_by_local(&self, local_order_id: &str, status: &str) -> anyhow::Result<()> {
+    pub fn update_order_status_by_local(
+        &self,
+        local_order_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
         let now = now_ms()?;
         self.with_conn(|conn| {
             conn.execute(
@@ -209,7 +246,11 @@ impl OrderStore {
         })
     }
 
-    pub fn update_order_status_by_remote(&self, remote_order_id: &str, status: &str) -> anyhow::Result<()> {
+    pub fn update_order_status_by_remote(
+        &self,
+        remote_order_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
         let now = now_ms()?;
         self.with_conn(|conn| {
             conn.execute(
@@ -298,6 +339,78 @@ impl OrderStore {
         })
     }
 
+    pub fn upsert_mid_requote_shared_state(
+        &self,
+        token: &str,
+        topic: &str,
+        last_mid: Option<Decimal>,
+        last_best_bid: Option<Decimal>,
+        last_best_ask: Option<Decimal>,
+        last_position_size: Decimal,
+    ) -> anyhow::Result<()> {
+        self.upsert_mid_requote_state(
+            token,
+            topic,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            last_mid,
+            last_best_bid,
+            last_best_ask,
+            last_position_size,
+        )
+    }
+
+    pub fn upsert_mid_requote_side_state(
+        &self,
+        token: &str,
+        side: QuoteSide,
+        active_local_order_id: Option<&str>,
+        pending_local_order_id: Option<&str>,
+        pending_price: Option<Decimal>,
+        pending_order_size: Option<Decimal>,
+        pending_mid: Option<Decimal>,
+        last_quoted_mid: Option<Decimal>,
+        cancel_requested: bool,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO strategy_state_mid_requote_side (
+                    token, side, active_local_order_id, pending_local_order_id, pending_price,
+                    pending_order_size, pending_mid, last_quoted_mid, cancel_requested, updated_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(token, side) DO UPDATE SET
+                    active_local_order_id = excluded.active_local_order_id,
+                    pending_local_order_id = excluded.pending_local_order_id,
+                    pending_price = excluded.pending_price,
+                    pending_order_size = excluded.pending_order_size,
+                    pending_mid = excluded.pending_mid,
+                    last_quoted_mid = excluded.last_quoted_mid,
+                    cancel_requested = excluded.cancel_requested,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    token,
+                    side_to_str(side),
+                    active_local_order_id,
+                    pending_local_order_id,
+                    pending_price.map(|value| value.to_string()),
+                    pending_order_size.map(|value| value.to_string()),
+                    pending_mid.map(|value| value.to_string()),
+                    last_quoted_mid.map(|value| value.to_string()),
+                    if cancel_requested { 1_i64 } else { 0_i64 },
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn load_active_orders(&self) -> anyhow::Result<Vec<StoredOrder>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -317,7 +430,8 @@ impl OrderStore {
                     token: row.get(4)?,
                     side: side_from_str(&row.get::<_, String>(5)?).map_err(to_sql_error)?,
                     price: decimal_from_str(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
-                    order_size: decimal_from_str(&row.get::<_, String>(7)?).map_err(to_sql_error)?,
+                    order_size: decimal_from_str(&row.get::<_, String>(7)?)
+                        .map_err(to_sql_error)?,
                     status: row.get(8)?,
                     last_mid: row
                         .get::<_, Option<String>>(9)?
@@ -329,58 +443,82 @@ impl OrderStore {
         })
     }
 
-    pub fn load_mid_requote_states(&self) -> anyhow::Result<Vec<StoredMidRequoteState>> {
+    pub fn load_mid_requote_shared_states(
+        &self,
+    ) -> anyhow::Result<Vec<StoredMidRequoteSharedState>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "
-                SELECT token, topic, active_local_order_id, pending_local_order_id, pending_side,
-                       pending_price, pending_order_size, pending_mid, last_mid, last_best_bid,
-                       last_best_ask, last_position_size
+                SELECT token, topic, last_mid, last_best_bid, last_best_ask, last_position_size
                 FROM strategy_state_mid_requote
                 ",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(StoredMidRequoteState {
+                Ok(StoredMidRequoteSharedState {
                     token: row.get(0)?,
                     topic: row.get(1)?,
-                    active_local_order_id: row.get(2)?,
-                    pending_local_order_id: row.get(3)?,
-                    pending_side: row
-                        .get::<_, Option<String>>(4)?
-                        .map(|value| side_from_str(&value).map_err(to_sql_error))
-                        .transpose()?,
-                    pending_price: row
-                        .get::<_, Option<String>>(5)?
-                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
-                        .transpose()?,
-                    pending_order_size: row
-                        .get::<_, Option<String>>(6)?
-                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
-                        .transpose()?,
-                    pending_mid: row
-                        .get::<_, Option<String>>(7)?
-                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
-                        .transpose()?,
                     last_mid: row
-                        .get::<_, Option<String>>(8)?
+                        .get::<_, Option<String>>(2)?
                         .map(|value| decimal_from_str(&value).map_err(to_sql_error))
                         .transpose()?,
                     last_best_bid: row
-                        .get::<_, Option<String>>(9)?
+                        .get::<_, Option<String>>(3)?
                         .map(|value| decimal_from_str(&value).map_err(to_sql_error))
                         .transpose()?,
                     last_best_ask: row
-                        .get::<_, Option<String>>(10)?
+                        .get::<_, Option<String>>(4)?
                         .map(|value| decimal_from_str(&value).map_err(to_sql_error))
                         .transpose()?,
-                    last_position_size: decimal_from_str(&row.get::<_, String>(11)?).map_err(to_sql_error)?,
+                    last_position_size: decimal_from_str(&row.get::<_, String>(5)?)
+                        .map_err(to_sql_error)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
 
-    pub fn find_local_order_id_by_remote(&self, remote_order_id: &str) -> anyhow::Result<Option<String>> {
+    pub fn load_mid_requote_side_states(&self) -> anyhow::Result<Vec<StoredMidRequoteSideState>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                SELECT token, side, active_local_order_id, pending_local_order_id, pending_price,
+                       pending_order_size, pending_mid, last_quoted_mid, cancel_requested
+                FROM strategy_state_mid_requote_side
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StoredMidRequoteSideState {
+                    token: row.get(0)?,
+                    side: side_from_str(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+                    active_local_order_id: row.get(2)?,
+                    pending_local_order_id: row.get(3)?,
+                    pending_price: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    pending_order_size: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    pending_mid: row
+                        .get::<_, Option<String>>(6)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    last_quoted_mid: row
+                        .get::<_, Option<String>>(7)?
+                        .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                        .transpose()?,
+                    cancel_requested: row.get::<_, i64>(8)? != 0,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn find_local_order_id_by_remote(
+        &self,
+        remote_order_id: &str,
+    ) -> anyhow::Result<Option<String>> {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT local_order_id FROM orders WHERE remote_order_id = ?1",
@@ -393,7 +531,10 @@ impl OrderStore {
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
-        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("SQLite 连接锁已中毒"))?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQLite 连接锁已中毒"))?;
         f(&guard)
     }
 }
@@ -424,11 +565,132 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
     }
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> anyhow::Result<()> {
+fn migrate_mid_requote_side_state(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT token, active_local_order_id, pending_local_order_id, pending_side,
+               pending_price, pending_order_size, pending_mid, last_mid
+        FROM strategy_state_mid_requote
+        WHERE active_local_order_id IS NOT NULL OR pending_local_order_id IS NOT NULL
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+    let legacy_rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let now = now_ms()?;
+
+    for (
+        token,
+        active_local_order_id,
+        pending_local_order_id,
+        pending_side,
+        pending_price,
+        pending_order_size,
+        pending_mid,
+        last_mid,
+    ) in legacy_rows
+    {
+        if side_state_exists(conn, &token)? {
+            continue;
+        }
+
+        if let Some(active_local_order_id) = active_local_order_id {
+            let active_side = conn
+                .query_row(
+                    "SELECT side FROM orders WHERE local_order_id = ?1",
+                    params![active_local_order_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(active_side) = active_side {
+                conn.execute(
+                    "
+                    INSERT OR IGNORE INTO strategy_state_mid_requote_side (
+                        token, side, active_local_order_id, pending_local_order_id, pending_price,
+                        pending_order_size, pending_mid, last_quoted_mid, cancel_requested, updated_at_ms
+                    ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, 0, ?5)
+                    ",
+                    params![token, active_side, active_local_order_id, last_mid, now],
+                )?;
+            }
+        }
+
+        if let (
+            Some(pending_local_order_id),
+            Some(pending_side),
+            Some(pending_price),
+            Some(pending_order_size),
+            Some(pending_mid),
+        ) = (
+            pending_local_order_id,
+            pending_side,
+            pending_price,
+            pending_order_size,
+            pending_mid,
+        ) {
+            conn.execute(
+                "
+                INSERT INTO strategy_state_mid_requote_side (
+                    token, side, active_local_order_id, pending_local_order_id, pending_price,
+                    pending_order_size, pending_mid, last_quoted_mid, cancel_requested, updated_at_ms
+                ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, 0, ?8)
+                ON CONFLICT(token, side) DO UPDATE SET
+                    pending_local_order_id = excluded.pending_local_order_id,
+                    pending_price = excluded.pending_price,
+                    pending_order_size = excluded.pending_order_size,
+                    pending_mid = excluded.pending_mid,
+                    last_quoted_mid = COALESCE(strategy_state_mid_requote_side.last_quoted_mid, excluded.last_quoted_mid),
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    token,
+                    pending_side,
+                    pending_local_order_id,
+                    pending_price,
+                    pending_order_size,
+                    pending_mid,
+                    last_mid,
+                    now,
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn side_state_exists(conn: &Connection, token: &str) -> anyhow::Result<bool> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM strategy_state_mid_requote_side WHERE token = ?1",
+        params![token],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> anyhow::Result<()> {
     let pragma = format!("PRAGMA table_info({table})");
     let mut stmt = conn.prepare(&pragma)?;
     let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    let exists = columns.collect::<Result<Vec<_>, _>>()?.into_iter().any(|name| name == column);
+    let exists = columns
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == column);
     if !exists {
         conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),

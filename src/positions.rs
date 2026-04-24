@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use polymarket_client_sdk::data::{types::request::PositionsRequest, Client};
+use polymarket_client_sdk::data::{Client, types::request::PositionsRequest};
 use polymarket_client_sdk::types::{Address, Decimal};
 use tracing::{info, warn};
 
@@ -109,7 +109,10 @@ pub async fn run_simulated(
 
     while let Some(fill) = fill_rx.recv().await {
         let next_snapshot = apply_simulated_fill(current_snapshot.as_ref(), &fill);
-        let changed_assets = diff_assets(current_snapshot.by_asset.as_ref(), next_snapshot.by_asset.as_ref());
+        let changed_assets = diff_assets(
+            current_snapshot.by_asset.as_ref(),
+            next_snapshot.by_asset.as_ref(),
+        );
         let position_count = next_snapshot.by_asset.len();
 
         if changed_assets.is_empty() {
@@ -172,11 +175,17 @@ async fn sync_positions(
                 .collect(),
         ),
     });
-    let changed_assets = diff_assets(current_snapshot.by_asset.as_ref(), next_snapshot.by_asset.as_ref());
+    let changed_assets = diff_assets(
+        current_snapshot.by_asset.as_ref(),
+        next_snapshot.by_asset.as_ref(),
+    );
     Ok((next_snapshot, changed_assets))
 }
 
-async fn fetch_all_positions(client: &Client, address: Address) -> anyhow::Result<Vec<PositionView>> {
+async fn fetch_all_positions(
+    client: &Client,
+    address: Address,
+) -> anyhow::Result<Vec<PositionView>> {
     let mut offset = 0;
     let mut positions = Vec::new();
 
@@ -199,7 +208,9 @@ async fn fetch_all_positions(client: &Client, address: Address) -> anyhow::Resul
     Ok(positions)
 }
 
-fn normalize_position(position: polymarket_client_sdk::data::types::response::Position) -> PositionView {
+fn normalize_position(
+    position: polymarket_client_sdk::data::types::response::Position,
+) -> PositionView {
     PositionView {
         asset_id: position.asset,
         size: position.size,
@@ -283,7 +294,10 @@ fn drain_triggers(
 }
 
 fn summarize_triggers(triggers: &[PositionRefreshTrigger]) -> &'static str {
-    if triggers.iter().any(|trigger| *trigger == PositionRefreshTrigger::Startup) {
+    if triggers
+        .iter()
+        .any(|trigger| *trigger == PositionRefreshTrigger::Startup)
+    {
         "startup"
     } else if triggers
         .iter()

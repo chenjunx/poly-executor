@@ -143,10 +143,7 @@ pub async fn run(
     // TLS 握手
     let cx = native_tls::TlsConnector::new()?;
     let cx = tokio_native_tls::TlsConnector::from(cx);
-    let tls_stream = cx
-        .connect(host, tcp)
-        .await
-        .context("TLS 握手失败")?;
+    let tls_stream = cx.connect(host, tcp).await.context("TLS 握手失败")?;
 
     // WebSocket 握手
     let (mut ws, _) = tokio_tungstenite::client_async(WS_URL, tls_stream)

@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk::clob::ws::Client;
 use polymarket_client_sdk::types::Address;
-use polymarket_client_sdk::POLYGON;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -25,9 +25,19 @@ pub async fn run(
     strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 ) {
     loop {
-        match subscribe_orders(&auth, &correlations, &order_store, &positions_refresh_tx, &strategy_tx).await {
+        match subscribe_orders(
+            &auth,
+            &correlations,
+            &order_store,
+            &positions_refresh_tx,
+            &strategy_tx,
+        )
+        .await
+        {
             Ok(()) => warn!(target: "order", "订单 websocket 已断开，5 秒后重连"),
-            Err(error) => warn!(target: "order", error = %error, "订单 websocket 监听失败，5 秒后重连"),
+            Err(error) => {
+                warn!(target: "order", error = %error, "订单 websocket 监听失败，5 秒后重连")
+            }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -62,11 +72,24 @@ async fn subscribe_orders(
                 let local_order_id = local_meta
                     .as_ref()
                     .map(|meta| meta.local_order_id.clone())
-                    .or_else(|| order_store.find_local_order_id_by_remote(&order.id).ok().flatten());
+                    .or_else(|| {
+                        order_store
+                            .find_local_order_id_by_remote(&order.id)
+                            .ok()
+                            .flatten()
+                    });
                 let status = classify_ws_status(
                     &format!("{:?}", order.msg_type),
-                    order.original_size.as_ref().map(|value| value.to_string()).as_deref(),
-                    order.size_matched.as_ref().map(|value| value.to_string()).as_deref(),
+                    order
+                        .original_size
+                        .as_ref()
+                        .map(|value| value.to_string())
+                        .as_deref(),
+                    order
+                        .size_matched
+                        .as_ref()
+                        .map(|value| value.to_string())
+                        .as_deref(),
                 );
 
                 let _ = order_store.append_order_event(
@@ -114,11 +137,12 @@ async fn subscribe_orders(
                     );
                     let is_terminal = matches!(status, "canceled" | "filled" | "rejected");
                     if is_terminal {
-                        let _ = strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
-                            token: local_meta.token.clone(),
-                            local_order_id: local_meta.local_order_id.clone(),
-                            status: Arc::from(status),
-                        }));
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: local_meta.token.clone(),
+                                local_order_id: local_meta.local_order_id.clone(),
+                                status: Arc::from(status),
+                            }));
                     }
                 } else {
                     info!(
@@ -149,7 +173,11 @@ async fn subscribe_orders(
     Ok(())
 }
 
-fn classify_ws_status(msg_type: &str, original_size: Option<&str>, size_matched: Option<&str>) -> &'static str {
+fn classify_ws_status(
+    msg_type: &str,
+    original_size: Option<&str>,
+    size_matched: Option<&str>,
+) -> &'static str {
     let msg_type = msg_type.to_ascii_lowercase();
     if msg_type.contains("cancel") {
         return "canceled";

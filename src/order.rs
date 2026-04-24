@@ -1,11 +1,11 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{Address, Decimal};
-use polymarket_client_sdk::POLYGON;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -132,7 +132,8 @@ pub async fn run(
                 {
                     Ok(placed) => {
                         if placed {
-                            let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
+                            let _ = positions_refresh_tx
+                                .try_send(PositionRefreshTrigger::OrderPlacement);
                         }
                     }
                     Err(error) => {
@@ -210,8 +211,39 @@ pub async fn run(
                         &order_store,
                         &token,
                         &active_local_order_id,
-                    ).await;
+                    )
+                    .await;
                 }
+            }
+            UnifiedOrder::MidRequoteCancel {
+                strategy,
+                topic,
+                token,
+                side,
+                active_local_order_id,
+            } => {
+                let remote_order_id = correlations
+                    .get(&active_local_order_id)
+                    .and_then(|entry| entry.remote_order_id.clone());
+                let _ = order_store.append_order_event(
+                    Some(&active_local_order_id),
+                    remote_order_id.as_deref(),
+                    "cancel_only_requested",
+                    json!({
+                        "strategy": strategy.as_ref(),
+                        "topic": topic.as_ref(),
+                        "token": token,
+                        "side": format!("{:?}", side),
+                    }),
+                );
+                request_mid_requote_cancel(
+                    &auth,
+                    &correlations,
+                    &order_store,
+                    &token,
+                    &active_local_order_id,
+                )
+                .await;
             }
         }
     }
@@ -363,11 +395,20 @@ async fn place_mid_requote_order(
     correlations.insert(local_order_id.to_string(), meta.clone());
     correlations.insert(response.order_id.clone(), meta.clone());
     let status = if response.success { "open" } else { "failed" };
-    let _ = order_store.update_order_remote_and_status(local_order_id, &response.order_id, status, Some(mid));
+    let _ = order_store.update_order_remote_and_status(
+        local_order_id,
+        &response.order_id,
+        status,
+        Some(mid),
+    );
     let _ = order_store.append_order_event(
         Some(local_order_id),
         Some(&response.order_id),
-        if response.success { "submit_succeeded" } else { "submit_failed" },
+        if response.success {
+            "submit_succeeded"
+        } else {
+            "submit_failed"
+        },
         json!({
             "strategy": strategy.as_ref(),
             "topic": topic.as_ref(),
@@ -401,7 +442,12 @@ async fn place_mid_requote_order(
     Ok(response.success)
 }
 
-fn persist_new_order(order_store: &OrderStore, meta: &LocalOrderMeta, mid: Decimal, simulation_enabled: bool) {
+fn persist_new_order(
+    order_store: &OrderStore,
+    meta: &LocalOrderMeta,
+    mid: Decimal,
+    simulation_enabled: bool,
+) {
     let _ = order_store.upsert_order(meta, "pending_submit", Some(mid));
     let _ = order_store.append_order_event(
         Some(&meta.local_order_id),

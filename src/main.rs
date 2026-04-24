@@ -7,9 +7,9 @@ mod order_ws;
 mod positions;
 mod price_store;
 mod proxy_ws;
+mod storage;
 mod strategies;
 mod strategy;
-mod storage;
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -18,24 +18,26 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use config::{Config, File};
+use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer as _};
 use polymarket_client_sdk::clob::types::request::{OrdersRequest, TradesRequest};
 use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::error::{Kind as PmErrorKind, Status as PmStatus, StatusCode};
 use polymarket_client_sdk::types::Decimal;
-use polymarket_client_sdk::POLYGON;
 use serde::Deserialize;
 use tracing::info;
 
 use dispatcher::Dispatcher;
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
 use storage::OrderStore;
-use strategies::mid_requote::{MidRequoteRestoreState, MidRequoteStrategy};
+use strategies::mid_requote::{
+    MidRequoteRestoreSideState, MidRequoteRestoreState, MidRequoteStrategy,
+};
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
-    build_token_topics, merge_topic_tokens, Filters, OrderCorrelationMap, OrderSignal, Strategy,
-    StrategyHandle,
+    Filters, OrderCorrelationMap, OrderSignal, Strategy, StrategyHandle, build_token_topics,
+    merge_topic_tokens,
 };
 
 #[derive(Debug, Deserialize)]
@@ -221,47 +223,16 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    let restored_mid_requote_states: HashMap<String, MidRequoteRestoreState> = order_store
-        .load_mid_requote_states()?
+    let mut restored_mid_requote_states: HashMap<String, MidRequoteRestoreState> = order_store
+        .load_mid_requote_shared_states()?
         .into_iter()
         .map(|state| {
-            let active_local_order_id = state
-                .active_local_order_id
-                .filter(|order_id| order_correlations.contains_key(order_id));
-            let active_side = active_local_order_id
-                .as_ref()
-                .and_then(|order_id| order_correlations.get(order_id).map(|entry| entry.side));
-            let pending_local_order_id = state
-                .pending_local_order_id
-                .filter(|order_id| order_correlations.contains_key(order_id));
-            let has_pending_replacement = pending_local_order_id.is_some();
             (
                 state.token.clone(),
                 MidRequoteRestoreState {
                     topic: Arc::from(state.topic),
-                    active_local_order_id,
-                    active_side,
-                    pending_local_order_id,
-                    pending_side: if has_pending_replacement {
-                        state.pending_side
-                    } else {
-                        None
-                    },
-                    pending_price: if has_pending_replacement {
-                        state.pending_price
-                    } else {
-                        None
-                    },
-                    pending_order_size: if has_pending_replacement {
-                        state.pending_order_size
-                    } else {
-                        None
-                    },
-                    pending_mid: if has_pending_replacement {
-                        state.pending_mid
-                    } else {
-                        None
-                    },
+                    buy: MidRequoteRestoreSideState::default(),
+                    sell: MidRequoteRestoreSideState::default(),
                     last_mid: state.last_mid,
                     last_best_bid: state.last_best_bid,
                     last_best_ask: state.last_best_ask,
@@ -271,14 +242,71 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    for side_state in order_store.load_mid_requote_side_states()? {
+        let restore_state = restored_mid_requote_states
+            .entry(side_state.token.clone())
+            .or_insert_with(|| MidRequoteRestoreState {
+                topic: Arc::from("mid"),
+                buy: MidRequoteRestoreSideState::default(),
+                sell: MidRequoteRestoreSideState::default(),
+                last_mid: None,
+                last_best_bid: None,
+                last_best_ask: None,
+                last_position_size: Decimal::ZERO,
+            });
+        let lane = match side_state.side {
+            strategy::QuoteSide::Buy => &mut restore_state.buy,
+            strategy::QuoteSide::Sell => &mut restore_state.sell,
+        };
+
+        lane.active_local_order_id = side_state.active_local_order_id.filter(|order_id| {
+            order_correlations
+                .get(order_id)
+                .is_some_and(|entry| entry.side == side_state.side)
+        });
+        lane.active_order_size = lane.active_local_order_id.as_ref().and_then(|order_id| {
+            order_correlations
+                .get(order_id)
+                .map(|entry| entry.order_size)
+        });
+
+        lane.pending_local_order_id = side_state.pending_local_order_id.filter(|order_id| {
+            order_correlations
+                .get(order_id)
+                .is_some_and(|entry| entry.side == side_state.side)
+        });
+        let has_pending_replacement = lane.pending_local_order_id.is_some();
+        lane.pending_price = if has_pending_replacement {
+            side_state.pending_price
+        } else {
+            None
+        };
+        lane.pending_order_size = if has_pending_replacement {
+            side_state.pending_order_size
+        } else {
+            None
+        };
+        lane.pending_mid = if has_pending_replacement {
+            side_state.pending_mid
+        } else {
+            None
+        };
+        lane.last_quoted_mid = side_state.last_quoted_mid;
+        lane.cancel_requested = side_state.cancel_requested;
+    }
+
     let mid_file = if !app_config.mid_requote.file.is_empty() {
         app_config.mid_requote.file.as_str()
     } else {
         "mid.csv"
     };
     let mid_requote = if app_config.mid_requote.enabled {
-        MidRequoteStrategy::from_csv(mid_file)?
-            .map(|strategy| strategy.with_restore_state(restored_mid_requote_states.clone(), Some(order_store.clone())))
+        MidRequoteStrategy::from_csv(mid_file)?.map(|strategy| {
+            strategy.with_restore_state(
+                restored_mid_requote_states.clone(),
+                Some(order_store.clone()),
+            )
+        })
     } else {
         None
     };
@@ -428,7 +456,9 @@ async fn reconcile_startup_orders(
     let mut cursor: Option<String> = None;
 
     loop {
-        let page = client.orders(&OrdersRequest::default(), cursor.clone()).await?;
+        let page = client
+            .orders(&OrdersRequest::default(), cursor.clone())
+            .await?;
         for order in page.data {
             remote_open_orders.insert(order.id.clone(), order);
         }
@@ -491,15 +521,20 @@ async fn reconcile_startup_orders(
                         "price": order.price.to_string(),
                     }),
                 )?;
-                if !matches!(status, "filled" | "canceled" | "rejected" | "failed" | "unknown") {
+                if !matches!(
+                    status,
+                    "filled" | "canceled" | "rejected" | "failed" | "unknown"
+                ) {
                     let mut updated = stored_order.clone();
                     updated.status = status.to_string();
                     reconciled.push(updated);
                 }
             }
             Err(error) if is_not_found_status(&error) => {
-                let terminal_status = infer_missing_remote_terminal_status(&client, &stored_order).await?;
-                order_store.update_order_status_by_local(&stored_order.local_order_id, terminal_status)?;
+                let terminal_status =
+                    infer_missing_remote_terminal_status(&client, &stored_order).await?;
+                order_store
+                    .update_order_status_by_local(&stored_order.local_order_id, terminal_status)?;
                 order_store.append_order_event(
                     Some(&stored_order.local_order_id),
                     Some(remote_order_id),
@@ -521,14 +556,15 @@ async fn build_authenticated_clob_client(
     auth: &AuthConfig,
 ) -> anyhow::Result<ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
-    Ok(
-        ClobClient::new("https://clob.polymarket.com", ClobConfig::builder().use_server_time(true).build())?
-            .authentication_builder(&signer)
-            .funder(auth.funder.parse()?)
-            .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
-            .authenticate()
-            .await?,
-    )
+    Ok(ClobClient::new(
+        "https://clob.polymarket.com",
+        ClobConfig::builder().use_server_time(true).build(),
+    )?
+    .authentication_builder(&signer)
+    .funder(auth.funder.parse()?)
+    .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
+    .authenticate()
+    .await?)
 }
 
 fn map_open_order_status(order: &OpenOrderResponse) -> &'static str {

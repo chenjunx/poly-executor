@@ -209,10 +209,14 @@ fn check_pairs(
         if ask0 - bid0 > filters.max_spread || ask1 - bid1 > filters.max_spread {
             continue;
         }
-        if bid0 < filters.min_price || bid0 > filters.max_price
-            || ask0 < filters.min_price || ask0 > filters.max_price
-            || bid1 < filters.min_price || bid1 > filters.max_price
-            || ask1 < filters.min_price || ask1 > filters.max_price
+        if bid0 < filters.min_price
+            || bid0 > filters.max_price
+            || ask0 < filters.min_price
+            || ask0 > filters.max_price
+            || bid1 < filters.min_price
+            || bid1 > filters.max_price
+            || ask1 < filters.min_price
+            || ask1 > filters.max_price
         {
             continue;
         }
@@ -229,8 +233,14 @@ fn check_pairs(
             topic,
             event_ts,
             gap,
-            &p0.asset_id[..12], bid0, ask0, p0.updated_at_ms,
-            &p1.asset_id[..12], bid1, ask1, p1.updated_at_ms,
+            &p0.asset_id[..12],
+            bid0,
+            ask0,
+            p0.updated_at_ms,
+            &p1.asset_id[..12],
+            bid1,
+            ask1,
+            p1.updated_at_ms,
         );
         info!(target: "alerts", "{}", line.trim_end());
 

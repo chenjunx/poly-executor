@@ -2,11 +2,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
+use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer as _};
 use polymarket_client_sdk::clob::types::request::UserRewardsEarningRequest;
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::Decimal;
-use polymarket_client_sdk::POLYGON;
 use tracing::{info, warn};
 
 use crate::AuthConfig;
@@ -28,7 +28,9 @@ async fn poll_user_rewards(auth: &AuthConfig) -> anyhow::Result<()> {
     let client = build_authenticated_clob_client(auth).await?;
     let date = Utc::now().date_naive() - TimeDelta::days(30);
     let request = UserRewardsEarningRequest::builder().date(date).build();
-    let rewards = client.user_earnings_and_markets_config(&request, None).await?;
+    let rewards = client
+        .user_earnings_and_markets_config(&request, None)
+        .await?;
     let reward_percentages = client.reward_percentages().await?;
 
     let total_earnings = rewards
@@ -74,12 +76,13 @@ async fn build_authenticated_clob_client(
     auth: &AuthConfig,
 ) -> anyhow::Result<ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
-    Ok(
-        ClobClient::new(CLOB_HOST, ClobConfig::builder().use_server_time(true).build())?
-            .authentication_builder(&signer)
-            .funder(auth.funder.parse()?)
-            .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
-            .authenticate()
-            .await?,
-    )
+    Ok(ClobClient::new(
+        CLOB_HOST,
+        ClobConfig::builder().use_server_time(true).build(),
+    )?
+    .authentication_builder(&signer)
+    .funder(auth.funder.parse()?)
+    .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
+    .authenticate()
+    .await?)
 }

@@ -50,6 +50,13 @@ pub enum OrderSignal {
         pending_local_order_id: String,
         request_cancel: bool,
     },
+    MidRequoteCancel {
+        strategy: Arc<str>,
+        topic: Arc<str>,
+        token: String,
+        side: QuoteSide,
+        active_local_order_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +89,13 @@ pub enum UnifiedOrder {
         active_local_order_id: String,
         pending_local_order_id: String,
         request_cancel: bool,
+    },
+    MidRequoteCancel {
+        strategy: Arc<str>,
+        topic: Arc<str>,
+        token: String,
+        side: QuoteSide,
+        active_local_order_id: String,
     },
 }
 
@@ -142,6 +156,19 @@ impl From<OrderSignal> for UnifiedOrder {
                 active_local_order_id,
                 pending_local_order_id,
                 request_cancel,
+            },
+            OrderSignal::MidRequoteCancel {
+                strategy,
+                topic,
+                token,
+                side,
+                active_local_order_id,
+            } => Self::MidRequoteCancel {
+                strategy,
+                topic,
+                token,
+                side,
+                active_local_order_id,
             },
         }
     }
@@ -289,10 +316,7 @@ pub trait Strategy: Send + 'static {
     fn name(&self) -> &str;
     fn registration(&self) -> &StrategyRegistration;
 
-    fn relevant_positions(
-        &self,
-        event: &PositionsUpdateEvent,
-    ) -> Option<RelevantPositionsUpdate> {
+    fn relevant_positions(&self, event: &PositionsUpdateEvent) -> Option<RelevantPositionsUpdate> {
         let related_tokens = &self.registration().related_tokens;
         let changed_assets: Vec<String> = event
             .changed_assets

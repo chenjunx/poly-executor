@@ -15,7 +15,8 @@
       "WebSearch",
       "Bash(curl *)",
       "Bash(claude *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(cargo fmt *)"
     ]
   }
 }

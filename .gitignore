@@ -4,3 +4,4 @@ config.local.toml
 orders.db
 orders.db-shm
 orders.db-wal
+*.log

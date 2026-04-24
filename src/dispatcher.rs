@@ -16,7 +16,10 @@ impl Dispatcher {
         let mut position_routes: HashMap<String, Vec<StrategyHandle>> = HashMap::new();
         for strategy in &strategies {
             for topic in strategy.topics.iter() {
-                routes.entry(topic.clone()).or_default().push(strategy.clone());
+                routes
+                    .entry(topic.clone())
+                    .or_default()
+                    .push(strategy.clone());
             }
             for token in strategy.related_tokens.iter() {
                 position_routes
