@@ -24,6 +24,10 @@ pub struct MidRequoteRule {
     pub offset: Decimal,
     pub mid_change_threshold: Decimal,
     pub target_order_size: Decimal,
+    pub reward_min_orders: Option<u32>,
+    pub reward_max_spread_cents: Option<f64>,
+    pub reward_min_size: Option<f64>,
+    pub reward_daily_pool: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +94,10 @@ pub struct MidRequoteStrategy {
 }
 
 impl MidRequoteStrategy {
+    pub fn rules(&self) -> impl Iterator<Item = (&String, &MidRequoteRule)> {
+        self.rules.iter()
+    }
+
     pub fn with_restore_state(
         mut self,
         restored_states: HashMap<String, MidRequoteRestoreState>,
@@ -135,12 +143,21 @@ impl MidRequoteStrategy {
                 Arc::from(DEFAULT_TOPIC)
             };
 
+            let reward_min_orders = record.get(5).and_then(|v| v.trim().parse::<u32>().ok());
+            let reward_max_spread_cents = record.get(6).and_then(|v| v.trim().parse::<f64>().ok());
+            let reward_min_size = record.get(7).and_then(|v| v.trim().parse::<f64>().ok());
+            let reward_daily_pool = record.get(8).and_then(|v| v.trim().parse::<f64>().ok());
+
             rules.push(MidRequoteRule {
                 topic,
                 token: token.to_string(),
                 offset,
                 mid_change_threshold,
                 target_order_size,
+                reward_min_orders,
+                reward_max_spread_cents,
+                reward_min_size,
+                reward_daily_pool,
             });
         }
 

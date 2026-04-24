@@ -10,6 +10,7 @@ use polymarket_client_sdk::clob::ws::types::response::{
 use polymarket_client_sdk::types::Decimal;
 use tracing::{info, warn};
 
+use crate::monitor::FullBookSnapshot;
 use crate::proxy_ws;
 use crate::strategy::{CleanOrderbook, MarketEvent, StrategyEvent};
 
@@ -193,6 +194,7 @@ pub async fn run(
     mid_tokens: Arc<std::collections::HashSet<String>>,
     mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
     market_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
+    monitor_tx: Option<tokio::sync::mpsc::Sender<FullBookSnapshot>>,
 ) {
     let mut books: HashMap<String, LocalOrderbook> = HashMap::new();
 
@@ -204,6 +206,17 @@ pub async fn run(
 
         for (asset_id, book) in events {
             log_mid_orderbook_diagnostics(&msg, &asset_id, &book, mid_tokens.as_ref());
+
+            if let Some(ref tx) = monitor_tx {
+                if let Some(state) = books.get(asset_id.as_ref()) {
+                    let _ = tx.try_send(FullBookSnapshot {
+                        asset_id: asset_id.clone(),
+                        bids: Arc::new(state.bids.clone()),
+                        asks: Arc::new(state.asks.clone()),
+                        timestamp_ms: state.timestamp_ms,
+                    });
+                }
+            }
 
             let Some(topics) = token_topics.get(asset_id.as_ref()) else {
                 continue;

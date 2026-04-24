@@ -6,6 +6,7 @@ mod market;
 mod monitor;
 mod order;
 mod order_ws;
+mod polymarket_rewards;
 mod positions;
 mod price_store;
 mod proxy_ws;
@@ -21,6 +22,7 @@ use tracing::info;
 
 use config::load_app_config;
 use dispatcher::Dispatcher;
+use monitor::RewardMonitorConfig;
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
 use recovery::RecoveryCoordinator;
 use storage::OrderStore;
@@ -101,16 +103,40 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "mid.csv"
     };
-    let mid_requote = if app_config.mid_requote.enabled {
-        MidRequoteStrategy::from_csv(mid_file)?.map(|strategy| {
-            strategy.with_restore_state(
-                restored_mid_requote_states.clone(),
-                Some(order_store.clone()),
-            )
-        })
+    let mid_requote_strategy_opt = if app_config.mid_requote.enabled {
+        MidRequoteStrategy::from_csv(mid_file)?
     } else {
         None
     };
+
+    let reward_monitor_configs: std::collections::HashMap<String, RewardMonitorConfig> =
+        mid_requote_strategy_opt
+            .as_ref()
+            .map(|s| {
+                s.rules()
+                    .filter_map(|(token, rule)| {
+                        let pool = rule.reward_daily_pool?;
+                        let spread = rule.reward_max_spread_cents?;
+                        Some((
+                            token.clone(),
+                            RewardMonitorConfig {
+                                min_orders: rule.reward_min_orders.unwrap_or(0),
+                                max_spread_cents: spread,
+                                min_size: rule.reward_min_size.unwrap_or(0.0),
+                                daily_reward_pool: pool,
+                            },
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    let mid_requote = mid_requote_strategy_opt.map(|strategy| {
+        strategy.with_restore_state(
+            restored_mid_requote_states.clone(),
+            Some(order_store.clone()),
+        )
+    });
 
     let mid_tokens: Arc<std::collections::HashSet<String>> = Arc::new(
         mid_requote
@@ -162,6 +188,17 @@ async fn main() -> anyhow::Result<()> {
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * topic_tokens.len().max(1));
     let (strategy_tx, strategy_rx) = tokio::sync::mpsc::channel(1024);
     let (order_tx, order_rx) = tokio::sync::mpsc::channel::<OrderSignal>(64);
+    let monitor_tx = if reward_monitor_configs.is_empty() {
+        None
+    } else {
+        let (tx, rx) = tokio::sync::mpsc::channel(512);
+        tokio::spawn(monitor::run_reward_estimator(
+            rx,
+            reward_monitor_configs,
+            order_correlations.clone(),
+        ));
+        Some(tx)
+    };
     let (positions_refresh_tx, positions_refresh_rx) = tokio::sync::mpsc::channel(64);
     let (sim_fill_tx, sim_fill_rx) = tokio::sync::mpsc::channel::<SimulatedFillEvent>(64);
 
@@ -192,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
         mid_tokens.clone(),
         ws_rx,
         strategy_tx.clone(),
+        monitor_tx,
     ));
     if app_config.simulation.enabled {
         tokio::spawn(positions::run_simulated(sim_fill_rx, strategy_tx.clone()));

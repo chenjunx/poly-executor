@@ -16,7 +16,18 @@
       "Bash(curl *)",
       "Bash(claude *)",
       "Bash(python *)",
-      "Bash(cargo fmt *)"
+      "Bash(cargo fmt *)",
+      "Bash(git -C \"/e/work/poly-executor\" status --short)",
+      "Bash(git -C \"/e/work/poly-executor\" rev-parse --show-toplevel)",
+      "Bash(git grep *)",
+      "Bash(git restore *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:www.scribd.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:startpolymarket.com)"
     ]
   }
 }
