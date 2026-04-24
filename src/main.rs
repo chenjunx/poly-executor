@@ -1,6 +1,7 @@
 mod dispatcher;
 mod logging;
 mod market;
+mod monitor;
 mod order;
 mod order_ws;
 mod positions;
@@ -11,12 +12,19 @@ mod strategy;
 mod storage;
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
 use config::{Config, File};
+use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer as _};
+use polymarket_client_sdk::clob::types::request::{OrdersRequest, TradesRequest};
+use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
+use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk::error::{Kind as PmErrorKind, Status as PmStatus, StatusCode};
 use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk::POLYGON;
 use serde::Deserialize;
 use tracing::info;
 
@@ -61,6 +69,8 @@ struct AppSettings {
     min_price: f64,
     max_price: f64,
     default_threads: usize,
+    #[serde(default = "default_monitor_interval_secs")]
+    monitor_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -90,6 +100,12 @@ struct MidRequoteConfig {
     enabled: bool,
     #[serde(default)]
     file: String,
+    #[serde(default)]
+    monitor_enabled: bool,
+}
+
+fn default_monitor_interval_secs() -> u64 {
+    30
 }
 
 #[tokio::main]
@@ -175,7 +191,14 @@ async fn main() -> anyhow::Result<()> {
 
     let order_correlations: OrderCorrelationMap = Arc::new(DashMap::new());
 
-    for stored_order in order_store.load_active_orders()? {
+    let stored_active_orders = order_store.load_active_orders()?;
+    let reconciled_active_orders = if app_config.simulation.enabled {
+        stored_active_orders
+    } else {
+        reconcile_startup_orders(&app_config.auth, &order_store, stored_active_orders).await?
+    };
+
+    for stored_order in reconciled_active_orders {
         let local_meta = stored_order.to_local_order_meta();
         order_correlations.insert(local_meta.local_order_id.clone(), local_meta.clone());
         if let Some(remote_order_id) = &local_meta.remote_order_id {
@@ -273,6 +296,16 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or_default(),
     );
+
+    if app_config.mid_requote.enabled
+        && app_config.mid_requote.monitor_enabled
+        && !app_config.simulation.enabled
+    {
+        tokio::spawn(monitor::run_mid_reward_monitor(
+            app_config.auth.clone(),
+            app_config.app.monitor_interval_secs.max(1),
+        ));
+    }
 
     let mut registrations = vec![pair_registration.clone()];
     if let Some(strategy) = &mid_requote {
@@ -383,4 +416,168 @@ async fn main() -> anyhow::Result<()> {
 
     futures::future::pending::<()>().await;
     Ok(())
+}
+
+async fn reconcile_startup_orders(
+    auth: &AuthConfig,
+    order_store: &OrderStore,
+    stored_orders: Vec<storage::StoredOrder>,
+) -> anyhow::Result<Vec<storage::StoredOrder>> {
+    let client = build_authenticated_clob_client(auth).await?;
+    let mut remote_open_orders = HashMap::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let page = client.orders(&OrdersRequest::default(), cursor.clone()).await?;
+        for order in page.data {
+            remote_open_orders.insert(order.id.clone(), order);
+        }
+        if page.next_cursor == "LTE=" {
+            break;
+        }
+        cursor = Some(page.next_cursor);
+    }
+
+    let mut reconciled = Vec::new();
+    for stored_order in stored_orders {
+        let Some(remote_order_id) = stored_order.remote_order_id.as_deref() else {
+            order_store.update_order_status_by_local(&stored_order.local_order_id, "unknown")?;
+            order_store.append_order_event(
+                Some(&stored_order.local_order_id),
+                None,
+                "startup_reconciled",
+                serde_json::json!({
+                    "result": "missing_remote_order_id",
+                    "status": "unknown",
+                }),
+            )?;
+            continue;
+        };
+
+        if let Some(open_order) = remote_open_orders.get(remote_order_id) {
+            let status = map_open_order_status(open_order);
+            order_store.update_order_status_by_remote(remote_order_id, status)?;
+            order_store.append_order_event(
+                Some(&stored_order.local_order_id),
+                Some(remote_order_id),
+                "startup_reconciled",
+                serde_json::json!({
+                    "result": "present_in_open_orders",
+                    "status": status,
+                    "original_size": open_order.original_size.to_string(),
+                    "size_matched": open_order.size_matched.to_string(),
+                    "price": open_order.price.to_string(),
+                }),
+            )?;
+            let mut updated = stored_order.clone();
+            updated.status = status.to_string();
+            reconciled.push(updated);
+            continue;
+        }
+
+        match client.order(remote_order_id).await {
+            Ok(order) => {
+                let status = map_single_order_status(&order);
+                order_store.update_order_status_by_remote(remote_order_id, status)?;
+                order_store.append_order_event(
+                    Some(&stored_order.local_order_id),
+                    Some(remote_order_id),
+                    "startup_reconciled",
+                    serde_json::json!({
+                        "result": "resolved_by_order_lookup",
+                        "status": status,
+                        "original_size": order.original_size.to_string(),
+                        "size_matched": order.size_matched.to_string(),
+                        "price": order.price.to_string(),
+                    }),
+                )?;
+                if !matches!(status, "filled" | "canceled" | "rejected" | "failed" | "unknown") {
+                    let mut updated = stored_order.clone();
+                    updated.status = status.to_string();
+                    reconciled.push(updated);
+                }
+            }
+            Err(error) if is_not_found_status(&error) => {
+                let terminal_status = infer_missing_remote_terminal_status(&client, &stored_order).await?;
+                order_store.update_order_status_by_local(&stored_order.local_order_id, terminal_status)?;
+                order_store.append_order_event(
+                    Some(&stored_order.local_order_id),
+                    Some(remote_order_id),
+                    "startup_reconciled",
+                    serde_json::json!({
+                        "result": "missing_from_remote",
+                        "status": terminal_status,
+                    }),
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(reconciled)
+}
+
+async fn build_authenticated_clob_client(
+    auth: &AuthConfig,
+) -> anyhow::Result<ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>> {
+    let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
+    Ok(
+        ClobClient::new("https://clob.polymarket.com", ClobConfig::builder().use_server_time(true).build())?
+            .authentication_builder(&signer)
+            .funder(auth.funder.parse()?)
+            .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
+            .authenticate()
+            .await?,
+    )
+}
+
+fn map_open_order_status(order: &OpenOrderResponse) -> &'static str {
+    if order.size_matched == Decimal::ZERO {
+        "open"
+    } else {
+        "partially_filled"
+    }
+}
+
+fn map_single_order_status(order: &OpenOrderResponse) -> &'static str {
+    use polymarket_client_sdk::clob::types::OrderStatusType;
+
+    match order.status {
+        OrderStatusType::Canceled => "canceled",
+        OrderStatusType::Matched => {
+            if order.size_matched == order.original_size {
+                "filled"
+            } else {
+                "partially_filled"
+            }
+        }
+        OrderStatusType::Live | OrderStatusType::Delayed | OrderStatusType::Unmatched => {
+            map_open_order_status(order)
+        }
+        OrderStatusType::Unknown => "unknown",
+        _ => "unknown",
+    }
+}
+
+async fn infer_missing_remote_terminal_status(
+    client: &ClobClient<polymarket_client_sdk::auth::state::Authenticated<Normal>>,
+    stored_order: &storage::StoredOrder,
+) -> anyhow::Result<&'static str> {
+    let request = TradesRequest::builder()
+        .asset_id(stored_order.token.clone())
+        .build();
+    let page = client.trades(&request, None).await?;
+    let has_full_fill = page.data.iter().any(|trade| {
+        trade.maker_orders.iter().any(|maker_order| {
+            maker_order.order_id == stored_order.remote_order_id.clone().unwrap_or_default()
+        })
+    });
+    Ok(if has_full_fill { "filled" } else { "unknown" })
+}
+
+fn is_not_found_status(error: &polymarket_client_sdk::error::Error) -> bool {
+    error.kind() == PmErrorKind::Status
+        && error
+            .downcast_ref::<PmStatus>()
+            .is_some_and(|status| status.status_code == StatusCode::NOT_FOUND)
 }

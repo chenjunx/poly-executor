@@ -74,6 +74,8 @@ async fn subscribe_orders(
                     Some(&order.id),
                     "ws_update",
                     json!({
+                        "strategy": local_meta.as_ref().map(|meta| meta.strategy.as_ref()),
+                        "topic": local_meta.as_ref().and_then(|meta| meta.topic.as_ref().map(|topic| topic.as_ref())),
                         "market": order.market,
                         "asset_id": order.asset_id,
                         "side": format!("{:?}", order.side),

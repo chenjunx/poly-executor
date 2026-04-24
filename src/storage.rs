@@ -305,7 +305,7 @@ impl OrderStore {
                 SELECT local_order_id, remote_order_id, strategy, topic, token, side, price,
                        min_order_size, status, last_mid
                 FROM orders
-                WHERE status NOT IN ('filled', 'canceled', 'rejected', 'failed')
+                WHERE status NOT IN ('filled', 'canceled', 'rejected', 'failed', 'unknown')
                 ",
             )?;
             let rows = stmt.query_map([], |row| {

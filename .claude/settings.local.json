@@ -9,7 +9,13 @@
       "Bash(git remote get-url origin)",
       "Bash(bash scripts/deploy_prod.sh *)",
       "Bash(bash scripts/ops_prod.sh *)",
-      "Bash(bash scripts/remote_bootstrap_prod.sh *)"
+      "Bash(bash scripts/remote_bootstrap_prod.sh *)",
+      "Bash(claude plugins *)",
+      "Bash(claude plugin *)",
+      "WebSearch",
+      "Bash(curl *)",
+      "Bash(claude *)",
+      "Bash(python *)"
     ]
   }
 }

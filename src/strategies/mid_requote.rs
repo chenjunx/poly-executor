@@ -22,6 +22,7 @@ pub struct MidRequoteRule {
     pub topic: Arc<str>,
     pub token: String,
     pub offset: Decimal,
+    pub mid_change_threshold: Decimal,
     pub min_order_size: Decimal,
 }
 
@@ -44,6 +45,7 @@ struct PendingReplacement {
 struct RequoteState {
     topic: Arc<str>,
     last_mid: Option<Decimal>,
+    last_quoted_mid: Option<Decimal>,
     last_best_bid: Option<Decimal>,
     last_best_ask: Option<Decimal>,
     last_position_size: Decimal,
@@ -101,15 +103,21 @@ impl MidRequoteStrategy {
 
             let token = record[0].trim();
             let offset = record[1].trim();
-            let min_order_size = record[2].trim();
-            if token.is_empty() || offset.is_empty() || min_order_size.is_empty() {
+            let mid_change_threshold = record[2].trim();
+            let min_order_size = record[3].trim();
+            if token.is_empty()
+                || offset.is_empty()
+                || mid_change_threshold.is_empty()
+                || min_order_size.is_empty()
+            {
                 continue;
             }
 
             let offset = Decimal::try_from(offset.parse::<f64>()?)?;
+            let mid_change_threshold = Decimal::try_from(mid_change_threshold.parse::<f64>()?)?;
             let min_order_size = Decimal::try_from(min_order_size.parse::<f64>()?)?;
-            let topic: Arc<str> = if record.len() >= 4 && !record[3].trim().is_empty() {
-                Arc::from(record[3].trim())
+            let topic: Arc<str> = if record.len() >= 5 && !record[4].trim().is_empty() {
+                Arc::from(record[4].trim())
             } else {
                 Arc::from(DEFAULT_TOPIC)
             };
@@ -118,6 +126,7 @@ impl MidRequoteStrategy {
                 topic,
                 token: token.to_string(),
                 offset,
+                mid_change_threshold,
                 min_order_size,
             });
         }
@@ -203,6 +212,7 @@ impl Strategy for MidRequoteStrategy {
                         RequoteState {
                             topic: restored.topic,
                             last_mid: restored.last_mid,
+                            last_quoted_mid: restored.last_mid,
                             last_best_bid: restored.last_best_bid,
                             last_best_ask: restored.last_best_ask,
                             last_position_size: restored.last_position_size,
@@ -252,6 +262,7 @@ impl Strategy for MidRequoteStrategy {
                             .or_insert_with(|| RequoteState {
                                 topic: rule.topic.clone(),
                                 last_mid: None,
+                                last_quoted_mid: None,
                                 last_best_bid: None,
                                 last_best_ask: None,
                                 last_position_size: Decimal::ZERO,
@@ -259,11 +270,18 @@ impl Strategy for MidRequoteStrategy {
                                 pending_replacement: None,
                             });
                         let is_first_snapshot = state.last_mid.is_none();
-                        let mid_changed = state.last_mid != Some(mid);
+                        let prev_mid = state.last_mid;
+                        let mid_changed = prev_mid != Some(mid);
+                        let quoted_mid_delta = state
+                            .last_quoted_mid
+                            .map(|quoted_mid| (mid - quoted_mid).abs());
+                        let should_requote = state.last_quoted_mid.is_none()
+                            || quoted_mid_delta.is_some_and(|delta| delta >= rule.mid_change_threshold);
 
                         state.topic = rule.topic.clone();
                         state.last_best_bid = Some(bid);
                         state.last_best_ask = Some(ask);
+                        state.last_mid = Some(mid);
 
                         if is_first_snapshot {
                             info!(
@@ -273,6 +291,7 @@ impl Strategy for MidRequoteStrategy {
                                 bid = %bid,
                                 ask = %ask,
                                 mid = %mid,
+                                mid_change_threshold = %rule.mid_change_threshold,
                                 ts = event.book.timestamp_ms,
                                 "mid_requote 首次收到行情"
                             );
@@ -284,18 +303,22 @@ impl Strategy for MidRequoteStrategy {
                                 bid = %bid,
                                 ask = %ask,
                                 mid = %mid,
-                                prev_mid = ?state.last_mid,
+                                prev_mid = ?prev_mid,
+                                last_quoted_mid = ?state.last_quoted_mid,
+                                quoted_mid_delta = ?quoted_mid_delta,
+                                mid_change_threshold = %rule.mid_change_threshold,
+                                will_requote = should_requote,
                                 ts = event.book.timestamp_ms,
                                 "mid_requote mid 发生变化"
                             );
                         }
 
-                        if !mid_changed {
+                        if !mid_changed || !should_requote {
                             persist_state(order_store.as_ref(), &rule.token, state);
                             continue;
                         }
 
-                        state.last_mid = Some(mid);
+                        state.last_quoted_mid = Some(mid);
 
                         let side = state
                             .active_order
@@ -337,6 +360,7 @@ impl Strategy for MidRequoteStrategy {
                             continue;
                         };
                         if let Err(err) = order_tx.try_send(OrderSignal::MidRequotePlace {
+                            strategy: Arc::from("mid_requote"),
                             topic: state.topic.clone(),
                             token: status_event.token.clone(),
                             mid: pending.mid,
@@ -391,6 +415,7 @@ impl Strategy for MidRequoteStrategy {
                                 .or_insert_with(|| RequoteState {
                                     topic: rule.topic.clone(),
                                     last_mid: None,
+                                    last_quoted_mid: None,
                                     last_best_bid: None,
                                     last_best_ask: None,
                                     last_position_size: Decimal::ZERO,
@@ -403,6 +428,7 @@ impl Strategy for MidRequoteStrategy {
                             if state.active_order.is_none() {
                                 if let Some(pending) = state.pending_replacement.clone() {
                                     if let Err(err) = order_tx.try_send(OrderSignal::MidRequotePlace {
+                                        strategy: Arc::from("mid_requote"),
                                         topic: state.topic.clone(),
                                         token: token.clone(),
                                         mid: pending.mid,
@@ -476,6 +502,8 @@ impl Strategy for MidRequoteStrategy {
                                 continue;
                             }
 
+                            state.last_quoted_mid = Some(mid);
+
                             if let Err(err) = submit_quote(
                                 rule,
                                 state,
@@ -538,6 +566,7 @@ fn submit_quote(
             mid,
         });
         return order_tx.try_send(OrderSignal::MidRequoteStageReplacement {
+            strategy: Arc::from("mid_requote"),
             topic: rule.topic.clone(),
             token: rule.token.clone(),
             mid,
@@ -556,6 +585,7 @@ fn submit_quote(
     });
 
     order_tx.try_send(OrderSignal::MidRequotePlace {
+        strategy: Arc::from("mid_requote"),
         topic: rule.topic.clone(),
         token: rule.token.clone(),
         mid,
@@ -591,7 +621,7 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &RequoteS
 
 fn resolve_csv_path(csv_file: &str) -> String {
     let csv_path = Path::new(csv_file);
-    if csv_path.is_absolute() {
+    if csv_path.is_absolute() || csv_path.exists() {
         csv_file.to_string()
     } else if let Ok(mut exe_path) = std::env::current_exe() {
         exe_path.pop();

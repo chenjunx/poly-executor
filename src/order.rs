@@ -47,6 +47,7 @@ pub async fn run(
                 }
             }
             UnifiedOrder::MidRequotePlace {
+                strategy,
                 topic,
                 token,
                 mid,
@@ -58,7 +59,7 @@ pub async fn run(
                 let meta = LocalOrderMeta {
                     local_order_id: local_order_id.clone(),
                     remote_order_id: None,
-                    strategy: Arc::from("mid_requote"),
+                    strategy: strategy.clone(),
                     topic: Some(topic.clone()),
                     token: token.clone(),
                     side,
@@ -87,6 +88,7 @@ pub async fn run(
                         "submit_succeeded",
                         json!({
                             "mode": "simulation",
+                            "strategy": strategy.as_ref(),
                             "topic": topic.as_ref(),
                             "token": token,
                             "side": format!("{:?}", side),
@@ -117,6 +119,7 @@ pub async fn run(
                     &auth,
                     &correlations,
                     &order_store,
+                    &strategy,
                     &topic,
                     &token,
                     mid,
@@ -139,6 +142,7 @@ pub async fn run(
                             None,
                             "submit_failed",
                             json!({
+                                "strategy": strategy.as_ref(),
                                 "topic": topic.as_ref(),
                                 "token": token,
                                 "side": format!("{:?}", side),
@@ -161,6 +165,7 @@ pub async fn run(
                 }
             }
             UnifiedOrder::MidRequoteStageReplacement {
+                strategy,
                 topic,
                 token,
                 mid,
@@ -174,7 +179,7 @@ pub async fn run(
                 let meta = LocalOrderMeta {
                     local_order_id: pending_local_order_id.clone(),
                     remote_order_id: None,
-                    strategy: Arc::from("mid_requote"),
+                    strategy: strategy.clone(),
                     topic: Some(topic.clone()),
                     token: token.clone(),
                     side,
@@ -188,6 +193,7 @@ pub async fn run(
                     None,
                     "replacement_staged",
                     json!({
+                        "strategy": strategy.as_ref(),
                         "topic": topic.as_ref(),
                         "token": token,
                         "active_local_order_id": active_local_order_id,
@@ -218,15 +224,15 @@ async fn request_mid_requote_cancel(
     token: &str,
     local_order_id: &str,
 ) {
+    let meta = correlations.get(local_order_id).map(|entry| entry.clone());
     let _ = order_store.update_order_status_by_local(local_order_id, "cancel_requested");
     let _ = order_store.append_order_event(
         Some(local_order_id),
-        correlations
-            .get(local_order_id)
-            .and_then(|entry| entry.remote_order_id.clone())
-            .as_deref(),
+        meta.as_ref().and_then(|entry| entry.remote_order_id.as_deref()),
         "cancel_requested",
         json!({
+            "strategy": meta.as_ref().map(|entry| entry.strategy.as_ref()),
+            "topic": meta.as_ref().and_then(|entry| entry.topic.as_ref().map(|topic| topic.as_ref())),
             "token": token,
         }),
     );
@@ -266,7 +272,7 @@ async fn request_mid_requote_cancel(
         }
     };
 
-    let Some(meta) = correlations.get(local_order_id).map(|entry| entry.clone()) else {
+    let Some(meta) = meta else {
         warn!(target: "order", local_order_id = %local_order_id, token = %token, "mid_requote 取消旧单时未找到本地订单元数据");
         return;
     };
@@ -311,6 +317,7 @@ async fn place_mid_requote_order(
     auth: &AuthConfig,
     correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
+    strategy: &Arc<str>,
     topic: &Arc<str>,
     token: &str,
     mid: Decimal,
@@ -362,6 +369,7 @@ async fn place_mid_requote_order(
         Some(&response.order_id),
         if response.success { "submit_succeeded" } else { "submit_failed" },
         json!({
+            "strategy": strategy.as_ref(),
             "topic": topic.as_ref(),
             "token": token,
             "mid": mid.to_string(),

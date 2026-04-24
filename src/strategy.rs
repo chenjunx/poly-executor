@@ -29,6 +29,7 @@ pub enum OrderSignal {
         gap: Decimal,
     },
     MidRequotePlace {
+        strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
         mid: Decimal,
@@ -38,6 +39,7 @@ pub enum OrderSignal {
         local_order_id: String,
     },
     MidRequoteStageReplacement {
+        strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
         mid: Decimal,
@@ -60,6 +62,7 @@ pub enum UnifiedOrder {
         gap: Decimal,
     },
     MidRequotePlace {
+        strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
         mid: Decimal,
@@ -69,6 +72,7 @@ pub enum UnifiedOrder {
         local_order_id: String,
     },
     MidRequoteStageReplacement {
+        strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
         mid: Decimal,
@@ -98,6 +102,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 gap,
             },
             OrderSignal::MidRequotePlace {
+                strategy,
                 topic,
                 token,
                 mid,
@@ -106,6 +111,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 order_size,
                 local_order_id,
             } => Self::MidRequotePlace {
+                strategy,
                 topic,
                 token,
                 mid,
@@ -115,6 +121,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 local_order_id,
             },
             OrderSignal::MidRequoteStageReplacement {
+                strategy,
                 topic,
                 token,
                 mid,
@@ -125,6 +132,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 pending_local_order_id,
                 request_cancel,
             } => Self::MidRequoteStageReplacement {
+                strategy,
                 topic,
                 token,
                 mid,
