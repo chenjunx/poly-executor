@@ -12,9 +12,7 @@ use crate::config::AuthConfig;
 use crate::storage::{
     OrderStore, StoredMidRequoteSharedState, StoredMidRequoteSideState, StoredOrder,
 };
-use crate::strategies::mid_requote::{
-    MidRequoteRestoreSideState, MidRequoteRestoreState,
-};
+use crate::strategies::mid_requote::{MidRequoteRestoreSideState, MidRequoteRestoreState};
 use crate::strategy::{OrderCorrelationMap, QuoteSide};
 
 const END_CURSOR: &str = "LTE=";
@@ -107,7 +105,9 @@ impl RecoveryCoordinator {
         }
 
         match client.order(remote_order_id).await {
-            Ok(order) => self.reconcile_resolved_order_lookup(&stored_order, remote_order_id, &order),
+            Ok(order) => {
+                self.reconcile_resolved_order_lookup(&stored_order, remote_order_id, &order)
+            }
             Err(error) if is_not_found_status(&error) => {
                 self.reconcile_missing_remote_order(client, &stored_order, remote_order_id)
                     .await?;
@@ -117,7 +117,10 @@ impl RecoveryCoordinator {
         }
     }
 
-    fn mark_missing_remote_order_id_unknown(&self, stored_order: &StoredOrder) -> anyhow::Result<()> {
+    fn mark_missing_remote_order_id_unknown(
+        &self,
+        stored_order: &StoredOrder,
+    ) -> anyhow::Result<()> {
         self.order_store
             .update_order_status_by_local(&stored_order.local_order_id, "unknown")?;
         self.order_store.append_order_event(
@@ -334,10 +337,11 @@ fn apply_mid_requote_side_state(
     lane.active_local_order_id = side_state
         .active_local_order_id
         .filter(|order_id| correlated_order_matches_side(order_correlations, order_id, side));
-    lane.active_order_size = lane
-        .active_local_order_id
-        .as_ref()
-        .and_then(|order_id| order_correlations.get(order_id).map(|entry| entry.order_size));
+    lane.active_order_size = lane.active_local_order_id.as_ref().and_then(|order_id| {
+        order_correlations
+            .get(order_id)
+            .map(|entry| entry.order_size)
+    });
 
     lane.pending_local_order_id = side_state
         .pending_local_order_id
@@ -437,7 +441,11 @@ async fn infer_missing_remote_terminal_status(
             maker_order.order_id == stored_order.remote_order_id.clone().unwrap_or_default()
         })
     });
-    Ok(if has_trade_for_order { "filled" } else { "unknown" })
+    Ok(if has_trade_for_order {
+        "filled"
+    } else {
+        "unknown"
+    })
 }
 
 fn is_not_found_status(error: &polymarket_client_sdk::error::Error) -> bool {

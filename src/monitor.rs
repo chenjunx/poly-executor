@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::clob_client::build_authenticated_clob_client;
 use crate::config::AuthConfig;
 use crate::polymarket_rewards::{
-    estimate_reward, Market as RewardMarket, MarketParams, Order as RewardOrder, Side as RewardSide,
+    Market as RewardMarket, MarketParams, Order as RewardOrder, Side as RewardSide, estimate_reward,
 };
 use crate::strategy::{OrderCorrelationMap, QuoteSide};
 
@@ -203,4 +203,3 @@ async fn poll_user_rewards(auth: &AuthConfig) -> anyhow::Result<()> {
 
     Ok(())
 }
-

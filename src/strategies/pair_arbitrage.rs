@@ -34,7 +34,7 @@ impl PairArbitrageStrategy {
         };
 
         let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
+            .has_headers(true)
             .from_path(&csv_path)
             .map_err(|e| anyhow::anyhow!("无法打开 {}: {}", csv_path, e))?;
 

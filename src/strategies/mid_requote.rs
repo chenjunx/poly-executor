@@ -111,7 +111,7 @@ impl MidRequoteStrategy {
     pub fn from_csv(csv_file: &str) -> anyhow::Result<Option<Self>> {
         let csv_path = resolve_csv_path(csv_file);
         let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
+            .has_headers(true)
             .from_path(&csv_path)
             .map_err(|e| anyhow::anyhow!("无法打开 {}: {}", csv_path, e))?;
 
@@ -459,7 +459,8 @@ impl Strategy for MidRequoteStrategy {
 
                             let buy_target = buy_target_size(rule, new_position_size);
                             if buy_target > Decimal::ZERO {
-                                let buy_target_changed = side_target_size(&state.buy) != Some(buy_target);
+                                let buy_target_changed =
+                                    side_target_size(&state.buy) != Some(buy_target);
                                 if side_is_empty(&state.buy) || buy_target_changed {
                                     if let Err(err) = submit_side_quote(
                                         rule,
@@ -533,9 +534,9 @@ impl Strategy for MidRequoteStrategy {
 fn state_from_restore(restored: MidRequoteRestoreState) -> RequoteState {
     RequoteState {
         topic: restored.topic,
-        last_mid: restored.last_mid,
-        last_best_bid: restored.last_best_bid,
-        last_best_ask: restored.last_best_ask,
+        last_mid: None,
+        last_best_bid: None,
+        last_best_ask: None,
         last_position_size: restored.last_position_size,
         buy: side_from_restore(restored.buy),
         sell: side_from_restore(restored.sell),

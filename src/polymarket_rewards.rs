@@ -5,8 +5,8 @@
 pub struct Order {
     pub side: Side,
     pub market: Market,
-    pub price: f64,  // 0.0 ~ 1.0
-    pub size: f64,   // in shares
+    pub price: f64, // 0.0 ~ 1.0
+    pub size: f64,  // in shares
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,11 +190,24 @@ mod tests {
     fn test_two_sided_qmin() {
         let params = default_params();
         let orders = vec![
-            Order { side: Side::Buy,  market: Market::Yes, price: 0.49, size: 100.0 },
-            Order { side: Side::Sell, market: Market::Yes, price: 0.51, size: 100.0 },
+            Order {
+                side: Side::Buy,
+                market: Market::Yes,
+                price: 0.49,
+                size: 100.0,
+            },
+            Order {
+                side: Side::Sell,
+                market: Market::Yes,
+                price: 0.51,
+                size: 100.0,
+            },
         ];
         let (qone, qtwo) = compute_q_sides(&orders, &params);
-        assert!((qone - qtwo).abs() < 1e-9, "balanced orders should have equal qone/qtwo");
+        assert!(
+            (qone - qtwo).abs() < 1e-9,
+            "balanced orders should have equal qone/qtwo"
+        );
         let r = compute_qmin(qone, qtwo, &params);
         assert!((r.qmin - qone).abs() < 1e-9);
     }
@@ -202,9 +215,12 @@ mod tests {
     #[test]
     fn test_single_sided_penalty() {
         let params = default_params();
-        let orders = vec![
-            Order { side: Side::Buy, market: Market::Yes, price: 0.49, size: 100.0 },
-        ];
+        let orders = vec![Order {
+            side: Side::Buy,
+            market: Market::Yes,
+            price: 0.49,
+            size: 100.0,
+        }];
         let (qone, qtwo) = compute_q_sides(&orders, &params);
         assert_eq!(qtwo, 0.0);
         let r = compute_qmin(qone, qtwo, &params);
@@ -215,9 +231,12 @@ mod tests {
     fn test_extreme_price_requires_two_sided() {
         let mut params = default_params();
         params.mid_price = 0.05;
-        let orders = vec![
-            Order { side: Side::Buy, market: Market::Yes, price: 0.04, size: 100.0 },
-        ];
+        let orders = vec![Order {
+            side: Side::Buy,
+            market: Market::Yes,
+            price: 0.04,
+            size: 100.0,
+        }];
         let (qone, qtwo) = compute_q_sides(&orders, &params);
         let r = compute_qmin(qone, qtwo, &params);
         assert_eq!(r.qmin, 0.0);
@@ -226,26 +245,48 @@ mod tests {
     #[test]
     fn test_no_market_conversion() {
         let params = default_params();
-        let no_sell = vec![
-            Order { side: Side::Sell, market: Market::No, price: 0.51, size: 100.0 },
-        ];
-        let yes_buy = vec![
-            Order { side: Side::Buy, market: Market::Yes, price: 0.49, size: 100.0 },
-        ];
+        let no_sell = vec![Order {
+            side: Side::Sell,
+            market: Market::No,
+            price: 0.51,
+            size: 100.0,
+        }];
+        let yes_buy = vec![Order {
+            side: Side::Buy,
+            market: Market::Yes,
+            price: 0.49,
+            size: 100.0,
+        }];
         let (q1, _) = compute_q_sides(&no_sell, &params);
         let (q2, _) = compute_q_sides(&yes_buy, &params);
-        assert!((q1 - q2).abs() < 1e-9, "NO sell and YES buy should produce identical scores");
+        assert!(
+            (q1 - q2).abs() < 1e-9,
+            "NO sell and YES buy should produce identical scores"
+        );
     }
 
     #[test]
     fn test_full_reward_estimate() {
         let params = default_params();
         let my_orders = vec![
-            Order { side: Side::Buy,  market: Market::Yes, price: 0.49, size: 100.0 },
-            Order { side: Side::Sell, market: Market::Yes, price: 0.51, size: 100.0 },
+            Order {
+                side: Side::Buy,
+                market: Market::Yes,
+                price: 0.49,
+                size: 100.0,
+            },
+            Order {
+                side: Side::Sell,
+                market: Market::Yes,
+                price: 0.51,
+                size: 100.0,
+            },
         ];
         let est = estimate_reward(&my_orders, &[], &params);
-        assert!((est.share - 1.0).abs() < 1e-9, "100% share with no competitors");
+        assert!(
+            (est.share - 1.0).abs() < 1e-9,
+            "100% share with no competitors"
+        );
         assert!((est.estimated_reward - params.reward_pool).abs() < 1e-6);
     }
 }
