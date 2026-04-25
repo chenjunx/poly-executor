@@ -6,7 +6,7 @@ use futures::StreamExt as _;
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk::clob::ws::Client;
-use polymarket_client_sdk::types::Address;
+use polymarket_client_sdk::types::{Address, Decimal};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -14,7 +14,7 @@ use crate::{
     config::AuthConfig,
     positions::PositionRefreshTrigger,
     storage::OrderStore,
-    strategy::{OrderCorrelationMap, OrderStatusEvent, StrategyEvent},
+    strategy::{OrderCorrelationMap, OrderFillEvent, OrderStatusEvent, StrategyEvent},
 };
 
 pub async fn run(
@@ -91,6 +91,11 @@ async fn subscribe_orders(
                         .map(|value| value.to_string())
                         .as_deref(),
                 );
+                let previous_size_matched = order_store
+                    .last_ws_size_matched_by_remote(&order.id)
+                    .ok()
+                    .flatten();
+                let current_size_matched = order.size_matched;
 
                 let _ = order_store.append_order_event(
                     local_order_id.as_deref(),
@@ -135,6 +140,28 @@ async fn subscribe_orders(
                         status = status,
                         "收到订单 websocket 更新，并成功关联本地订单"
                     );
+                    if let Some(delta_size) =
+                        fill_delta(previous_size_matched, current_size_matched)
+                    {
+                        let _ = strategy_tx.try_send(StrategyEvent::OrderFill(OrderFillEvent {
+                            token: local_meta.token.clone(),
+                            local_order_id: local_meta.local_order_id.clone(),
+                            side: local_meta.side,
+                            delta_size,
+                            total_matched_size: current_size_matched.unwrap_or(Decimal::ZERO),
+                        }));
+                        info!(
+                            target: "order",
+                            order_id = %order.id,
+                            local_order_id = %local_meta.local_order_id,
+                            token = %local_meta.token,
+                            side = ?local_meta.side,
+                            delta_size = %delta_size,
+                            total_matched_size = %current_size_matched.unwrap_or(Decimal::ZERO),
+                            "根据订单 websocket 成交增量触发策略库存更新"
+                        );
+                    }
+
                     let is_terminal = matches!(status, "canceled" | "filled" | "rejected");
                     if is_terminal {
                         let _ =
@@ -163,6 +190,15 @@ async fn subscribe_orders(
                 }
 
                 let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+                if matches!(status, "partially_filled" | "filled") {
+                    let positions_refresh_tx = positions_refresh_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+                        tokio::time::sleep(Duration::from_secs(12)).await;
+                        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+                    });
+                }
             }
             Err(error) => {
                 return Err(error.into());
@@ -171,6 +207,16 @@ async fn subscribe_orders(
     }
 
     Ok(())
+}
+
+fn fill_delta(
+    previous_size_matched: Option<Decimal>,
+    current_size_matched: Option<Decimal>,
+) -> Option<Decimal> {
+    let previous_size_matched = previous_size_matched?;
+    let current_size_matched = current_size_matched?;
+    let delta = current_size_matched - previous_size_matched;
+    (delta > Decimal::ZERO).then_some(delta)
 }
 
 fn classify_ws_status(

@@ -11,8 +11,8 @@ pub(crate) struct AppConfig {
     pub(crate) order: OrderConfig,
     #[serde(default)]
     pub(crate) simulation: SimulationConfig,
-    #[serde(default)]
-    pub(crate) mid_requote: MidRequoteConfig,
+    #[serde(default, alias = "mid_requote")]
+    pub(crate) liquidity_reward: LiquidityRewardConfig,
     #[serde(default)]
     pub(crate) topic_threads: HashMap<String, usize>,
 }
@@ -60,7 +60,7 @@ pub(crate) struct SimulationConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
-pub(crate) struct MidRequoteConfig {
+pub(crate) struct LiquidityRewardConfig {
     #[serde(default)]
     pub(crate) enabled: bool,
     #[serde(default)]

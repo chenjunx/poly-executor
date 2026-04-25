@@ -5,3 +5,4 @@ orders.db
 orders.db-shm
 orders.db-wal
 *.log
+orders_backup_attempt.db

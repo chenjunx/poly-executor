@@ -5,7 +5,7 @@ Polymarket 自动化执行器，用 Rust/Tokio 实现行情订阅、策略分发
 当前项目包含两个策略：
 
 - `pair_arbitrage`：根据 `assets.csv` 中的 token 配对，监控 `1 - (ask0 + ask1)` 的套利空间。
-- `mid_requote`：根据 `mid.csv` 中的 token 配置，在盘口中间价附近维护双边库存报价。
+- `liquidity_reward`：根据 `liquidity_reward.csv` 中的 token 配置，在盘口中间价附近维护双边库存报价。
 
 ## 架构概览
 
@@ -26,7 +26,7 @@ dispatcher
     ├── pair_arbitrage
     │     └── 发现套利机会后发送 OrderSignal
     │
-    └── mid_requote
+    └── liquidity_reward
           ├── 根据行情维护 buy/sell lane
           ├── 根据仓位同步卖侧库存
           └── 发送下单、替换、撤单信号
@@ -53,7 +53,7 @@ order
 | `src/dispatcher.rs` | 将行情、仓位、订单状态事件分发到各策略队列。 |
 | `src/strategy.rs` | 策略公共类型、事件、订单信号和注册信息。 |
 | `src/strategies/pair_arbitrage.rs` | pair arbitrage 策略。 |
-| `src/strategies/mid_requote.rs` | mid requote 双边库存策略。 |
+| `src/strategies/liquidity_reward.rs` | 流动性奖励双边库存策略。 |
 | `src/order.rs` | 执行策略下单信号，支持模拟和真实下单。 |
 | `src/order_ws.rs` | 监听真实订单 websocket，更新订单状态并触发策略事件。 |
 | `src/positions.rs` | 同步真实仓位或维护模拟仓位。 |
@@ -84,9 +84,9 @@ size_usdc = 10.0
 [simulation]
 enabled = true
 
-[mid_requote]
+[liquidity_reward]
 enabled = true
-file = "mid.csv"
+file = "liquidity_reward.csv"
 monitor_enabled = true
 
 [app]
@@ -118,8 +118,8 @@ sqlite_path = "orders.db"
 | --- | --- |
 | `order.enabled` | 是否允许真实订单执行。为 `false` 时不会向交易所下单。 |
 | `simulation.enabled` | 是否启用本地模拟成交/仓位。为 `true` 时不走真实 order websocket 和真实 positions。 |
-| `mid_requote.enabled` | 是否启用 `mid_requote` 策略。 |
-| `mid_requote.monitor_enabled` | 是否启用当前用户奖励监控。只在非 simulation 模式下启动。 |
+| `liquidity_reward.enabled` | 是否启用 `liquidity_reward` 策略。 |
+| `liquidity_reward.monitor_enabled` | 是否启用当前用户奖励监控。只在非 simulation 模式下启动。 |
 | `app.sqlite_path` | SQLite 订单数据库路径。 |
 
 ## CSV 配置
@@ -141,13 +141,13 @@ token0,token1,topic
 | `token1` | 第二个 outcome token。 |
 | `topic` | 主题名，用于订阅分组和策略路由。 |
 
-### `mid.csv`
+### `liquidity_reward.csv`
 
-用于 `mid_requote` 策略。
+用于 `liquidity_reward` 策略。
 
 ```csv
 token,offset,mid_change_threshold,target_order_size,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,reward_daily_pool
-<token>,0.001,0.002,100,mid,,4,100,11
+<token>,0.001,0.002,100,liquidity_reward,,4,100,11
 ```
 
 字段说明：
@@ -158,15 +158,15 @@ token,offset,mid_change_threshold,target_order_size,topic,reward_min_orders,rewa
 | `offset` | 报价偏移。买价为 `best_bid - offset`，卖价为 `best_ask + offset`。 |
 | `mid_change_threshold` | 中间价变化阈值。超过阈值才触发对应 side 的换价。 |
 | `target_order_size` | 目标库存/买侧目标。买侧目标数量为 `target_order_size - 当前库存`。 |
-| `topic` | 主题名，默认 `mid`。 |
+| `topic` | 主题名，默认 `liquidity_reward`。 |
 | `reward_min_orders` | 奖励配置字段，目前用于配置透传，本地估算中未强制过滤。 |
 | `reward_max_spread_cents` | 奖励最大价差，单位为 cents，用于本地奖励估算。 |
 | `reward_min_size` | 奖励最小 size 配置，目前用于配置透传，本地估算中未强制过滤。 |
 | `reward_daily_pool` | 日奖励池，用于估算当前报价占比对应的每日奖励。 |
 
-## `mid_requote` 策略逻辑
+## `liquidity_reward` 策略逻辑
 
-`mid_requote` 是双边库存策略，每个 token 独立维护 buy lane 和 sell lane。
+`liquidity_reward` 是双边库存策略，每个 token 独立维护 buy lane 和 sell lane。
 
 ### 定价
 
@@ -228,8 +228,8 @@ gap = 1 - (ask0 + ask1)
 | --- | --- |
 | `orders` | 本地订单主表，记录 local/remote order id、策略、token、side、price、size、status。 |
 | `order_events` | 订单生命周期事件，便于回溯下单、撤单、websocket 更新等。 |
-| `strategy_state_mid_requote` | `mid_requote` token 级共享状态，如 last mid、last bid/ask、last position。 |
-| `strategy_state_mid_requote_side` | `mid_requote` buy/sell side 状态，如 active order、pending replacement、cancel_requested。 |
+| `strategy_state_mid_requote` | 流动性奖励策略的 token 级共享状态，如 last mid、last bid/ask、last position；保留旧表名用于兼容历史数据。 |
+| `strategy_state_mid_requote_side` | 流动性奖励策略的 buy/sell side 状态，如 active order、pending replacement、cancel_requested；保留旧表名用于兼容历史数据。 |
 
 ### 启动恢复
 
@@ -239,7 +239,7 @@ gap = 1 - (ask0 + ask1)
 2. 非 simulation 模式下拉取交易所 open orders。
 3. 对本地订单和远端订单做对账。
 4. 重建 local/remote order id 到本地订单元数据的关联。
-5. 恢复 `mid_requote` 的 buy/sell lane 状态。
+5. 恢复 `liquidity_reward` 的 buy/sell lane 状态。
 
 恢复后，策略会等待新的行情快照再报价，避免用历史盘口直接下单。
 
@@ -248,7 +248,7 @@ gap = 1 - (ask0 + ask1)
 项目有两类奖励相关日志：
 
 1. 当前用户奖励监控：调用 Polymarket API 查询当前用户奖励信息。
-2. 本地流动性奖励估算：根据当前 orderbook、自己的报价和 `mid.csv` 中的奖励配置估算奖励份额。
+2. 本地流动性奖励估算：根据当前 orderbook、自己的报价和 `liquidity_reward.csv` 中的奖励配置估算奖励份额。
 
 本地估算核心公式位于 `src/polymarket_rewards.rs`，会计算：
 
@@ -330,5 +330,5 @@ cargo run --release
 - 配置文件中的私钥/API key 不要提交到 Git。
 - `orders.db`、WAL 文件和临时备份文件不应提交。
 - 实盘前先使用 simulation 模式验证配置和策略行为。
-- `mid_requote` 的 `target_order_size` 是目标库存逻辑，不是每次固定买入数量。
+- `liquidity_reward` 的 `target_order_size` 是目标库存逻辑，不是每次固定买入数量。
 - 当前本地奖励估算基于内存订单关联和本地 orderbook，适合辅助观察，不应当作为最终结算依据。

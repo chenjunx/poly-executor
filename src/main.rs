@@ -26,7 +26,7 @@ use monitor::RewardMonitorConfig;
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
 use recovery::RecoveryCoordinator;
 use storage::OrderStore;
-use strategies::mid_requote::MidRequoteStrategy;
+use strategies::liquidity_reward::LiquidityRewardStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
     Filters, OrderSignal, Strategy, StrategyHandle, build_token_topics, merge_topic_tokens,
@@ -97,20 +97,20 @@ async fn main() -> anyhow::Result<()> {
     .recover()
     .await?;
     let order_correlations = recovery.order_correlations;
-    let restored_mid_requote_states = recovery.mid_requote_restore_states;
-    let mid_file = if !app_config.mid_requote.file.is_empty() {
-        app_config.mid_requote.file.as_str()
+    let restored_liquidity_reward_states = recovery.liquidity_reward_restore_states;
+    let liquidity_reward_file = if !app_config.liquidity_reward.file.is_empty() {
+        app_config.liquidity_reward.file.as_str()
     } else {
-        "mid.csv"
+        "liquidity_reward.csv"
     };
-    let mid_requote_strategy_opt = if app_config.mid_requote.enabled {
-        MidRequoteStrategy::from_csv(mid_file)?
+    let liquidity_reward_strategy_opt = if app_config.liquidity_reward.enabled {
+        LiquidityRewardStrategy::from_csv(liquidity_reward_file)?
     } else {
         None
     };
 
     let reward_monitor_configs: std::collections::HashMap<String, RewardMonitorConfig> =
-        mid_requote_strategy_opt
+        liquidity_reward_strategy_opt
             .as_ref()
             .map(|s| {
                 s.rules()
@@ -131,15 +131,15 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or_default();
 
-    let mid_requote = mid_requote_strategy_opt.map(|strategy| {
+    let liquidity_reward = liquidity_reward_strategy_opt.map(|strategy| {
         strategy.with_restore_state(
-            restored_mid_requote_states.clone(),
+            restored_liquidity_reward_states.clone(),
             Some(order_store.clone()),
         )
     });
 
-    let mid_tokens: Arc<std::collections::HashSet<String>> = Arc::new(
-        mid_requote
+    let liquidity_reward_tokens: Arc<std::collections::HashSet<String>> = Arc::new(
+        liquidity_reward
             .as_ref()
             .map(|strategy| {
                 strategy
@@ -152,18 +152,18 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_default(),
     );
 
-    if app_config.mid_requote.enabled
-        && app_config.mid_requote.monitor_enabled
+    if app_config.liquidity_reward.enabled
+        && app_config.liquidity_reward.monitor_enabled
         && !app_config.simulation.enabled
     {
-        tokio::spawn(monitor::run_mid_reward_monitor(
+        tokio::spawn(monitor::run_liquidity_reward_monitor(
             app_config.auth.clone(),
             app_config.app.monitor_interval_secs.max(1),
         ));
     }
 
     let mut registrations = vec![pair_registration.clone()];
-    if let Some(strategy) = &mid_requote {
+    if let Some(strategy) = &liquidity_reward {
         registrations.push(strategy.registration().clone());
     }
 
@@ -212,21 +212,21 @@ async fn main() -> anyhow::Result<()> {
 
     pair_strategy.spawn(pair_rx, order_tx.clone());
 
-    if let Some(mid_requote_strategy) = mid_requote {
-        let mid_requote_registration = mid_requote_strategy.registration().clone();
-        let (mid_requote_tx, mid_requote_rx) = tokio::sync::mpsc::channel(256);
+    if let Some(liquidity_reward_strategy) = liquidity_reward {
+        let liquidity_reward_registration = liquidity_reward_strategy.registration().clone();
+        let (liquidity_reward_tx, liquidity_reward_rx) = tokio::sync::mpsc::channel(256);
         strategy_handles.push(StrategyHandle {
-            name: mid_requote_registration.name.clone(),
-            topics: mid_requote_registration.topics.clone(),
-            related_tokens: mid_requote_registration.related_tokens.clone(),
-            tx: mid_requote_tx,
+            name: liquidity_reward_registration.name.clone(),
+            topics: liquidity_reward_registration.topics.clone(),
+            related_tokens: liquidity_reward_registration.related_tokens.clone(),
+            tx: liquidity_reward_tx,
         });
-        mid_requote_strategy.spawn(mid_requote_rx, order_tx.clone());
+        liquidity_reward_strategy.spawn(liquidity_reward_rx, order_tx.clone());
     }
     tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
     tokio::spawn(market::run(
         token_topics.clone(),
-        mid_tokens.clone(),
+        liquidity_reward_tokens.clone(),
         ws_rx,
         strategy_tx.clone(),
         monitor_tx,
@@ -265,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
         order_store.clone(),
         positions_refresh_tx.clone(),
         sim_fill_tx,
+        strategy_tx.clone(),
     ));
 
     if !app_config.simulation.enabled {

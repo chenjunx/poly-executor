@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
@@ -13,7 +14,10 @@ use crate::{
     config::{AuthConfig, OrderConfig},
     positions::{PositionRefreshTrigger, SimulatedFillEvent},
     storage::OrderStore,
-    strategy::{LocalOrderMeta, OrderCorrelationMap, OrderSignal, QuoteSide, UnifiedOrder},
+    strategy::{
+        LocalOrderMeta, OrderCorrelationMap, OrderSignal, OrderStatusEvent, QuoteSide,
+        StrategyEvent, UnifiedOrder,
+    },
 };
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -27,6 +31,7 @@ pub async fn run(
     order_store: OrderStore,
     positions_refresh_tx: tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
     sim_fill_tx: tokio::sync::mpsc::Sender<SimulatedFillEvent>,
+    strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 ) {
     while let Some(signal) = order_rx.recv().await {
         let order = UnifiedOrder::from(signal);
@@ -46,7 +51,7 @@ pub async fn run(
                     let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
                 }
             }
-            UnifiedOrder::MidRequotePlace {
+            UnifiedOrder::LiquidityRewardPlace {
                 strategy,
                 topic,
                 token,
@@ -79,7 +84,7 @@ pub async fn run(
                         price = %price,
                         order_size = %order_size,
                         local_order_id = %local_order_id,
-                        "mid_requote 模拟挂单成功，已记录本地订单元数据"
+                        "liquidity_reward 模拟挂单成功，已记录本地订单元数据"
                     );
                     let _ = order_store.update_order_status_by_local(&local_order_id, "open");
                     let _ = order_store.append_order_event(
@@ -115,7 +120,7 @@ pub async fn run(
                     continue;
                 }
 
-                match place_mid_requote_order(
+                match place_liquidity_reward_order(
                     &auth,
                     &correlations,
                     &order_store,
@@ -137,6 +142,7 @@ pub async fn run(
                         }
                     }
                     Err(error) => {
+                        let error = error.to_string();
                         let _ = order_store.update_order_status_by_local(&local_order_id, "failed");
                         let _ = order_store.append_order_event(
                             Some(&local_order_id),
@@ -149,9 +155,16 @@ pub async fn run(
                                 "side": format!("{:?}", side),
                                 "price": price.to_string(),
                                 "order_size": order_size.to_string(),
-                                "error": error.to_string(),
+                                "error": error,
                             }),
                         );
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("failed"),
+                            }));
+                        schedule_balance_retry_if_needed(&error, &positions_refresh_tx);
                         warn!(
                             target: "order",
                             topic = %topic,
@@ -160,12 +173,12 @@ pub async fn run(
                             price = %price,
                             order_size = %order_size,
                             error = %error,
-                            "mid_requote 真实下单失败"
+                            "liquidity_reward 真实下单失败"
                         );
                     }
                 }
             }
-            UnifiedOrder::MidRequoteStageReplacement {
+            UnifiedOrder::LiquidityRewardStageReplacement {
                 strategy,
                 topic,
                 token,
@@ -205,7 +218,7 @@ pub async fn run(
                 );
 
                 if request_cancel {
-                    request_mid_requote_cancel(
+                    request_liquidity_reward_cancel(
                         &auth,
                         &correlations,
                         &order_store,
@@ -215,7 +228,7 @@ pub async fn run(
                     .await;
                 }
             }
-            UnifiedOrder::MidRequoteCancel {
+            UnifiedOrder::LiquidityRewardCancel {
                 strategy,
                 topic,
                 token,
@@ -236,7 +249,7 @@ pub async fn run(
                         "side": format!("{:?}", side),
                     }),
                 );
-                request_mid_requote_cancel(
+                request_liquidity_reward_cancel(
                     &auth,
                     &correlations,
                     &order_store,
@@ -249,7 +262,7 @@ pub async fn run(
     }
 }
 
-async fn request_mid_requote_cancel(
+async fn request_liquidity_reward_cancel(
     auth: &AuthConfig,
     correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
@@ -272,21 +285,21 @@ async fn request_mid_requote_cancel(
     let signer = match LocalSigner::from_str(&auth.private_key) {
         Ok(signer) => signer.with_chain_id(Some(POLYGON)),
         Err(error) => {
-            warn!(target: "order", local_order_id = %local_order_id, error = %error, "mid_requote 构造 signer 失败，无法发送撤单");
+            warn!(target: "order", local_order_id = %local_order_id, error = %error, "liquidity_reward 构造 signer 失败，无法发送撤单");
             return;
         }
     };
     let funder = match Address::from_str(&auth.funder) {
         Ok(funder) => funder,
         Err(error) => {
-            warn!(target: "order", local_order_id = %local_order_id, error = %error, "mid_requote 解析 funder 失败，无法发送撤单");
+            warn!(target: "order", local_order_id = %local_order_id, error = %error, "liquidity_reward 解析 funder 失败，无法发送撤单");
             return;
         }
     };
     let client = match Client::new(CLOB_HOST, Config::builder().use_server_time(true).build()) {
         Ok(client) => client,
         Err(error) => {
-            warn!(target: "order", local_order_id = %local_order_id, error = %error, "mid_requote 构造客户端失败，无法发送撤单");
+            warn!(target: "order", local_order_id = %local_order_id, error = %error, "liquidity_reward 构造客户端失败，无法发送撤单");
             return;
         }
     };
@@ -299,17 +312,17 @@ async fn request_mid_requote_cancel(
     {
         Ok(client) => client,
         Err(error) => {
-            warn!(target: "order", local_order_id = %local_order_id, error = %error, "mid_requote 鉴权失败，无法发送撤单");
+            warn!(target: "order", local_order_id = %local_order_id, error = %error, "liquidity_reward 鉴权失败，无法发送撤单");
             return;
         }
     };
 
     let Some(meta) = meta else {
-        warn!(target: "order", local_order_id = %local_order_id, token = %token, "mid_requote 取消旧单时未找到本地订单元数据");
+        warn!(target: "order", local_order_id = %local_order_id, token = %token, "liquidity_reward 取消旧单时未找到本地订单元数据");
         return;
     };
     let Some(remote_order_id) = meta.remote_order_id.clone() else {
-        warn!(target: "order", local_order_id = %local_order_id, token = %token, "mid_requote 取消旧单时尚未关联远端订单 ID");
+        warn!(target: "order", local_order_id = %local_order_id, token = %token, "liquidity_reward 取消旧单时尚未关联远端订单 ID");
         return;
     };
 
@@ -330,7 +343,7 @@ async fn request_mid_requote_cancel(
                 remote_order_id = %remote_order_id,
                 canceled = ?result.canceled,
                 not_canceled = ?result.not_canceled,
-                "mid_requote 已向交易所发送撤单请求"
+                "liquidity_reward 已向交易所发送撤单请求"
             );
         }
         Err(error) => {
@@ -339,13 +352,13 @@ async fn request_mid_requote_cancel(
                 local_order_id = %local_order_id,
                 remote_order_id = %remote_order_id,
                 error = %error,
-                "mid_requote 撤单请求失败"
+                "liquidity_reward 撤单请求失败"
             );
         }
     }
 }
 
-async fn place_mid_requote_order(
+async fn place_liquidity_reward_order(
     auth: &AuthConfig,
     correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
@@ -386,7 +399,7 @@ async fn place_mid_requote_order(
             local_order_id = %local_order_id,
             remote_order_id = %response.order_id,
             token = %token,
-            "mid_requote 下单成功后未找到本地订单元数据，跳过关联写回"
+            "liquidity_reward 下单成功后未找到本地订单元数据，跳过关联写回"
         );
         return Ok(false);
     };
@@ -436,10 +449,26 @@ async fn place_mid_requote_order(
         status = ?response.status,
         success = response.success,
         error_msg = ?response.error_msg,
-        "mid_requote 真实挂单成功，已写入本地与远端订单关联"
+        "liquidity_reward 真实挂单成功，已写入本地与远端订单关联"
     );
 
     Ok(response.success)
+}
+
+fn schedule_balance_retry_if_needed(
+    error: &str,
+    positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
+) {
+    if !error.contains("not enough balance / allowance") {
+        return;
+    }
+    let positions_refresh_tx = positions_refresh_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+    });
 }
 
 fn persist_new_order(

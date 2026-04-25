@@ -191,7 +191,7 @@ pub async fn spawn_subscriptions(
 
 pub async fn run(
     token_topics: Arc<HashMap<String, Arc<[Arc<str>]>>>,
-    mid_tokens: Arc<std::collections::HashSet<String>>,
+    liquidity_reward_tokens: Arc<std::collections::HashSet<String>>,
     mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
     market_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
     monitor_tx: Option<tokio::sync::mpsc::Sender<FullBookSnapshot>>,
@@ -205,7 +205,12 @@ pub async fn run(
         }
 
         for (asset_id, book) in events {
-            log_mid_orderbook_diagnostics(&msg, &asset_id, &book, mid_tokens.as_ref());
+            log_liquidity_reward_orderbook_diagnostics(
+                &msg,
+                &asset_id,
+                &book,
+                liquidity_reward_tokens.as_ref(),
+            );
 
             if let Some(ref tx) = monitor_tx {
                 if let Some(state) = books.get(asset_id.as_ref()) {
@@ -239,13 +244,13 @@ pub async fn run(
     }
 }
 
-fn log_mid_orderbook_diagnostics(
+fn log_liquidity_reward_orderbook_diagnostics(
     msg: &WsMessage,
     asset_id: &Arc<str>,
     book: &CleanOrderbook,
-    mid_tokens: &std::collections::HashSet<String>,
+    liquidity_reward_tokens: &std::collections::HashSet<String>,
 ) {
-    if !mid_tokens.contains(asset_id.as_ref()) {
+    if !liquidity_reward_tokens.contains(asset_id.as_ref()) {
         return;
     }
 
@@ -275,7 +280,7 @@ fn log_mid_orderbook_diagnostics(
                 best_ask_price = book.best_ask_price,
                 best_ask_size = book.best_ask_size,
                 ts = book.timestamp_ms,
-                "mid 监控 token 的订单簿快照诊断"
+                "liquidity_reward 监控 token 的订单簿快照诊断"
             );
         }
         WsMessage::PriceChange(price_change) => {
@@ -297,7 +302,7 @@ fn log_mid_orderbook_diagnostics(
                     best_ask_price = book.best_ask_price,
                     best_ask_size = book.best_ask_size,
                     ts = book.timestamp_ms,
-                    "mid 监控 token 的订单簿增量诊断"
+                    "liquidity_reward 监控 token 的订单簿增量诊断"
                 );
             }
         }

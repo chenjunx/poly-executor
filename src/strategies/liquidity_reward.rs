@@ -13,12 +13,12 @@ use crate::{
     },
 };
 
-const DEFAULT_TOPIC: &str = "mid";
+const DEFAULT_TOPIC: &str = "liquidity_reward";
 const PRICE_SCALE: u32 = 10_000;
 static ORDER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
-pub struct MidRequoteRule {
+pub struct LiquidityRewardRule {
     pub topic: Arc<str>,
     pub token: String,
     pub offset: Decimal,
@@ -64,7 +64,7 @@ struct RequoteState {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct MidRequoteRestoreSideState {
+pub struct LiquidityRewardRestoreSideState {
     pub active_local_order_id: Option<String>,
     pub active_order_size: Option<Decimal>,
     pub pending_local_order_id: Option<String>,
@@ -76,31 +76,31 @@ pub struct MidRequoteRestoreSideState {
 }
 
 #[derive(Debug, Clone)]
-pub struct MidRequoteRestoreState {
+pub struct LiquidityRewardRestoreState {
     pub topic: Arc<str>,
-    pub buy: MidRequoteRestoreSideState,
-    pub sell: MidRequoteRestoreSideState,
+    pub buy: LiquidityRewardRestoreSideState,
+    pub sell: LiquidityRewardRestoreSideState,
     pub last_mid: Option<Decimal>,
     pub last_best_bid: Option<Decimal>,
     pub last_best_ask: Option<Decimal>,
     pub last_position_size: Decimal,
 }
 
-pub struct MidRequoteStrategy {
-    rules: Arc<HashMap<String, MidRequoteRule>>,
+pub struct LiquidityRewardStrategy {
+    rules: Arc<HashMap<String, LiquidityRewardRule>>,
     registration: Arc<StrategyRegistration>,
-    restored_states: HashMap<String, MidRequoteRestoreState>,
+    restored_states: HashMap<String, LiquidityRewardRestoreState>,
     order_store: Option<OrderStore>,
 }
 
-impl MidRequoteStrategy {
-    pub fn rules(&self) -> impl Iterator<Item = (&String, &MidRequoteRule)> {
+impl LiquidityRewardStrategy {
+    pub fn rules(&self) -> impl Iterator<Item = (&String, &LiquidityRewardRule)> {
         self.rules.iter()
     }
 
     pub fn with_restore_state(
         mut self,
-        restored_states: HashMap<String, MidRequoteRestoreState>,
+        restored_states: HashMap<String, LiquidityRewardRestoreState>,
         order_store: Option<OrderStore>,
     ) -> Self {
         self.restored_states = restored_states;
@@ -148,7 +148,7 @@ impl MidRequoteStrategy {
             let reward_min_size = record.get(7).and_then(|v| v.trim().parse::<f64>().ok());
             let reward_daily_pool = record.get(8).and_then(|v| v.trim().parse::<f64>().ok());
 
-            rules.push(MidRequoteRule {
+            rules.push(LiquidityRewardRule {
                 topic,
                 token: token.to_string(),
                 offset,
@@ -164,7 +164,7 @@ impl MidRequoteStrategy {
         Self::from_rules(rules)
     }
 
-    pub fn from_rules(rules: Vec<MidRequoteRule>) -> anyhow::Result<Option<Self>> {
+    pub fn from_rules(rules: Vec<LiquidityRewardRule>) -> anyhow::Result<Option<Self>> {
         if rules.is_empty() {
             return Ok(None);
         }
@@ -199,7 +199,7 @@ impl MidRequoteStrategy {
             .collect::<Vec<_>>();
 
         let registration = Arc::new(StrategyRegistration {
-            name: Arc::from("mid_requote"),
+            name: Arc::from("liquidity_reward"),
             topics: Arc::<[Arc<str>]>::from(topics),
             topic_tokens: Arc::<[TopicRegistration]>::from(topic_tokens),
             related_tokens: Arc::<[String]>::from(related_tokens),
@@ -214,9 +214,9 @@ impl MidRequoteStrategy {
     }
 }
 
-impl Strategy for MidRequoteStrategy {
+impl Strategy for LiquidityRewardStrategy {
     fn name(&self) -> &str {
-        "mid_requote"
+        "liquidity_reward"
     }
 
     fn registration(&self) -> &StrategyRegistration {
@@ -276,7 +276,7 @@ impl Strategy for MidRequoteStrategy {
                                 mid = %mid,
                                 mid_change_threshold = %rule.mid_change_threshold,
                                 ts = event.book.timestamp_ms,
-                                "mid_requote 首次收到行情"
+                                "liquidity_reward 首次收到行情"
                             );
                         } else if mid_changed {
                             info!(
@@ -296,7 +296,7 @@ impl Strategy for MidRequoteStrategy {
                                 sell_will_requote = state.last_position_size > Decimal::ZERO
                                     && side_needs_quote(&state.sell, mid, rule.mid_change_threshold),
                                 ts = event.book.timestamp_ms,
-                                "mid_requote mid 发生变化"
+                                "liquidity_reward mid 发生变化"
                             );
                         }
 
@@ -314,13 +314,13 @@ impl Strategy for MidRequoteStrategy {
                                     event.book.timestamp_ms,
                                     &order_tx,
                                 ) {
-                                    warn!(token = %rule.token, error = %err, "mid_requote 发送买侧挂单事件失败");
+                                    warn!(token = %rule.token, error = %err, "liquidity_reward 发送买侧挂单事件失败");
                                 }
                             }
                         } else if let Err(err) =
                             cancel_side_quote(rule, state, QuoteSide::Buy, &order_tx)
                         {
-                            warn!(token = %rule.token, error = %err, "mid_requote 发送买侧撤单事件失败");
+                            warn!(token = %rule.token, error = %err, "liquidity_reward 发送买侧撤单事件失败");
                         }
 
                         if state.last_position_size > Decimal::ZERO {
@@ -336,13 +336,13 @@ impl Strategy for MidRequoteStrategy {
                                     event.book.timestamp_ms,
                                     &order_tx,
                                 ) {
-                                    warn!(token = %rule.token, error = %err, "mid_requote 发送卖侧挂单事件失败");
+                                    warn!(token = %rule.token, error = %err, "liquidity_reward 发送卖侧挂单事件失败");
                                 }
                             }
                         } else if let Err(err) =
                             cancel_side_quote(rule, state, QuoteSide::Sell, &order_tx)
                         {
-                            warn!(token = %rule.token, error = %err, "mid_requote 发送卖侧撤单事件失败");
+                            warn!(token = %rule.token, error = %err, "liquidity_reward 发送卖侧撤单事件失败");
                         }
 
                         persist_state(order_store.as_ref(), &rule.token, state);
@@ -358,12 +358,23 @@ impl Strategy for MidRequoteStrategy {
                         if !is_terminal {
                             continue;
                         }
-                        let Some(side) = active_order_side(state, &status_event.local_order_id)
-                        else {
+                        let side = active_order_side(state, &status_event.local_order_id)
+                            .or_else(|| pending_order_side(state, &status_event.local_order_id));
+                        let Some(side) = side else {
                             continue;
                         };
                         let topic = state.topic.clone();
                         let lane = side_state_mut(state, side);
+                        if lane
+                            .pending_replacement
+                            .as_ref()
+                            .is_some_and(|pending| pending.order_id == status_event.local_order_id)
+                        {
+                            lane.pending_replacement = None;
+                            lane.cancel_requested = false;
+                            persist_state(order_store.as_ref(), &status_event.token, state);
+                            continue;
+                        }
                         lane.cancel_requested = false;
                         let Some(pending) = lane.pending_replacement.clone() else {
                             lane.active_order = None;
@@ -377,8 +388,8 @@ impl Strategy for MidRequoteStrategy {
                             continue;
                         }
 
-                        if let Err(err) = order_tx.try_send(OrderSignal::MidRequotePlace {
-                            strategy: Arc::from("mid_requote"),
+                        if let Err(err) = order_tx.try_send(OrderSignal::LiquidityRewardPlace {
+                            strategy: Arc::from("liquidity_reward"),
                             topic,
                             token: status_event.token.clone(),
                             mid: pending.mid,
@@ -387,7 +398,7 @@ impl Strategy for MidRequoteStrategy {
                             order_size: pending.order_size,
                             local_order_id: pending.order_id.clone(),
                         }) {
-                            warn!(token = %status_event.token, side = ?side, error = %err, "mid_requote 收到撤单确认后发送 replacement 失败");
+                            warn!(token = %status_event.token, side = ?side, error = %err, "liquidity_reward 收到撤单确认后发送 replacement 失败");
                             persist_state(order_store.as_ref(), &status_event.token, state);
                             continue;
                         }
@@ -398,6 +409,45 @@ impl Strategy for MidRequoteStrategy {
                         lane.last_quoted_mid = Some(pending.mid);
                         lane.pending_replacement = None;
                         persist_state(order_store.as_ref(), &status_event.token, state);
+                    }
+                    StrategyEvent::OrderFill(fill_event) => {
+                        let Some(rule) = rules.get(fill_event.token.as_str()) else {
+                            continue;
+                        };
+                        let state = states
+                            .entry(rule.token.clone())
+                            .or_insert_with(|| empty_state(rule));
+                        state.topic = rule.topic.clone();
+
+                        let old_position_size = state.last_position_size;
+                        let delta = match fill_event.side {
+                            QuoteSide::Buy => fill_event.delta_size,
+                            QuoteSide::Sell => -fill_event.delta_size,
+                        };
+                        let new_position_size = (old_position_size + delta).max(Decimal::ZERO);
+                        state.last_position_size = new_position_size;
+
+                        info!(
+                            target = "order",
+                            token = %rule.token,
+                            local_order_id = %fill_event.local_order_id,
+                            side = ?fill_event.side,
+                            delta_size = %fill_event.delta_size,
+                            total_matched_size = %fill_event.total_matched_size,
+                            old_position_size = %old_position_size,
+                            new_position_size = %new_position_size,
+                            "liquidity_reward 根据订单 websocket 成交增量更新本地库存"
+                        );
+
+                        sync_inventory_quotes(
+                            rule,
+                            state,
+                            old_position_size,
+                            new_position_size,
+                            "order_ws_fill",
+                            &order_tx,
+                            order_store.as_ref(),
+                        );
                     }
                     StrategyEvent::Positions(update) => {
                         let changed_assets: Vec<String> = update
@@ -442,87 +492,15 @@ impl Strategy for MidRequoteStrategy {
                             let old_position_size = state.last_position_size;
                             state.last_position_size = new_position_size;
 
-                            let Some(mid) = state.last_mid else {
-                                persist_state(order_store.as_ref(), &rule.token, state);
-                                continue;
-                            };
-                            let Some(best_bid) = state.last_best_bid else {
-                                persist_state(order_store.as_ref(), &rule.token, state);
-                                continue;
-                            };
-                            let Some(best_ask) = state.last_best_ask else {
-                                persist_state(order_store.as_ref(), &rule.token, state);
-                                continue;
-                            };
-
-                            promote_unblocked_pending(rule, state, QuoteSide::Buy, &order_tx);
-
-                            let buy_target = buy_target_size(rule, new_position_size);
-                            if buy_target > Decimal::ZERO {
-                                let buy_target_changed =
-                                    side_target_size(&state.buy) != Some(buy_target);
-                                if side_is_empty(&state.buy) || buy_target_changed {
-                                    if let Err(err) = submit_side_quote(
-                                        rule,
-                                        state,
-                                        QuoteSide::Buy,
-                                        best_bid,
-                                        best_ask,
-                                        mid,
-                                        buy_target,
-                                        0,
-                                        &order_tx,
-                                    ) {
-                                        warn!(token = %rule.token, error = %err, "mid_requote 仓位刷新后同步买侧失败");
-                                    }
-                                }
-                            } else if let Err(err) =
-                                cancel_side_quote(rule, state, QuoteSide::Buy, &order_tx)
-                            {
-                                warn!(token = %rule.token, error = %err, "mid_requote 仓位达到目标后撤买侧失败");
-                            }
-
-                            if new_position_size > Decimal::ZERO {
-                                promote_unblocked_pending(rule, state, QuoteSide::Sell, &order_tx);
-                                let sell_target_changed =
-                                    side_target_size(&state.sell) != Some(new_position_size);
-                                if side_is_empty(&state.sell) || sell_target_changed {
-                                    if let Err(err) = submit_side_quote(
-                                        rule,
-                                        state,
-                                        QuoteSide::Sell,
-                                        best_bid,
-                                        best_ask,
-                                        mid,
-                                        new_position_size,
-                                        0,
-                                        &order_tx,
-                                    ) {
-                                        warn!(token = %rule.token, error = %err, "mid_requote 仓位刷新后同步卖侧失败");
-                                    }
-                                }
-                            } else if let Err(err) =
-                                cancel_side_quote(rule, state, QuoteSide::Sell, &order_tx)
-                            {
-                                warn!(token = %rule.token, error = %err, "mid_requote 仓位清零后撤卖侧失败");
-                            }
-
-                            info!(
-                                target = "order",
-                                token = %rule.token,
-                                topic = %rule.topic,
-                                old_position_size = %old_position_size,
-                                new_position_size = %new_position_size,
-                                buy_active = state.buy.active_order.as_ref().map(|order| order.order_id.as_str()),
-                                sell_active = state.sell.active_order.as_ref().map(|order| order.order_id.as_str()),
-                                sell_pending = state.sell.pending_replacement.as_ref().map(|pending| pending.order_id.as_str()),
-                                best_bid = %best_bid,
-                                best_ask = %best_ask,
-                                mid = %mid,
-                                "mid_requote 根据仓位同步双边库存报价"
+                            sync_inventory_quotes(
+                                rule,
+                                state,
+                                old_position_size,
+                                new_position_size,
+                                "positions",
+                                &order_tx,
+                                order_store.as_ref(),
                             );
-
-                            persist_state(order_store.as_ref(), &rule.token, state);
                         }
                     }
                 }
@@ -531,7 +509,7 @@ impl Strategy for MidRequoteStrategy {
     }
 }
 
-fn state_from_restore(restored: MidRequoteRestoreState) -> RequoteState {
+fn state_from_restore(restored: LiquidityRewardRestoreState) -> RequoteState {
     RequoteState {
         topic: restored.topic,
         last_mid: None,
@@ -543,7 +521,7 @@ fn state_from_restore(restored: MidRequoteRestoreState) -> RequoteState {
     }
 }
 
-fn side_from_restore(restored: MidRequoteRestoreSideState) -> SideQuoteState {
+fn side_from_restore(restored: LiquidityRewardRestoreSideState) -> SideQuoteState {
     SideQuoteState {
         last_quoted_mid: restored.last_quoted_mid,
         active_order: restored.active_local_order_id.and_then(|order_id| {
@@ -572,7 +550,7 @@ fn side_from_restore(restored: MidRequoteRestoreSideState) -> SideQuoteState {
     }
 }
 
-fn empty_state(rule: &MidRequoteRule) -> RequoteState {
+fn empty_state(rule: &LiquidityRewardRule) -> RequoteState {
     RequoteState {
         topic: rule.topic.clone(),
         last_mid: None,
@@ -591,8 +569,101 @@ fn side_state_mut(state: &mut RequoteState, side: QuoteSide) -> &mut SideQuoteSt
     }
 }
 
-fn buy_target_size(rule: &MidRequoteRule, position_size: Decimal) -> Decimal {
+fn buy_target_size(rule: &LiquidityRewardRule, position_size: Decimal) -> Decimal {
     rule.target_order_size - position_size
+}
+
+fn sync_inventory_quotes(
+    rule: &LiquidityRewardRule,
+    state: &mut RequoteState,
+    old_position_size: Decimal,
+    new_position_size: Decimal,
+    source: &str,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    order_store: Option<&OrderStore>,
+) {
+    let Some(mid) = state.last_mid else {
+        persist_state(order_store, &rule.token, state);
+        return;
+    };
+    let Some(best_bid) = state.last_best_bid else {
+        persist_state(order_store, &rule.token, state);
+        return;
+    };
+    let Some(best_ask) = state.last_best_ask else {
+        persist_state(order_store, &rule.token, state);
+        return;
+    };
+
+    promote_unblocked_pending(rule, state, QuoteSide::Buy, order_tx);
+
+    let buy_target = buy_target_size(rule, new_position_size);
+    if buy_target > Decimal::ZERO {
+        let buy_target_changed = side_target_size(&state.buy) != Some(buy_target);
+        if side_is_empty(&state.buy) || buy_target_changed {
+            if let Err(err) = submit_side_quote(
+                rule,
+                state,
+                QuoteSide::Buy,
+                best_bid,
+                best_ask,
+                mid,
+                buy_target,
+                0,
+                order_tx,
+            ) {
+                warn!(token = %rule.token, source, error = %err, "liquidity_reward 同步买侧失败");
+            }
+        }
+    } else if let Err(err) = cancel_side_quote(rule, state, QuoteSide::Buy, order_tx) {
+        warn!(token = %rule.token, source, error = %err, "liquidity_reward 仓位达到目标后撤买侧失败");
+    }
+
+    if new_position_size > Decimal::ZERO {
+        promote_unblocked_pending(rule, state, QuoteSide::Sell, order_tx);
+        let sell_target_changed = side_target_size(&state.sell) != Some(new_position_size);
+        if side_is_empty(&state.sell) || sell_target_changed {
+            if let Err(err) = submit_side_quote(
+                rule,
+                state,
+                QuoteSide::Sell,
+                best_bid,
+                best_ask,
+                mid,
+                new_position_size,
+                0,
+                order_tx,
+            ) {
+                warn!(token = %rule.token, source, error = %err, "liquidity_reward 同步卖侧失败");
+            }
+        }
+    } else if let Err(err) = cancel_side_quote(rule, state, QuoteSide::Sell, order_tx) {
+        warn!(token = %rule.token, source, error = %err, "liquidity_reward 仓位清零后撤卖侧失败");
+    }
+
+    info!(
+        target = "order",
+        token = %rule.token,
+        topic = %rule.topic,
+        source,
+        old_position_size = %old_position_size,
+        new_position_size = %new_position_size,
+        buy_target = %buy_target,
+        buy_active = state.buy.active_order.as_ref().map(|order| order.order_id.as_str()),
+        buy_active_size = ?state.buy.active_order.as_ref().map(|order| order.order_size),
+        buy_pending = state.buy.pending_replacement.as_ref().map(|pending| pending.order_id.as_str()),
+        buy_pending_size = ?state.buy.pending_replacement.as_ref().map(|pending| pending.order_size),
+        sell_active = state.sell.active_order.as_ref().map(|order| order.order_id.as_str()),
+        sell_active_size = ?state.sell.active_order.as_ref().map(|order| order.order_size),
+        sell_pending = state.sell.pending_replacement.as_ref().map(|pending| pending.order_id.as_str()),
+        sell_pending_size = ?state.sell.pending_replacement.as_ref().map(|pending| pending.order_size),
+        best_bid = %best_bid,
+        best_ask = %best_ask,
+        mid = %mid,
+        "liquidity_reward 根据库存同步双边报价"
+    );
+
+    persist_state(order_store, &rule.token, state);
 }
 
 fn quoted_mid_delta(side_state: &SideQuoteState, mid: Decimal) -> Option<Decimal> {
@@ -643,13 +714,33 @@ fn active_order_side(state: &RequoteState, local_order_id: &str) -> Option<Quote
     }
 }
 
+fn pending_order_side(state: &RequoteState, local_order_id: &str) -> Option<QuoteSide> {
+    if state
+        .buy
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| pending.order_id == local_order_id)
+    {
+        Some(QuoteSide::Buy)
+    } else if state
+        .sell
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| pending.order_id == local_order_id)
+    {
+        Some(QuoteSide::Sell)
+    } else {
+        None
+    }
+}
+
 fn has_unblocked_pending(state: &RequoteState) -> bool {
     (state.buy.active_order.is_none() && state.buy.pending_replacement.is_some())
         || (state.sell.active_order.is_none() && state.sell.pending_replacement.is_some())
 }
 
 fn promote_unblocked_pending(
-    rule: &MidRequoteRule,
+    rule: &LiquidityRewardRule,
     state: &mut RequoteState,
     side: QuoteSide,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
@@ -662,8 +753,8 @@ fn promote_unblocked_pending(
     let Some(pending) = lane.pending_replacement.clone() else {
         return;
     };
-    if let Err(err) = order_tx.try_send(OrderSignal::MidRequotePlace {
-        strategy: Arc::from("mid_requote"),
+    if let Err(err) = order_tx.try_send(OrderSignal::LiquidityRewardPlace {
+        strategy: Arc::from("liquidity_reward"),
         topic,
         token: rule.token.clone(),
         mid: pending.mid,
@@ -672,7 +763,7 @@ fn promote_unblocked_pending(
         order_size: pending.order_size,
         local_order_id: pending.order_id.clone(),
     }) {
-        warn!(token = %rule.token, side = ?side, error = %err, "mid_requote 恢复 pending replacement 时发送挂单失败");
+        warn!(token = %rule.token, side = ?side, error = %err, "liquidity_reward 恢复 pending replacement 时发送挂单失败");
         return;
     }
     lane.active_order = Some(ActiveOrder {
@@ -685,7 +776,7 @@ fn promote_unblocked_pending(
 }
 
 fn submit_side_quote(
-    rule: &MidRequoteRule,
+    rule: &LiquidityRewardRule,
     state: &mut RequoteState,
     side: QuoteSide,
     best_bid: Decimal,
@@ -700,11 +791,11 @@ fn submit_side_quote(
         QuoteSide::Sell => best_ask + rule.offset,
     };
     if price <= Decimal::ZERO {
-        warn!(token = %rule.token, side = ?side, mid = %mid, price = %price, "mid_requote 计算出的挂单价格无效");
+        warn!(token = %rule.token, side = ?side, mid = %mid, price = %price, "liquidity_reward 计算出的挂单价格无效");
         return Ok(());
     }
     if order_size <= Decimal::ZERO {
-        warn!(token = %rule.token, side = ?side, mid = %mid, order_size = %order_size, "mid_requote 计算出的挂单数量无效");
+        warn!(token = %rule.token, side = ?side, mid = %mid, order_size = %order_size, "liquidity_reward 计算出的挂单数量无效");
         return Ok(());
     }
 
@@ -729,8 +820,8 @@ fn submit_side_quote(
         if request_cancel {
             lane.cancel_requested = true;
         }
-        return order_tx.try_send(OrderSignal::MidRequoteStageReplacement {
-            strategy: Arc::from("mid_requote"),
+        return order_tx.try_send(OrderSignal::LiquidityRewardStageReplacement {
+            strategy: Arc::from("liquidity_reward"),
             topic,
             token: rule.token.clone(),
             mid,
@@ -750,8 +841,8 @@ fn submit_side_quote(
     lane.last_quoted_mid = Some(mid);
     lane.cancel_requested = false;
 
-    order_tx.try_send(OrderSignal::MidRequotePlace {
-        strategy: Arc::from("mid_requote"),
+    order_tx.try_send(OrderSignal::LiquidityRewardPlace {
+        strategy: Arc::from("liquidity_reward"),
         topic,
         token: rule.token.clone(),
         mid,
@@ -763,7 +854,7 @@ fn submit_side_quote(
 }
 
 fn cancel_side_quote(
-    rule: &MidRequoteRule,
+    rule: &LiquidityRewardRule,
     state: &mut RequoteState,
     side: QuoteSide,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
@@ -779,8 +870,8 @@ fn cancel_side_quote(
         return Ok(());
     }
     lane.cancel_requested = true;
-    order_tx.try_send(OrderSignal::MidRequoteCancel {
-        strategy: Arc::from("mid_requote"),
+    order_tx.try_send(OrderSignal::LiquidityRewardCancel {
+        strategy: Arc::from("liquidity_reward"),
         topic,
         token: rule.token.clone(),
         side,
@@ -793,7 +884,7 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &RequoteS
         return;
     };
 
-    if let Err(error) = order_store.upsert_mid_requote_shared_state(
+    if let Err(error) = order_store.upsert_liquidity_reward_shared_state(
         token,
         state.topic.as_ref(),
         state.last_mid,
@@ -801,7 +892,7 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &RequoteS
         state.last_best_ask,
         state.last_position_size,
     ) {
-        warn!(token = %token, error = %error, "mid_requote 持久化共享策略状态失败");
+        warn!(token = %token, error = %error, "liquidity_reward 持久化共享策略状态失败");
     }
 
     persist_side_state(order_store, token, QuoteSide::Buy, &state.buy);
@@ -814,7 +905,7 @@ fn persist_side_state(
     side: QuoteSide,
     state: &SideQuoteState,
 ) {
-    if let Err(error) = order_store.upsert_mid_requote_side_state(
+    if let Err(error) = order_store.upsert_liquidity_reward_side_state(
         token,
         side,
         state
@@ -840,7 +931,7 @@ fn persist_side_state(
         state.last_quoted_mid,
         state.cancel_requested,
     ) {
-        warn!(token = %token, side = ?side, error = %error, "mid_requote 持久化单侧策略状态失败");
+        warn!(token = %token, side = ?side, error = %error, "liquidity_reward 持久化单侧策略状态失败");
     }
 }
 

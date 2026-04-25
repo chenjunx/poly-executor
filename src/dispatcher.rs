@@ -87,6 +87,20 @@ impl Dispatcher {
                         }
                     }
                 }
+                StrategyEvent::OrderFill(fill_event) => {
+                    if let Some(strategies) = self.position_routes.get(&fill_event.token) {
+                        for strategy in strategies {
+                            if let Err(err) = strategy.tx.try_send(event.clone()) {
+                                warn!(
+                                    strategy = %strategy.name,
+                                    asset_id = %fill_event.token,
+                                    error = %err,
+                                    "dispatcher 投递订单成交事件失败"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

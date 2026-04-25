@@ -66,7 +66,7 @@ pub async fn run_reward_estimator(
             .iter()
             .filter(|e| {
                 let m = e.value();
-                m.token == token && m.strategy.as_ref() == "mid_requote"
+                m.token == token && m.strategy.as_ref() == "liquidity_reward"
             })
             .map(|e| {
                 let m = e.value();
@@ -138,14 +138,14 @@ pub async fn run_reward_estimator(
             my_share_pct = format!("{:.2}%", est.share * 100.0),
             estimated_daily_reward = format!("{:.4}", est.estimated_reward),
             below_min_payout = est.estimated_reward > 0.0 && est.estimated_reward < 1.0,
-            "mid_requote 流动性奖励实时估算"
+            "liquidity_reward 流动性奖励实时估算"
         );
 
         last_log.insert(token.to_string(), now);
     }
 }
 
-pub async fn run_mid_reward_monitor(auth: AuthConfig, interval_secs: u64) {
+pub async fn run_liquidity_reward_monitor(auth: AuthConfig, interval_secs: u64) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
 
     loop {

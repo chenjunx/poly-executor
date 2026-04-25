@@ -157,7 +157,7 @@ impl Strategy for PairArbitrageStrategy {
                             continue;
                         };
                     }
-                    StrategyEvent::OrderStatus(_) => {}
+                    StrategyEvent::OrderStatus(_) | StrategyEvent::OrderFill(_) => {}
                 }
             }
         })

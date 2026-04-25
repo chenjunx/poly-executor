@@ -29,7 +29,7 @@ pub struct StoredOrder {
 }
 
 #[derive(Debug, Clone)]
-pub struct StoredMidRequoteSharedState {
+pub struct StoredLiquidityRewardSharedState {
     pub token: String,
     pub topic: String,
     pub last_mid: Option<Decimal>,
@@ -39,7 +39,7 @@ pub struct StoredMidRequoteSharedState {
 }
 
 #[derive(Debug, Clone)]
-pub struct StoredMidRequoteSideState {
+pub struct StoredLiquidityRewardSideState {
     pub token: String,
     pub side: QuoteSide,
     pub active_local_order_id: Option<String>,
@@ -151,7 +151,7 @@ impl OrderStore {
                 "TEXT",
             )?;
             ensure_column(conn, "strategy_state_mid_requote", "pending_mid", "TEXT")?;
-            migrate_mid_requote_side_state(conn)?;
+            migrate_liquidity_reward_side_state(conn)?;
             Ok(())
         })
     }
@@ -281,7 +281,7 @@ impl OrderStore {
         })
     }
 
-    pub fn upsert_mid_requote_state(
+    pub fn upsert_liquidity_reward_state(
         &self,
         token: &str,
         topic: &str,
@@ -339,7 +339,7 @@ impl OrderStore {
         })
     }
 
-    pub fn upsert_mid_requote_shared_state(
+    pub fn upsert_liquidity_reward_shared_state(
         &self,
         token: &str,
         topic: &str,
@@ -348,7 +348,7 @@ impl OrderStore {
         last_best_ask: Option<Decimal>,
         last_position_size: Decimal,
     ) -> anyhow::Result<()> {
-        self.upsert_mid_requote_state(
+        self.upsert_liquidity_reward_state(
             token,
             topic,
             None,
@@ -364,7 +364,7 @@ impl OrderStore {
         )
     }
 
-    pub fn upsert_mid_requote_side_state(
+    pub fn upsert_liquidity_reward_side_state(
         &self,
         token: &str,
         side: QuoteSide,
@@ -419,7 +419,8 @@ impl OrderStore {
                        min_order_size, status, last_mid
                 FROM orders
                 WHERE status NOT IN ('filled', 'canceled', 'rejected', 'failed', 'unknown')
-                ",
+                  AND (remote_order_id IS NOT NULL OR status IN ('open', 'pending_submit'))
+",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(StoredOrder {
@@ -443,9 +444,9 @@ impl OrderStore {
         })
     }
 
-    pub fn load_mid_requote_shared_states(
+    pub fn load_liquidity_reward_shared_states(
         &self,
-    ) -> anyhow::Result<Vec<StoredMidRequoteSharedState>> {
+    ) -> anyhow::Result<Vec<StoredLiquidityRewardSharedState>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "
@@ -454,7 +455,7 @@ impl OrderStore {
                 ",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(StoredMidRequoteSharedState {
+                Ok(StoredLiquidityRewardSharedState {
                     token: row.get(0)?,
                     topic: row.get(1)?,
                     last_mid: row
@@ -477,7 +478,9 @@ impl OrderStore {
         })
     }
 
-    pub fn load_mid_requote_side_states(&self) -> anyhow::Result<Vec<StoredMidRequoteSideState>> {
+    pub fn load_liquidity_reward_side_states(
+        &self,
+    ) -> anyhow::Result<Vec<StoredLiquidityRewardSideState>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "
@@ -487,7 +490,7 @@ impl OrderStore {
                 ",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(StoredMidRequoteSideState {
+                Ok(StoredLiquidityRewardSideState {
                     token: row.get(0)?,
                     side: side_from_str(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
                     active_local_order_id: row.get(2)?,
@@ -530,6 +533,41 @@ impl OrderStore {
         })
     }
 
+    pub fn last_ws_size_matched_by_remote(
+        &self,
+        remote_order_id: &str,
+    ) -> anyhow::Result<Option<Decimal>> {
+        self.with_conn(|conn| {
+            let payload = conn
+                .query_row(
+                    "
+                    SELECT payload_json
+                    FROM order_events
+                    WHERE remote_order_id = ?1 AND event_type = 'ws_update'
+                    ORDER BY event_ts_ms DESC, id DESC
+                    LIMIT 1
+                    ",
+                    params![remote_order_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+
+            payload
+                .and_then(|payload| {
+                    serde_json::from_str::<Value>(&payload)
+                        .ok()
+                        .and_then(|value| value.get("size_matched").cloned())
+                        .and_then(|value| match value {
+                            Value::String(value) => Some(value),
+                            Value::Number(value) => Some(value.to_string()),
+                            _ => None,
+                        })
+                })
+                .map(|value| decimal_from_str(&value))
+                .transpose()
+        })
+    }
+
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let guard = self
             .conn
@@ -565,7 +603,7 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
     }
 }
 
-fn migrate_mid_requote_side_state(conn: &Connection) -> anyhow::Result<()> {
+fn migrate_liquidity_reward_side_state(conn: &Connection) -> anyhow::Result<()> {
     let mut stmt = conn.prepare(
         "
         SELECT token, active_local_order_id, pending_local_order_id, pending_side,

@@ -1,2 +1,2 @@
-pub mod mid_requote;
+pub mod liquidity_reward;
 pub mod pair_arbitrage;

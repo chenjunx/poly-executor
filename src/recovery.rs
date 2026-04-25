@@ -10,9 +10,11 @@ use polymarket_client_sdk::types::Decimal;
 use crate::clob_client::{AuthenticatedClobClient, build_authenticated_clob_client};
 use crate::config::AuthConfig;
 use crate::storage::{
-    OrderStore, StoredMidRequoteSharedState, StoredMidRequoteSideState, StoredOrder,
+    OrderStore, StoredLiquidityRewardSharedState, StoredLiquidityRewardSideState, StoredOrder,
 };
-use crate::strategies::mid_requote::{MidRequoteRestoreSideState, MidRequoteRestoreState};
+use crate::strategies::liquidity_reward::{
+    LiquidityRewardRestoreSideState, LiquidityRewardRestoreState,
+};
 use crate::strategy::{OrderCorrelationMap, QuoteSide};
 
 const END_CURSOR: &str = "LTE=";
@@ -25,7 +27,7 @@ pub struct RecoveryCoordinator {
 
 pub struct RecoveryArtifacts {
     pub order_correlations: OrderCorrelationMap,
-    pub mid_requote_restore_states: HashMap<String, MidRequoteRestoreState>,
+    pub liquidity_reward_restore_states: HashMap<String, LiquidityRewardRestoreState>,
 }
 
 impl RecoveryCoordinator {
@@ -43,23 +45,24 @@ impl RecoveryCoordinator {
             .reconcile_orders_against_exchange(local_projection.active_orders)
             .await?;
         let order_correlations = self.build_order_correlations(&reconciled_active_orders)?;
-        let mid_requote_restore_states = build_mid_requote_restore_states(
+        let liquidity_reward_restore_states = build_liquidity_reward_restore_states(
             local_projection.shared_states,
             local_projection.side_states,
             &order_correlations,
+            self.simulation_enabled,
         );
 
         Ok(RecoveryArtifacts {
             order_correlations,
-            mid_requote_restore_states,
+            liquidity_reward_restore_states,
         })
     }
 
     fn load_local_projection(&self) -> anyhow::Result<LocalProjection> {
         Ok(LocalProjection {
             active_orders: self.order_store.load_active_orders()?,
-            shared_states: self.order_store.load_mid_requote_shared_states()?,
-            side_states: self.order_store.load_mid_requote_side_states()?,
+            shared_states: self.order_store.load_liquidity_reward_shared_states()?,
+            side_states: self.order_store.load_liquidity_reward_side_states()?,
         })
     }
 
@@ -249,8 +252,8 @@ impl RecoveryCoordinator {
 
 struct LocalProjection {
     active_orders: Vec<StoredOrder>,
-    shared_states: Vec<StoredMidRequoteSharedState>,
-    side_states: Vec<StoredMidRequoteSideState>,
+    shared_states: Vec<StoredLiquidityRewardSharedState>,
+    side_states: Vec<StoredLiquidityRewardSideState>,
 }
 
 async fn fetch_remote_open_orders(
@@ -275,35 +278,42 @@ async fn fetch_remote_open_orders(
     Ok(remote_open_orders)
 }
 
-fn build_mid_requote_restore_states(
-    shared_states: Vec<StoredMidRequoteSharedState>,
-    side_states: Vec<StoredMidRequoteSideState>,
+fn build_liquidity_reward_restore_states(
+    shared_states: Vec<StoredLiquidityRewardSharedState>,
+    side_states: Vec<StoredLiquidityRewardSideState>,
     order_correlations: &OrderCorrelationMap,
-) -> HashMap<String, MidRequoteRestoreState> {
-    let mut restored_mid_requote_states = restore_states_from_shared_states(shared_states);
+    simulation_enabled: bool,
+) -> HashMap<String, LiquidityRewardRestoreState> {
+    let mut restored_liquidity_reward_states =
+        restore_liquidity_reward_states_from_shared_states(shared_states);
 
     for side_state in side_states {
-        let restore_state = restored_mid_requote_states
+        let restore_state = restored_liquidity_reward_states
             .entry(side_state.token.clone())
-            .or_insert_with(default_mid_requote_restore_state);
-        apply_mid_requote_side_state(restore_state, side_state, order_correlations);
+            .or_insert_with(default_liquidity_reward_restore_state);
+        apply_liquidity_reward_side_state(
+            restore_state,
+            side_state,
+            order_correlations,
+            simulation_enabled,
+        );
     }
 
-    restored_mid_requote_states
+    restored_liquidity_reward_states
 }
 
-fn restore_states_from_shared_states(
-    shared_states: Vec<StoredMidRequoteSharedState>,
-) -> HashMap<String, MidRequoteRestoreState> {
+fn restore_liquidity_reward_states_from_shared_states(
+    shared_states: Vec<StoredLiquidityRewardSharedState>,
+) -> HashMap<String, LiquidityRewardRestoreState> {
     shared_states
         .into_iter()
         .map(|state| {
             (
                 state.token.clone(),
-                MidRequoteRestoreState {
+                LiquidityRewardRestoreState {
                     topic: Arc::from(state.topic),
-                    buy: MidRequoteRestoreSideState::default(),
-                    sell: MidRequoteRestoreSideState::default(),
+                    buy: LiquidityRewardRestoreSideState::default(),
+                    sell: LiquidityRewardRestoreSideState::default(),
                     last_mid: state.last_mid,
                     last_best_bid: state.last_best_bid,
                     last_best_ask: state.last_best_ask,
@@ -314,11 +324,11 @@ fn restore_states_from_shared_states(
         .collect()
 }
 
-fn default_mid_requote_restore_state() -> MidRequoteRestoreState {
-    MidRequoteRestoreState {
-        topic: Arc::from("mid"),
-        buy: MidRequoteRestoreSideState::default(),
-        sell: MidRequoteRestoreSideState::default(),
+fn default_liquidity_reward_restore_state() -> LiquidityRewardRestoreState {
+    LiquidityRewardRestoreState {
+        topic: Arc::from("liquidity_reward"),
+        buy: LiquidityRewardRestoreSideState::default(),
+        sell: LiquidityRewardRestoreSideState::default(),
         last_mid: None,
         last_best_bid: None,
         last_best_ask: None,
@@ -326,26 +336,27 @@ fn default_mid_requote_restore_state() -> MidRequoteRestoreState {
     }
 }
 
-fn apply_mid_requote_side_state(
-    restore_state: &mut MidRequoteRestoreState,
-    side_state: StoredMidRequoteSideState,
+fn apply_liquidity_reward_side_state(
+    restore_state: &mut LiquidityRewardRestoreState,
+    side_state: StoredLiquidityRewardSideState,
     order_correlations: &OrderCorrelationMap,
+    simulation_enabled: bool,
 ) {
     let side = side_state.side;
     let lane = restore_lane_mut(restore_state, side);
 
-    lane.active_local_order_id = side_state
-        .active_local_order_id
-        .filter(|order_id| correlated_order_matches_side(order_correlations, order_id, side));
+    lane.active_local_order_id = side_state.active_local_order_id.filter(|order_id| {
+        recoverable_order_matches_side(order_correlations, order_id, side, simulation_enabled)
+    });
     lane.active_order_size = lane.active_local_order_id.as_ref().and_then(|order_id| {
         order_correlations
             .get(order_id)
             .map(|entry| entry.order_size)
     });
 
-    lane.pending_local_order_id = side_state
-        .pending_local_order_id
-        .filter(|order_id| correlated_order_matches_side(order_correlations, order_id, side));
+    lane.pending_local_order_id = side_state.pending_local_order_id.filter(|order_id| {
+        recoverable_order_matches_side(order_correlations, order_id, side, simulation_enabled)
+    });
     apply_pending_replacement_fields(
         lane,
         side_state.pending_price,
@@ -357,27 +368,28 @@ fn apply_mid_requote_side_state(
 }
 
 fn restore_lane_mut(
-    restore_state: &mut MidRequoteRestoreState,
+    restore_state: &mut LiquidityRewardRestoreState,
     side: QuoteSide,
-) -> &mut MidRequoteRestoreSideState {
+) -> &mut LiquidityRewardRestoreSideState {
     match side {
         QuoteSide::Buy => &mut restore_state.buy,
         QuoteSide::Sell => &mut restore_state.sell,
     }
 }
 
-fn correlated_order_matches_side(
+fn recoverable_order_matches_side(
     order_correlations: &OrderCorrelationMap,
     order_id: &str,
     side: QuoteSide,
+    simulation_enabled: bool,
 ) -> bool {
-    order_correlations
-        .get(order_id)
-        .is_some_and(|entry| entry.side == side)
+    order_correlations.get(order_id).is_some_and(|entry| {
+        entry.side == side && (simulation_enabled || entry.remote_order_id.is_some())
+    })
 }
 
 fn apply_pending_replacement_fields(
-    lane: &mut MidRequoteRestoreSideState,
+    lane: &mut LiquidityRewardRestoreSideState,
     pending_price: Option<Decimal>,
     pending_order_size: Option<Decimal>,
     pending_mid: Option<Decimal>,

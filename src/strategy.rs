@@ -28,7 +28,7 @@ pub enum OrderSignal {
         ask1: Decimal,
         gap: Decimal,
     },
-    MidRequotePlace {
+    LiquidityRewardPlace {
         strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
@@ -38,7 +38,7 @@ pub enum OrderSignal {
         order_size: Decimal,
         local_order_id: String,
     },
-    MidRequoteStageReplacement {
+    LiquidityRewardStageReplacement {
         strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
@@ -50,7 +50,7 @@ pub enum OrderSignal {
         pending_local_order_id: String,
         request_cancel: bool,
     },
-    MidRequoteCancel {
+    LiquidityRewardCancel {
         strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
@@ -68,7 +68,7 @@ pub enum UnifiedOrder {
         ask1: Decimal,
         gap: Decimal,
     },
-    MidRequotePlace {
+    LiquidityRewardPlace {
         strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
@@ -78,7 +78,7 @@ pub enum UnifiedOrder {
         order_size: Decimal,
         local_order_id: String,
     },
-    MidRequoteStageReplacement {
+    LiquidityRewardStageReplacement {
         strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
@@ -90,7 +90,7 @@ pub enum UnifiedOrder {
         pending_local_order_id: String,
         request_cancel: bool,
     },
-    MidRequoteCancel {
+    LiquidityRewardCancel {
         strategy: Arc<str>,
         topic: Arc<str>,
         token: String,
@@ -115,7 +115,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 ask1,
                 gap,
             },
-            OrderSignal::MidRequotePlace {
+            OrderSignal::LiquidityRewardPlace {
                 strategy,
                 topic,
                 token,
@@ -124,7 +124,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 price,
                 order_size,
                 local_order_id,
-            } => Self::MidRequotePlace {
+            } => Self::LiquidityRewardPlace {
                 strategy,
                 topic,
                 token,
@@ -134,7 +134,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 order_size,
                 local_order_id,
             },
-            OrderSignal::MidRequoteStageReplacement {
+            OrderSignal::LiquidityRewardStageReplacement {
                 strategy,
                 topic,
                 token,
@@ -145,7 +145,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 active_local_order_id,
                 pending_local_order_id,
                 request_cancel,
-            } => Self::MidRequoteStageReplacement {
+            } => Self::LiquidityRewardStageReplacement {
                 strategy,
                 topic,
                 token,
@@ -157,13 +157,13 @@ impl From<OrderSignal> for UnifiedOrder {
                 pending_local_order_id,
                 request_cancel,
             },
-            OrderSignal::MidRequoteCancel {
+            OrderSignal::LiquidityRewardCancel {
                 strategy,
                 topic,
                 token,
                 side,
                 active_local_order_id,
-            } => Self::MidRequoteCancel {
+            } => Self::LiquidityRewardCancel {
                 strategy,
                 topic,
                 token,
@@ -233,10 +233,20 @@ pub struct OrderStatusEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrderFillEvent {
+    pub token: String,
+    pub local_order_id: String,
+    pub side: QuoteSide,
+    pub delta_size: Decimal,
+    pub total_matched_size: Decimal,
+}
+
+#[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
     Positions(PositionsUpdateEvent),
     OrderStatus(OrderStatusEvent),
+    OrderFill(OrderFillEvent),
 }
 
 #[derive(Debug, Clone)]

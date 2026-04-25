@@ -98,9 +98,9 @@ for path in "${required_files[@]}"; do
   fi
 done
 
-if grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$REMOTE_DIR/config.toml" && grep -Eq '^\[mid_requote\]' "$REMOTE_DIR/config.toml"; then
-  if [[ ! -f "$REMOTE_DIR/mid.csv" ]]; then
-    echo "Missing required file: $REMOTE_DIR/mid.csv" >&2
+if grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$REMOTE_DIR/config.toml" && grep -Eq '^\[liquidity_reward\]' "$REMOTE_DIR/config.toml"; then
+  if [[ ! -f "$REMOTE_DIR/liquidity_reward.csv" ]]; then
+    echo "Missing required file: $REMOTE_DIR/liquidity_reward.csv" >&2
     exit 1
   fi
 fi
@@ -238,9 +238,9 @@ for path in "${required_files[@]}"; do
   fi
 done
 
-if grep -Eq '^\[mid_requote\]' "$REMOTE_DIR/config.toml" && grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$REMOTE_DIR/config.toml"; then
-  if [[ ! -f "$REMOTE_DIR/mid.csv" ]]; then
-    echo "Missing required file: $REMOTE_DIR/mid.csv" >&2
+if grep -Eq '^\[liquidity_reward\]' "$REMOTE_DIR/config.toml" && grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$REMOTE_DIR/config.toml"; then
+  if [[ ! -f "$REMOTE_DIR/liquidity_reward.csv" ]]; then
+    echo "Missing required file: $REMOTE_DIR/liquidity_reward.csv" >&2
     exit 1
   fi
 fi
