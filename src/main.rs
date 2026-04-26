@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let lr_simulation = app_config.liquidity_reward.simulation;
     let reward_monitor_configs: std::collections::HashMap<String, RewardMonitorConfig> =
         liquidity_reward_strategy_opt
             .as_ref()
@@ -117,6 +118,12 @@ async fn main() -> anyhow::Result<()> {
                     .filter_map(|(token, rule)| {
                         let pool = rule.reward_daily_pool?;
                         let spread = rule.reward_max_spread_cents?;
+                        let is_yes = token == &rule.token1;
+                        let paired_token = if is_yes {
+                            rule.token2.clone()
+                        } else {
+                            Some(rule.token1.clone())
+                        };
                         Some((
                             token.clone(),
                             RewardMonitorConfig {
@@ -124,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
                                 max_spread_cents: spread,
                                 min_size: rule.reward_min_size.unwrap_or(0.0),
                                 daily_reward_pool: pool,
+                                simulation: lr_simulation,
+                                paired_token,
+                                is_yes_token: is_yes,
                             },
                         ))
                     })
@@ -135,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         strategy.with_restore_state(
             restored_liquidity_reward_states.clone(),
             Some(order_store.clone()),
+            lr_simulation,
         )
     });
 
@@ -196,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
             rx,
             reward_monitor_configs,
             order_correlations.clone(),
+            order_store.clone(),
         ));
         Some(tx)
     };

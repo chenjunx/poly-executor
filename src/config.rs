@@ -67,6 +67,8 @@ pub(crate) struct LiquidityRewardConfig {
     pub(crate) file: String,
     #[serde(default)]
     pub(crate) monitor_enabled: bool,
+    #[serde(default)]
+    pub(crate) simulation: bool,
 }
 
 pub(crate) fn load_app_config() -> anyhow::Result<AppConfig> {

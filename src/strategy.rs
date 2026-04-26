@@ -37,6 +37,7 @@ pub enum OrderSignal {
         price: Decimal,
         order_size: Decimal,
         local_order_id: String,
+        simulated: bool,
     },
     LiquidityRewardStageReplacement {
         strategy: Arc<str>,
@@ -49,6 +50,7 @@ pub enum OrderSignal {
         active_local_order_id: String,
         pending_local_order_id: String,
         request_cancel: bool,
+        simulated: bool,
     },
     LiquidityRewardCancel {
         strategy: Arc<str>,
@@ -56,6 +58,7 @@ pub enum OrderSignal {
         token: String,
         side: QuoteSide,
         active_local_order_id: String,
+        simulated: bool,
     },
 }
 
@@ -77,6 +80,7 @@ pub enum UnifiedOrder {
         price: Decimal,
         order_size: Decimal,
         local_order_id: String,
+        simulated: bool,
     },
     LiquidityRewardStageReplacement {
         strategy: Arc<str>,
@@ -89,6 +93,7 @@ pub enum UnifiedOrder {
         active_local_order_id: String,
         pending_local_order_id: String,
         request_cancel: bool,
+        simulated: bool,
     },
     LiquidityRewardCancel {
         strategy: Arc<str>,
@@ -96,6 +101,7 @@ pub enum UnifiedOrder {
         token: String,
         side: QuoteSide,
         active_local_order_id: String,
+        simulated: bool,
     },
 }
 
@@ -124,6 +130,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 price,
                 order_size,
                 local_order_id,
+                simulated,
             } => Self::LiquidityRewardPlace {
                 strategy,
                 topic,
@@ -133,6 +140,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 price,
                 order_size,
                 local_order_id,
+                simulated,
             },
             OrderSignal::LiquidityRewardStageReplacement {
                 strategy,
@@ -145,6 +153,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 active_local_order_id,
                 pending_local_order_id,
                 request_cancel,
+                simulated,
             } => Self::LiquidityRewardStageReplacement {
                 strategy,
                 topic,
@@ -156,6 +165,7 @@ impl From<OrderSignal> for UnifiedOrder {
                 active_local_order_id,
                 pending_local_order_id,
                 request_cancel,
+                simulated,
             },
             OrderSignal::LiquidityRewardCancel {
                 strategy,
@@ -163,12 +173,14 @@ impl From<OrderSignal> for UnifiedOrder {
                 token,
                 side,
                 active_local_order_id,
+                simulated,
             } => Self::LiquidityRewardCancel {
                 strategy,
                 topic,
                 token,
                 side,
                 active_local_order_id,
+                simulated,
             },
         }
     }

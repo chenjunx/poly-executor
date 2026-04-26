@@ -121,6 +121,24 @@ impl OrderStore {
                     updated_at_ms INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS liquidity_reward_scores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token TEXT NOT NULL,
+                    mid TEXT NOT NULL,
+                    my_orders INTEGER NOT NULL,
+                    my_qone TEXT NOT NULL,
+                    my_qtwo TEXT NOT NULL,
+                    my_qmin TEXT NOT NULL,
+                    competitors_qmin TEXT NOT NULL,
+                    my_share TEXT NOT NULL,
+                    estimated_daily_reward TEXT NOT NULL,
+                    simulation INTEGER NOT NULL DEFAULT 0,
+                    recorded_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_lr_scores_token_ts
+                    ON liquidity_reward_scores (token, recorded_at_ms DESC);
+
                 CREATE TABLE IF NOT EXISTS strategy_state_mid_requote_side (
                     token TEXT NOT NULL,
                     side TEXT NOT NULL,
@@ -276,6 +294,47 @@ impl OrderStore {
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 ",
                 params![local_order_id, remote_order_id, event_type, payload.to_string(), now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_liquidity_reward_score(
+        &self,
+        token: &str,
+        mid: f64,
+        my_orders: usize,
+        my_qone: f64,
+        my_qtwo: f64,
+        my_qmin: f64,
+        competitors_qmin: f64,
+        my_share: f64,
+        estimated_daily_reward: f64,
+        simulation: bool,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO liquidity_reward_scores (
+                    token, mid, my_orders, my_qone, my_qtwo, my_qmin,
+                    competitors_qmin, my_share, estimated_daily_reward,
+                    simulation, recorded_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+                params![
+                    token,
+                    mid.to_string(),
+                    my_orders as i64,
+                    my_qone.to_string(),
+                    my_qtwo.to_string(),
+                    my_qmin.to_string(),
+                    competitors_qmin.to_string(),
+                    my_share.to_string(),
+                    estimated_daily_reward.to_string(),
+                    if simulation { 1_i64 } else { 0_i64 },
+                    now,
+                ],
             )?;
             Ok(())
         })

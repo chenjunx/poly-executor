@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
@@ -60,6 +60,7 @@ pub async fn run(
                 price,
                 order_size,
                 local_order_id,
+                simulated,
             } => {
                 let meta = LocalOrderMeta {
                     local_order_id: local_order_id.clone(),
@@ -72,9 +73,9 @@ pub async fn run(
                     order_size,
                 };
                 correlations.insert(local_order_id.clone(), meta.clone());
-                persist_new_order(&order_store, &meta, mid, simulation_enabled);
+                persist_new_order(&order_store, &meta, mid, simulated || simulation_enabled);
 
-                if simulation_enabled {
+                if simulated || simulation_enabled {
                     info!(
                         target: "order",
                         topic = %topic,
@@ -84,6 +85,7 @@ pub async fn run(
                         price = %price,
                         order_size = %order_size,
                         local_order_id = %local_order_id,
+                        simulated,
                         "liquidity_reward 模拟挂单成功，已记录本地订单元数据"
                     );
                     let _ = order_store.update_order_status_by_local(&local_order_id, "open");
@@ -101,18 +103,6 @@ pub async fn run(
                             "order_size": order_size.to_string(),
                         }),
                     );
-                    let sim_fill_tx = sim_fill_tx.clone();
-                    let fill_event = SimulatedFillEvent {
-                        local_order_id,
-                        token: token.clone(),
-                        side,
-                        price,
-                        size: order_size,
-                    };
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                        let _ = sim_fill_tx.send(fill_event).await;
-                    });
                     continue;
                 }
 
@@ -189,6 +179,7 @@ pub async fn run(
                 active_local_order_id,
                 pending_local_order_id,
                 request_cancel,
+                simulated,
             } => {
                 let meta = LocalOrderMeta {
                     local_order_id: pending_local_order_id.clone(),
@@ -214,10 +205,23 @@ pub async fn run(
                         "side": format!("{:?}", side),
                         "price": price.to_string(),
                         "order_size": order_size.to_string(),
+                        "simulated": simulated,
                     }),
                 );
 
-                if request_cancel {
+                if simulated || simulation_enabled {
+                    if request_cancel {
+                        let _ = order_store
+                            .update_order_status_by_local(&active_local_order_id, "canceled");
+                        let _ = strategy_tx.try_send(StrategyEvent::OrderStatus(
+                            OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: active_local_order_id.clone(),
+                                status: Arc::from("canceled"),
+                            },
+                        ));
+                    }
+                } else if request_cancel {
                     request_liquidity_reward_cancel(
                         &auth,
                         &correlations,
@@ -234,6 +238,7 @@ pub async fn run(
                 token,
                 side,
                 active_local_order_id,
+                simulated,
             } => {
                 let remote_order_id = correlations
                     .get(&active_local_order_id)
@@ -247,16 +252,27 @@ pub async fn run(
                         "topic": topic.as_ref(),
                         "token": token,
                         "side": format!("{:?}", side),
+                        "simulated": simulated,
                     }),
                 );
-                request_liquidity_reward_cancel(
-                    &auth,
-                    &correlations,
-                    &order_store,
-                    &token,
-                    &active_local_order_id,
-                )
-                .await;
+                if simulated || simulation_enabled {
+                    let _ = order_store
+                        .update_order_status_by_local(&active_local_order_id, "canceled");
+                    let _ = strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                        token: token.clone(),
+                        local_order_id: active_local_order_id.clone(),
+                        status: Arc::from("canceled"),
+                    }));
+                } else {
+                    request_liquidity_reward_cancel(
+                        &auth,
+                        &correlations,
+                        &order_store,
+                        &token,
+                        &active_local_order_id,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -326,8 +342,10 @@ async fn request_liquidity_reward_cancel(
         return;
     };
 
+    let t_cancel = Instant::now();
     match client.cancel_order(&remote_order_id).await {
         Ok(result) => {
+            let cancel_ms = t_cancel.elapsed().as_millis();
             let _ = order_store.append_order_event(
                 Some(local_order_id),
                 Some(&remote_order_id),
@@ -343,15 +361,18 @@ async fn request_liquidity_reward_cancel(
                 remote_order_id = %remote_order_id,
                 canceled = ?result.canceled,
                 not_canceled = ?result.not_canceled,
+                cancel_rtt_ms = cancel_ms,
                 "liquidity_reward 已向交易所发送撤单请求"
             );
         }
         Err(error) => {
+            let cancel_ms = t_cancel.elapsed().as_millis();
             warn!(
                 target: "order",
                 local_order_id = %local_order_id,
                 remote_order_id = %remote_order_id,
                 error = %error,
+                cancel_rtt_ms = cancel_ms,
                 "liquidity_reward 撤单请求失败"
             );
         }
@@ -391,7 +412,9 @@ async fn place_liquidity_reward_order(
         .build()
         .await?;
     let signed = client.sign(&signer, signable).await?;
+    let t_submit = Instant::now();
     let response = client.post_order(signed).await?;
+    let submit_ms = t_submit.elapsed().as_millis();
 
     let Some(mut meta) = correlations.get(local_order_id).map(|entry| entry.clone()) else {
         warn!(
@@ -449,6 +472,7 @@ async fn place_liquidity_reward_order(
         status = ?response.status,
         success = response.success,
         error_msg = ?response.error_msg,
+        submit_rtt_ms = submit_ms,
         "liquidity_reward 真实挂单成功，已写入本地与远端订单关联"
     );
 
