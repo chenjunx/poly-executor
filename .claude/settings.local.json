@@ -27,7 +27,11 @@
       "WebFetch(domain:docs.polymarket.com)",
       "WebFetch(domain:www.scribd.com)",
       "WebFetch(domain:medium.com)",
-      "WebFetch(domain:startpolymarket.com)"
+      "WebFetch(domain:startpolymarket.com)",
+      "Bash(sqlite3 orders.db \".tables\")",
+      "Bash(where sqlite3 *)",
+      "Bash(powershell -Command \"Get-Command sqlite3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
+      "Bash(powershell -Command \"\\(Get-Content 'E:\\\\work\\\\poly-executor\\\\orders.log'\\).Count\")"
     ]
   }
 }
