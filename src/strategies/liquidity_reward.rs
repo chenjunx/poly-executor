@@ -422,7 +422,7 @@ fn needs_requote(
     let Some(active) = &state.active_order else {
         return state.pending_replacement.is_none();
     };
-    active.price < mid - offset || active.price >= best_bid
+    active.price < mid - offset || active.price > best_bid
 }
 
 fn requote_reason(state: &TokenQuoteState, mid: Decimal, offset: Decimal) -> &'static str {

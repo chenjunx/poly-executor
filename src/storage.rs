@@ -139,6 +139,48 @@ impl OrderStore {
                 CREATE INDEX IF NOT EXISTS idx_lr_scores_token_ts
                     ON liquidity_reward_scores (token, recorded_at_ms DESC);
 
+                CREATE TABLE IF NOT EXISTS market_ticks (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token     TEXT    NOT NULL,
+                    bid_price INTEGER NOT NULL,
+                    bid_size  INTEGER NOT NULL,
+                    ask_price INTEGER NOT NULL,
+                    ask_size  INTEGER NOT NULL,
+                    ts_ms     INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_market_ticks_token_ts
+                    ON market_ticks (token, ts_ms DESC);
+
+                -- 全量订单簿快照：bids/asks 以小端字节流存储
+                -- 格式：每档位 = price(u16 LE) + size(u32 LE)，共 6 字节
+                CREATE TABLE IF NOT EXISTS book_snapshots (
+                    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token  TEXT    NOT NULL,
+                    market TEXT    NOT NULL,
+                    bids   BLOB    NOT NULL,
+                    asks   BLOB    NOT NULL,
+                    ts_ms  INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_book_snapshots_token_ts
+                    ON book_snapshots (token, ts_ms DESC);
+
+                -- last_trade_price 事件
+                CREATE TABLE IF NOT EXISTS trade_events (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token    TEXT NOT NULL,
+                    market   TEXT NOT NULL,
+                    price    TEXT NOT NULL,
+                    side     TEXT,
+                    size     TEXT,
+                    fee_rate TEXT,
+                    ts_ms    INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_events_token_ts
+                    ON trade_events (token, ts_ms DESC);
+
                 CREATE TABLE IF NOT EXISTS strategy_state_mid_requote_side (
                     token TEXT NOT NULL,
                     side TEXT NOT NULL,
@@ -624,6 +666,75 @@ impl OrderStore {
                 })
                 .map(|value| decimal_from_str(&value))
                 .transpose()
+        })
+    }
+
+    /// bids / asks 已由调用方打包为小端字节流（每档 6 字节：price u16 LE + size u32 LE）
+    pub fn insert_book_snapshot(
+        &self,
+        token: &str,
+        market: &str,
+        bids: &[u8],
+        asks: &[u8],
+        ts_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO book_snapshots (token, market, bids, asks, ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token, market, bids, asks, ts_ms],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_trade_event(
+        &self,
+        token: &str,
+        market: &str,
+        price: &str,
+        side: Option<&str>,
+        size: Option<&str>,
+        fee_rate: Option<&str>,
+        ts_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO trade_events (token, market, price, side, size, fee_rate, ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![token, market, price, side, size, fee_rate, ts_ms],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_market_ticks_batch(
+        &self,
+        ticks: &[(String, u16, u32, u16, u32, u64)],
+    ) -> anyhow::Result<usize> {
+        if ticks.is_empty() {
+            return Ok(0);
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN")?;
+            let mut stmt = conn.prepare_cached(
+                "INSERT INTO market_ticks (token, bid_price, bid_size, ask_price, ask_size, ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut count = 0usize;
+            for (token, bid_price, bid_size, ask_price, ask_size, ts_ms) in ticks {
+                stmt.execute(params![
+                    token,
+                    *bid_price as i64,
+                    *bid_size as i64,
+                    *ask_price as i64,
+                    *ask_size as i64,
+                    *ts_ms as i64,
+                ])?;
+                count += 1;
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(count)
         })
     }
 

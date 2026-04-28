@@ -36,6 +36,10 @@ pub(crate) struct AppSettings {
     pub(crate) default_threads: usize,
     #[serde(default = "default_monitor_interval_secs")]
     pub(crate) monitor_interval_secs: u64,
+    #[serde(default)]
+    pub(crate) tick_store_enabled: bool,
+    #[serde(default)]
+    pub(crate) raw_store_enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use polymarket_client_sdk::clob::types::Side;
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 
 use crate::monitor::FullBookSnapshot;
 use crate::proxy_ws;
+use crate::storage::OrderStore;
 use crate::strategy::{CleanOrderbook, MarketEvent, StrategyEvent};
 
 #[derive(Debug, Clone, Default)]
@@ -19,12 +21,14 @@ struct LocalOrderbook {
     bids: BTreeMap<u16, u32>,
     asks: BTreeMap<u16, u32>,
     timestamp_ms: u64,
+    market: String,
 }
 
 impl LocalOrderbook {
     fn apply_book(&mut self, book: &BookUpdate) -> Option<CleanOrderbook> {
         self.bids.clear();
         self.asks.clear();
+        self.market = book.market.clone();
 
         for level in &book.bids {
             let Some(price) = scale_price(level.price) else {
@@ -189,16 +193,149 @@ pub async fn spawn_subscriptions(
     }
 }
 
+pub async fn run_tick_recorder(
+    mut rx: tokio::sync::mpsc::Receiver<(Arc<str>, CleanOrderbook)>,
+    store: OrderStore,
+) {
+    const BATCH_SIZE: usize = 500;
+    let flush_interval = Duration::from_millis(500);
+
+    let mut buffer: Vec<(String, u16, u32, u16, u32, u64)> = Vec::with_capacity(BATCH_SIZE);
+    // token -> (last_bid_price, last_ask_price)：只在 best price 变化时落盘
+    let mut last_top: HashMap<String, (u16, u16)> = HashMap::new();
+    let mut ticker = tokio::time::interval(flush_interval);
+    ticker.tick().await; // 跳过立即触发的第一次
+
+    loop {
+        tokio::select! {
+            biased;
+
+            msg = rx.recv() => {
+                let Some((token, book)) = msg else { break };
+                let key = (book.best_bid_price, book.best_ask_price);
+                let last = last_top.entry(token.to_string()).or_insert((0, 0));
+                if *last != key {
+                    *last = key;
+                    buffer.push((
+                        token.to_string(),
+                        book.best_bid_price,
+                        book.best_bid_size,
+                        book.best_ask_price,
+                        book.best_ask_size,
+                        book.timestamp_ms,
+                    ));
+                    if buffer.len() >= BATCH_SIZE {
+                        flush_ticks(&store, &mut buffer);
+                    }
+                }
+            }
+
+            _ = ticker.tick() => {
+                if !buffer.is_empty() {
+                    flush_ticks(&store, &mut buffer);
+                }
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        flush_ticks(&store, &mut buffer);
+    }
+}
+
+fn flush_ticks(store: &OrderStore, buffer: &mut Vec<(String, u16, u32, u16, u32, u64)>) {
+    if let Err(e) = store.insert_market_ticks_batch(buffer) {
+        warn!(error = %e, rows = buffer.len(), "market_ticks 批量写入失败");
+    }
+    buffer.clear();
+}
+
+pub(crate) enum RawStoreEvent {
+    Book {
+        token: String,
+        market: String,
+        bids: BTreeMap<u16, u32>,
+        asks: BTreeMap<u16, u32>,
+        ts_ms: u64,
+    },
+    Trade {
+        token: String,
+        market: String,
+        price: String,
+        side: Option<String>,
+        size: Option<String>,
+        fee_rate: Option<String>,
+        ts_ms: i64,
+    },
+}
+
+pub async fn run_raw_recorder(
+    mut rx: tokio::sync::mpsc::Receiver<RawStoreEvent>,
+    store: OrderStore,
+) {
+    while let Some(event) = rx.recv().await {
+        match event {
+            RawStoreEvent::Book { token, market, bids, asks, ts_ms } => {
+                let bids_blob = pack_book(&bids);
+                let asks_blob = pack_book(&asks);
+                if let Err(e) = store.insert_book_snapshot(
+                    &token, &market, &bids_blob, &asks_blob, ts_ms as i64,
+                ) {
+                    warn!(error = %e, "book_snapshots 写入失败");
+                }
+            }
+            RawStoreEvent::Trade { token, market, price, side, size, fee_rate, ts_ms } => {
+                if let Err(e) = store.insert_trade_event(
+                    &token,
+                    &market,
+                    &price,
+                    side.as_deref(),
+                    size.as_deref(),
+                    fee_rate.as_deref(),
+                    ts_ms,
+                ) {
+                    warn!(error = %e, "trade_events 写入失败");
+                }
+            }
+        }
+    }
+}
+
+fn pack_book(book: &BTreeMap<u16, u32>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(book.len() * 6);
+    for (&price, &size) in book {
+        buf.extend_from_slice(&price.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+    }
+    buf
+}
+
 pub async fn run(
     token_topics: Arc<HashMap<String, Arc<[Arc<str>]>>>,
     liquidity_reward_tokens: Arc<std::collections::HashSet<String>>,
     mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
     market_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
     monitor_tx: Option<tokio::sync::mpsc::Sender<FullBookSnapshot>>,
+    tick_tx: Option<tokio::sync::mpsc::Sender<(Arc<str>, CleanOrderbook)>>,
+    raw_store_tx: Option<tokio::sync::mpsc::Sender<RawStoreEvent>>,
 ) {
     let mut books: HashMap<String, LocalOrderbook> = HashMap::new();
 
     while let Some(msg) = ws_rx.recv().await {
+        if let Some(ref tx) = raw_store_tx {
+            if let WsMessage::LastTradePrice(ltp) = &msg {
+                let _ = tx.try_send(RawStoreEvent::Trade {
+                    token: ltp.asset_id.clone(),
+                    market: ltp.market.clone(),
+                    price: ltp.price.to_string(),
+                    side: ltp.side.map(|s| format!("{s:?}")),
+                    size: ltp.size.map(|s| s.to_string()),
+                    fee_rate: ltp.fee_rate_bps.clone(),
+                    ts_ms: ltp.timestamp,
+                });
+            }
+        }
+
         let events = apply_market_message(&mut books, &msg);
         if events.is_empty() {
             continue;
@@ -212,6 +349,10 @@ pub async fn run(
                 liquidity_reward_tokens.as_ref(),
             );
 
+            if let Some(ref tx) = tick_tx {
+                let _ = tx.try_send((asset_id.clone(), book));
+            }
+
             if let Some(ref tx) = monitor_tx {
                 if let Some(state) = books.get(asset_id.as_ref()) {
                     let _ = tx.try_send(FullBookSnapshot {
@@ -219,6 +360,18 @@ pub async fn run(
                         bids: Arc::new(state.bids.clone()),
                         asks: Arc::new(state.asks.clone()),
                         timestamp_ms: state.timestamp_ms,
+                    });
+                }
+            }
+
+            if let Some(ref tx) = raw_store_tx {
+                if let Some(state) = books.get(asset_id.as_ref()) {
+                    let _ = tx.try_send(RawStoreEvent::Book {
+                        token: asset_id.to_string(),
+                        market: state.market.clone(),
+                        bids: state.bids.clone(),
+                        asks: state.asks.clone(),
+                        ts_ms: state.timestamp_ms,
                     });
                 }
             }
@@ -333,6 +486,9 @@ fn apply_market_message(
                 .iter()
                 .filter_map(|change| {
                     let state = books.entry(change.asset_id.clone()).or_default();
+                    if state.market.is_empty() {
+                        state.market = price_change.market.clone();
+                    }
                     state
                         .apply_price_change(change, timestamp_ms)
                         .map(|clean| (Arc::from(change.asset_id.as_str()), clean))

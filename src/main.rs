@@ -236,12 +236,30 @@ async fn main() -> anyhow::Result<()> {
         liquidity_reward_strategy.spawn(liquidity_reward_rx, order_tx.clone());
     }
     tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
+    let tick_tx = if app_config.app.tick_store_enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        tokio::spawn(market::run_tick_recorder(rx, order_store.clone()));
+        Some(tx)
+    } else {
+        None
+    };
+
+    let raw_store_tx = if app_config.app.raw_store_enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        tokio::spawn(market::run_raw_recorder(rx, order_store.clone()));
+        Some(tx)
+    } else {
+        None
+    };
+
     tokio::spawn(market::run(
         token_topics.clone(),
         liquidity_reward_tokens.clone(),
         ws_rx,
         strategy_tx.clone(),
         monitor_tx,
+        tick_tx,
+        raw_store_tx,
     ));
     if app_config.simulation.enabled {
         tokio::spawn(positions::run_simulated(sim_fill_rx, strategy_tx.clone()));

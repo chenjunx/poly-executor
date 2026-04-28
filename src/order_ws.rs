@@ -164,6 +164,10 @@ async fn subscribe_orders(
 
                     let is_terminal = matches!(status, "canceled" | "filled" | "rejected");
                     if is_terminal {
+                        correlations.remove(&local_meta.local_order_id);
+                        if let Some(remote_id) = &local_meta.remote_order_id {
+                            correlations.remove(remote_id.as_str());
+                        }
                         let _ =
                             strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
                                 token: local_meta.token.clone(),
