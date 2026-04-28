@@ -1,3 +1,8 @@
+[chain]
+# Polygon 主网 RPC，用于 merge_positions 等链上操作
+# 建议换成 Alchemy/Infura 专用 RPC 以提高稳定性
+rpc_url = "https://polygon-rpc.com"
+
 [proxy]
 # 代理地址，例如 "socks5://127.0.0.1:1080"
 url = ""
@@ -10,7 +15,6 @@ private_key = ""   # EIP-712 签名私钥（0x 开头）
 funder      = ""   # 钱包地址
 
 [order]
-enabled   = false  # 改为 true 才会启动订单链路
 size_usdc = 10.0   # 每次套利投入的 USDC 总量
 
 [simulation]
@@ -43,7 +47,7 @@ sqlite_path = "/root/orders.db"
 # 是否将 WS 行情 tick 写入 SQLite（best_bid/ask 变化时落盘）
 tick_store_enabled = false
 # 是否将全量 book 快照和 last_trade_price 事件写入 SQLite
-raw_store_enabled = false
+raw_store_enabled = true
 # 每个主题的订阅线程数，未列出的主题使用 default_threads
 [topic_threads]
 # cs = 2

@@ -82,8 +82,15 @@ cargo build --release
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `enabled` | bool | `false` | `true` 才启动真实订单链路（含订单 WebSocket 监听）；`false` 时即使 `simulation=false` 也不下单 |
 | `size_usdc` | f64 | `10.0` | 配对套利每次投入的 USDC 总量 |
+
+---
+
+### `[chain]`
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `rpc_url` | String | `"https://polygon-rpc.com"` | Polygon 主网 RPC 地址，用于 `merge` 工具等链上操作；建议换成 Alchemy/Infura 专用节点提高稳定性 |
 
 ---
 
@@ -91,7 +98,9 @@ cargo build --release
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `enabled` | bool | `false` | 全局模拟模式；`true` 时跳过真实订单 WebSocket 和持仓 API，改为本地模拟成交与仓位 |
+| `enabled` | bool | `false` | 全局模拟开关。`true` 时跳过所有与交易所的真实交互（真实订单 WebSocket、持仓 API、下单请求），改为本地模拟成交与仓位。**这是控制是否真实交易的唯一开关。** |
+
+> 注：原 `[order] enabled` 字段已移除，统一由 `[simulation] enabled` 控制。
 
 ---
 
@@ -140,6 +149,26 @@ us_iran = 1
 
 ---
 
+## 工具命令
+
+### `merge` — 头寸合并（YES+NO → USDC）
+
+将等量的 YES token 和 NO token 通过 Polymarket CTF 合约（`mergePositions`）换回 USDC。
+
+```bash
+cargo build --release --bin merge
+./target/release/merge <condition_id> <amount_usdc>
+```
+
+| 参数 | 说明 |
+|---|---|
+| `condition_id` | 市场的 condition ID，`0x` 开头 64 位十六进制 |
+| `amount_usdc` | 要合并的数量（USDC，如 `100.0`） |
+
+读取 `config.toml` / `config.local.toml` 中的 `[auth] private_key` 和 `[chain] rpc_url`，直接向 Polygon 发起链上交易。
+
+---
+
 ## CSV 文件格式
 
 ### `assets.csv`（配对套利）
@@ -171,7 +200,7 @@ token0,token1,topic
 | 1 | `token2` | String | 否 | 配对 NO token asset ID；为空时仅对 token1 单边做市 |
 | 2 | `topic` | String | 否 | 订阅分组名；为空时默认使用 `"liquidity_reward"` |
 | 3 | `reward_min_orders` | u32 | 否 | 奖励达标所需的最少挂单数量（用于 monitor 评估） |
-| 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（单位：cents，如 `4` 表示 4 cents） |
+| 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（**单位：cents**，如 `4` 表示 4 cents；典型值 2–5）。低于此价差的挂单才计入 Q-score。填 `0.04` 表示 0.04 cents，极其严苛，几乎无竞争者得分，建议填整数如 `3` 或 `4`。 |
 | 5 | `reward_min_size` | f64 | 否 | 奖励有效的最小单笔挂单金额（USDC） |
 | 6 | `reward_daily_pool` | f64 | 否 | 该市场每日奖励总池（USDC），用于估算预期日收益份额 |
 
@@ -192,7 +221,7 @@ token1,token2,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,re
 | `order_events` | 订单生命周期事件 | 订单流水，`payload_json` 存储原始事件 JSON |
 | `strategy_state_mid_requote` | 做市策略状态变更 | 做市策略共享状态快照，用于崩溃恢复 |
 | `strategy_state_mid_requote_side` | 做市策略状态变更 | 做市策略双侧（buy/sell）状态快照，PK 为 `(token, side)` |
-| `liquidity_reward_scores` | 奖励估算周期 | 做市奖励得分记录；包含 `my_qmin`、预计份额、估算日收益等字段 |
+| `liquidity_reward_scores` | 奖励估算周期 | 做市奖励得分记录；`my_orders` 为评估时刻内存中关联挂单数量（本地估算值，非 API 数据）；`competitors_qmin=0` 通常表示无竞争者订单满足 `reward_max_spread_cents` 门槛 |
 | `market_ticks` | `tick_store_enabled=true` | best bid/ask 变化时的 tick 记录；price/size 精度为 1/10000 的整数 |
 | `book_snapshots` | `raw_store_enabled=true` | 全量订单簿快照；`bids`/`asks` 为 BLOB，格式：每档 6 字节 = `price(u16 LE)` + `size(u32 LE)` |
 | `trade_events` | `raw_store_enabled=true` | `last_trade_price` 成交事件；字段：`token`、`market`、`price`、`side`、`size`、`fee_rate`、`ts_ms` |

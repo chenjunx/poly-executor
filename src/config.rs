@@ -53,7 +53,6 @@ pub(crate) struct AuthConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct OrderConfig {
-    pub(crate) enabled: bool,
     pub(crate) size_usdc: f64,
 }
 

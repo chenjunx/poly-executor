@@ -302,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::Startup);
     }
 
-    if app_config.order.enabled && !app_config.simulation.enabled {
+    if !app_config.simulation.enabled {
         tokio::spawn(order_ws::run(
             app_config.auth.clone(),
             order_correlations.clone(),

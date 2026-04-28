@@ -43,9 +43,6 @@ pub async fn run(
                 ask1,
                 gap,
             } => {
-                if !order_cfg.enabled {
-                    continue;
-                }
                 simulate_pair_order(&auth, &order_cfg, token0, token1, ask0, ask1, gap).await;
                 if !simulation_enabled {
                     let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
@@ -103,10 +100,6 @@ pub async fn run(
                             "order_size": order_size.to_string(),
                         }),
                     );
-                    continue;
-                }
-
-                if !order_cfg.enabled {
                     continue;
                 }
 
