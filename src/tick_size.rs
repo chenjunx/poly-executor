@@ -45,10 +45,17 @@ pub async fn load_for_tokens(tokens: &[String], auth: &AuthConfig, map: &TickSiz
         }
     };
 
+    // 并发查询所有 token，总耗时 ≈ 单次请求时延（而非 N 倍）
+    let futs = tokens.iter().map(|token| {
+        let client = &client;
+        async move { (token, client.tick_size(token).await) }
+    });
+    let results = futures::future::join_all(futs).await;
+
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for token in tokens {
-        match client.tick_size(token).await {
+    for (token, result) in results {
+        match result {
             Ok(resp) => {
                 let tick = Decimal::from(resp.minimum_tick_size);
                 info!(token = %token, tick = %tick, "tick_size 已加载");
