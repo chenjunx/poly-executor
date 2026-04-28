@@ -8,9 +8,10 @@ use anyhow::{Context as _, bail};
 use futures::{SinkExt as _, StreamExt as _};
 use polymarket_client_sdk::clob::ws::types::response::WsMessage;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::{interval, timeout};
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::info;
 use url::Url;
@@ -125,33 +126,49 @@ struct SubRequest<'a> {
     initial_dump: bool,
 }
 
-/// 通过代理建立 WebSocket 连接，然后循环接收价格消息并传回 channel。
+/// 建立 WebSocket 连接（可选代理），然后循环接收消息并传回 channel。
 ///
-/// 调用者通过 `tx` 接收解析后的 [`WsMessage`]。
+/// `proxy = None` 时直接 TLS 连接；`proxy = Some(...)` 时通过代理隧道连接。
+/// 调用者通过 `tx` 接收解析后的 [`WsMessage`]，所有事件类型均透传（含 last_trade_price）。
 pub async fn run(
-    proxy: Proxy,
+    proxy: Option<Proxy>,
     asset_ids: Vec<String>,
     tx: tokio::sync::mpsc::Sender<WsMessage>,
 ) -> anyhow::Result<()> {
-    let url = Url::parse(WS_URL)?;
-    let host = url.host_str().context("URL 缺少 host")?;
-    let port = url.port().unwrap_or(443);
+    if let Some(proxy) = proxy {
+        let url = Url::parse(WS_URL)?;
+        let host = url.host_str().context("URL 缺少 host")?;
+        let port = url.port().unwrap_or(443);
 
-    info!(host = %host, port, "通过代理建立隧道");
-    let tcp = proxy.tunnel(host, port).await?;
+        info!(host = %host, port, "通过代理建立隧道");
+        let tcp = proxy.tunnel(host, port).await?;
 
-    // TLS 握手
-    let cx = native_tls::TlsConnector::new()?;
-    let cx = tokio_native_tls::TlsConnector::from(cx);
-    let tls_stream = cx.connect(host, tcp).await.context("TLS 握手失败")?;
+        let cx = native_tls::TlsConnector::new()?;
+        let cx = tokio_native_tls::TlsConnector::from(cx);
+        let tls_stream = cx.connect(host, tcp).await.context("TLS 握手失败")?;
 
-    // WebSocket 握手
-    let (mut ws, _) = tokio_tungstenite::client_async(WS_URL, tls_stream)
-        .await
-        .context("WebSocket 握手失败")?;
+        let (ws, _) = tokio_tungstenite::client_async(WS_URL, tls_stream)
+            .await
+            .context("WebSocket 握手失败")?;
+        info!("WebSocket 已连接（通过代理）");
+        run_session(ws, asset_ids, tx).await
+    } else {
+        let (ws, _) = tokio_tungstenite::connect_async(WS_URL)
+            .await
+            .context("WebSocket 直连失败")?;
+        info!("WebSocket 已连接（直连）");
+        run_session(ws, asset_ids, tx).await
+    }
+}
 
-    info!("WebSocket 已连接（通过代理）");
-
+async fn run_session<S>(
+    mut ws: WebSocketStream<S>,
+    asset_ids: Vec<String>,
+    tx: tokio::sync::mpsc::Sender<WsMessage>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 发送订阅请求
     let req = SubRequest {
         r#type: "market",
@@ -182,7 +199,6 @@ pub async fn run(
                         if text == "PONG" {
                             continue;
                         }
-                        // simd-json 需要 &mut [u8]（原地解析），先转为字节缓冲
                         let mut buf = text.as_bytes().to_vec();
                         let msgs: Vec<WsMessage> = if buf.first() == Some(&b'[') {
                             simd_json::from_slice(&mut buf).unwrap_or_default()
@@ -197,7 +213,7 @@ pub async fn run(
                         }
                     }
                     Ok(Some(Ok(Message::Close(_)))) => bail!("服务器主动关闭连接"),
-                    Ok(Some(Ok(_))) => {} // 忽略 binary/ping/pong 帧
+                    Ok(Some(Ok(_))) => {}
                 }
             }
         }

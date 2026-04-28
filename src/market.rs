@@ -2,9 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt as _;
 use polymarket_client_sdk::clob::types::Side;
-use polymarket_client_sdk::clob::ws::Client;
 use polymarket_client_sdk::clob::ws::types::response::{
     BookUpdate, PriceChangeBatchEntry, WsMessage,
 };
@@ -137,59 +135,15 @@ pub async fn spawn_subscriptions(
 
     for chunk in all_chunks {
         let tx = tx.clone();
-        if let Some(ref proxy) = proxy {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(e) = proxy_ws::run(proxy.clone(), chunk.clone(), tx.clone()).await {
-                        warn!(error = %e, "proxy_ws 连接断开，5 秒后重连");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    }
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                loop {
-                    let client = Client::default();
-                    let orderbook_stream = match client.subscribe_orderbook(chunk.clone()) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(error = %e, "direct subscribe_orderbook 失败，5 秒后重连");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
-                        }
-                    };
-                    let price_stream = match client.subscribe_prices(chunk.clone()) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(error = %e, "direct subscribe_prices 失败，5 秒后重连");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
-                        }
-                    };
-                    let merged_stream = futures::stream::select(
-                        orderbook_stream.map(|result| result.map(WsMessage::Book)),
-                        price_stream.map(|result| result.map(WsMessage::PriceChange)),
-                    );
-                    let mut merged_stream = Box::pin(merged_stream);
-                    while let Some(result) = merged_stream.next().await {
-                        match result {
-                            Ok(msg) => {
-                                if tx.send(msg).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                warn!(error = %error, "direct market stream 消息处理失败，准备重连");
-                                break;
-                            }
-                        }
-                    }
-                    warn!("direct market stream 断开，5 秒后重连");
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = proxy_ws::run(proxy.clone(), chunk.clone(), tx.clone()).await {
+                    warn!(error = %e, "WS 连接断开，5 秒后重连");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
-            });
-        }
+            }
+        });
     }
 }
 
