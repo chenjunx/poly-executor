@@ -11,6 +11,7 @@ use crate::{
     strategy::{
         OrderSignal, QuoteSide, Strategy, StrategyEvent, StrategyRegistration, TopicRegistration,
     },
+    tick_size::{TickSizeMap, snap_price_to_tick},
 };
 
 const DEFAULT_TOPIC: &str = "liquidity_reward";
@@ -84,6 +85,7 @@ pub struct LiquidityRewardStrategy {
     restored_states: HashMap<String, LiquidityRewardRestoreState>,
     order_store: Option<OrderStore>,
     simulation_enabled: bool,
+    tick_size_map: TickSizeMap,
 }
 
 impl LiquidityRewardStrategy {
@@ -96,10 +98,12 @@ impl LiquidityRewardStrategy {
         restored_states: HashMap<String, LiquidityRewardRestoreState>,
         order_store: Option<OrderStore>,
         simulation_enabled: bool,
+        tick_size_map: TickSizeMap,
     ) -> Self {
         self.restored_states = restored_states;
         self.order_store = order_store;
         self.simulation_enabled = simulation_enabled;
+        self.tick_size_map = tick_size_map;
         self
     }
 
@@ -207,6 +211,7 @@ impl LiquidityRewardStrategy {
             restored_states: HashMap::new(),
             order_store: None,
             simulation_enabled: false,
+            tick_size_map: Arc::new(dashmap::DashMap::new()),
         }))
     }
 }
@@ -229,6 +234,7 @@ impl Strategy for LiquidityRewardStrategy {
         let order_store = self.order_store.clone();
         let restored_states = self.restored_states;
         let simulation_enabled = self.simulation_enabled;
+        let tick_size_map = self.tick_size_map.clone();
 
         tokio::spawn(async move {
             let mut states: HashMap<String, TokenQuoteState> = restored_states
@@ -298,6 +304,7 @@ impl Strategy for LiquidityRewardStrategy {
                                 simulation_enabled,
                                 event.book.timestamp_ms,
                                 &order_tx,
+                                &tick_size_map,
                             ) {
                                 warn!(token = %token, error = %err, "liquidity_reward 发送挂单事件失败");
                             }
@@ -448,10 +455,17 @@ fn submit_quote(
     simulated: bool,
     ts: u64,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    tick_size_map: &TickSizeMap,
 ) -> Result<(), tokio::sync::mpsc::error::TrySendError<OrderSignal>> {
-    let price = mid - spread / Decimal::TWO;
+    let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
+    let tick = tick_size_map
+        .get(token)
+        .map(|v| *v)
+        .unwrap_or(default_tick);
+    // 买单：向下对齐至最近合法价格刻度
+    let price = snap_price_to_tick(mid - spread / Decimal::TWO, tick, true);
     if price <= Decimal::ZERO {
-        warn!(token = %token, mid = %mid, spread_cents = ?rule.reward_max_spread_cents, price = %price, "liquidity_reward 计算出的挂单价格无效");
+        warn!(token = %token, mid = %mid, spread_cents = ?rule.reward_max_spread_cents, tick = %tick, price = %price, "liquidity_reward 计算出的挂单价格无效");
         return Ok(());
     }
 

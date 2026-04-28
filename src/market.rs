@@ -13,6 +13,7 @@ use crate::monitor::FullBookSnapshot;
 use crate::proxy_ws;
 use crate::storage::OrderStore;
 use crate::strategy::{CleanOrderbook, MarketEvent, StrategyEvent};
+use crate::tick_size::TickSizeMap;
 
 #[derive(Debug, Clone, Default)]
 struct LocalOrderbook {
@@ -272,10 +273,16 @@ pub async fn run(
     monitor_tx: Option<tokio::sync::mpsc::Sender<FullBookSnapshot>>,
     tick_tx: Option<tokio::sync::mpsc::Sender<(Arc<str>, CleanOrderbook)>>,
     raw_store_tx: Option<tokio::sync::mpsc::Sender<RawStoreEvent>>,
+    tick_size_map: TickSizeMap,
 ) {
     let mut books: HashMap<String, LocalOrderbook> = HashMap::new();
 
     while let Some(msg) = ws_rx.recv().await {
+        if let WsMessage::TickSizeChange(change) = &msg {
+            tick_size_map.insert(change.asset_id.clone(), change.new_tick_size);
+            continue;
+        }
+
         if let Some(ref tx) = raw_store_tx {
             if let WsMessage::LastTradePrice(ltp) = &msg {
                 let _ = tx.try_send(RawStoreEvent::Trade {

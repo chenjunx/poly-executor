@@ -14,6 +14,7 @@ mod recovery;
 mod storage;
 mod strategies;
 mod strategy;
+mod tick_size;
 
 use std::sync::Arc;
 
@@ -141,11 +142,21 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or_default();
 
+    let tick_size_map = tick_size::new_tick_size_map();
+    {
+        let lr_tokens: Vec<String> = liquidity_reward_strategy_opt
+            .as_ref()
+            .map(|s| s.registration().related_tokens.to_vec())
+            .unwrap_or_default();
+        tick_size::load_for_tokens(&lr_tokens, &app_config.auth, &tick_size_map).await;
+    }
+
     let liquidity_reward = liquidity_reward_strategy_opt.map(|strategy| {
         strategy.with_restore_state(
             restored_liquidity_reward_states.clone(),
             Some(order_store.clone()),
             lr_simulation,
+            tick_size_map.clone(),
         )
     });
 
@@ -260,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         monitor_tx,
         tick_tx,
         raw_store_tx,
+        tick_size_map.clone(),
     ));
     if app_config.simulation.enabled {
         tokio::spawn(positions::run_simulated(sim_fill_rx, strategy_tx.clone()));
