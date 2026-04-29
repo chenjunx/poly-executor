@@ -77,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let condition_id = &args[1];
-    let amount_usdc: f64 = args[2].parse().context("解析 amount_usdc 失败，应为浮点数")?;
+    let amount_usdc: f64 = args[2]
+        .parse()
+        .context("解析 amount_usdc 失败，应为浮点数")?;
     if amount_usdc <= 0.0 {
         anyhow::bail!("amount_usdc 必须大于 0");
     }
@@ -122,16 +124,15 @@ async fn main() -> anyhow::Result<()> {
         amount,
     );
 
-    let pending: PendingTransactionBuilder<Ethereum> =
-        tx_builder.send().await.context("发送 mergePositions 交易失败")?;
+    let pending: PendingTransactionBuilder<Ethereum> = tx_builder
+        .send()
+        .await
+        .context("发送 mergePositions 交易失败")?;
     let tx_hash = *pending.tx_hash();
     println!("交易已提交: {tx_hash:#x}");
     println!("等待链上确认...");
 
-    let receipt = pending
-        .get_receipt()
-        .await
-        .context("等待交易回执失败")?;
+    let receipt = pending.get_receipt().await.context("等待交易回执失败")?;
 
     if receipt.status() {
         println!();

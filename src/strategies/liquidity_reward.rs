@@ -253,10 +253,10 @@ impl Strategy for LiquidityRewardStrategy {
                         };
                         let token = event.asset_id.as_ref().to_string();
 
-                        let bid = Decimal::from(event.book.best_bid_price)
-                            / Decimal::from(PRICE_SCALE);
-                        let ask = Decimal::from(event.book.best_ask_price)
-                            / Decimal::from(PRICE_SCALE);
+                        let bid =
+                            Decimal::from(event.book.best_bid_price) / Decimal::from(PRICE_SCALE);
+                        let ask =
+                            Decimal::from(event.book.best_ask_price) / Decimal::from(PRICE_SCALE);
                         let mid = (bid + ask) / Decimal::TWO;
 
                         let state = states
@@ -460,16 +460,14 @@ impl Strategy for LiquidityRewardStrategy {
                         persist_state(order_store.as_ref(), &token, state);
                     }
                     StrategyEvent::OrderFill(fill_event) => {
-                        let is_ours = states
-                            .get(fill_event.token.as_str())
-                            .is_some_and(|s| {
-                                s.active_order
+                        let is_ours = states.get(fill_event.token.as_str()).is_some_and(|s| {
+                            s.active_order
+                                .as_ref()
+                                .is_some_and(|o| o.order_id == fill_event.local_order_id)
+                                || s.pending_replacement
                                     .as_ref()
-                                    .is_some_and(|o| o.order_id == fill_event.local_order_id)
-                                    || s.pending_replacement
-                                        .as_ref()
-                                        .is_some_and(|p| p.order_id == fill_event.local_order_id)
-                            });
+                                    .is_some_and(|p| p.order_id == fill_event.local_order_id)
+                        });
                         if !is_ours {
                             continue;
                         }
@@ -534,9 +532,16 @@ fn promote_pending_if_unblocked(
 }
 
 enum QuoteAction {
-    PlaceOrReplace { price: Decimal, reason: &'static str },
-    CancelOnly { reason: &'static str },
-    Wait { reason: &'static str },
+    PlaceOrReplace {
+        price: Decimal,
+        reason: &'static str,
+    },
+    CancelOnly {
+        reason: &'static str,
+    },
+    Wait {
+        reason: &'static str,
+    },
 }
 
 struct QuoteDecision {
@@ -559,10 +564,7 @@ fn quote_decision(
     tick_size_map: &TickSizeMap,
 ) -> QuoteDecision {
     let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
-    let tick = tick_size_map
-        .get(token)
-        .map(|v| *v)
-        .unwrap_or(default_tick);
+    let tick = tick_size_map.get(token).map(|v| *v).unwrap_or(default_tick);
     let target_price = snap_price_to_tick(mid - spread / Decimal::TWO, tick, true);
     let min_reward_price = mid - spread;
     let competitor_best_bid = competitor_best_bid(bids, state, order_size);
@@ -572,9 +574,13 @@ fn quote_decision(
         warn!(token = %token, mid = %mid, spread_cents = ?rule.reward_max_spread_cents, tick = %tick, price = %target_price, "liquidity_reward 计算出的挂单价格无效");
         return QuoteDecision {
             action: if state.active_order.is_some() {
-                QuoteAction::CancelOnly { reason: "invalid_target_price" }
+                QuoteAction::CancelOnly {
+                    reason: "invalid_target_price",
+                }
             } else {
-                QuoteAction::Wait { reason: "invalid_target_price" }
+                QuoteAction::Wait {
+                    reason: "invalid_target_price",
+                }
             },
             target_price: Some(target_price),
             min_reward_price,
@@ -586,9 +592,13 @@ fn quote_decision(
     let Some(non_best_cap) = non_best_cap else {
         return QuoteDecision {
             action: if state.active_order.is_some() {
-                QuoteAction::CancelOnly { reason: "no_competitor_bid" }
+                QuoteAction::CancelOnly {
+                    reason: "no_competitor_bid",
+                }
             } else {
-                QuoteAction::Wait { reason: "no_competitor_bid" }
+                QuoteAction::Wait {
+                    reason: "no_competitor_bid",
+                }
             },
             target_price: Some(target_price),
             min_reward_price,
@@ -604,9 +614,13 @@ fn quote_decision(
     } else {
         return QuoteDecision {
             action: if state.active_order.is_some() {
-                QuoteAction::CancelOnly { reason: "outside_reward_zone_wait" }
+                QuoteAction::CancelOnly {
+                    reason: "outside_reward_zone_wait",
+                }
             } else {
-                QuoteAction::Wait { reason: "outside_reward_zone_wait" }
+                QuoteAction::Wait {
+                    reason: "outside_reward_zone_wait",
+                }
             },
             target_price: Some(target_price),
             min_reward_price,
@@ -618,16 +632,26 @@ fn quote_decision(
     let action = match &state.active_order {
         None => {
             if state.pending_replacement.is_none() {
-                QuoteAction::PlaceOrReplace { price: desired_price, reason: "no_order" }
+                QuoteAction::PlaceOrReplace {
+                    price: desired_price,
+                    reason: "no_order",
+                }
             } else {
-                QuoteAction::Wait { reason: "pending_replacement" }
+                QuoteAction::Wait {
+                    reason: "pending_replacement",
+                }
             }
         }
         Some(active) => {
             if active.price != desired_price {
-                QuoteAction::PlaceOrReplace { price: desired_price, reason: "target_price_changed" }
+                QuoteAction::PlaceOrReplace {
+                    price: desired_price,
+                    reason: "target_price_changed",
+                }
             } else {
-                QuoteAction::Wait { reason: "unchanged" }
+                QuoteAction::Wait {
+                    reason: "unchanged",
+                }
             }
         }
     };
@@ -882,7 +906,9 @@ fn cancel_and_halt(
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     order_store: Option<&OrderStore>,
 ) {
-    let Some(state) = states.get_mut(token) else { return };
+    let Some(state) = states.get_mut(token) else {
+        return;
+    };
     if state.halted {
         return;
     }

@@ -232,16 +232,34 @@ pub async fn run_raw_recorder(
 ) {
     while let Some(event) = rx.recv().await {
         match event {
-            RawStoreEvent::Book { token, market, bids, asks, ts_ms } => {
+            RawStoreEvent::Book {
+                token,
+                market,
+                bids,
+                asks,
+                ts_ms,
+            } => {
                 let bids_blob = pack_book(&bids);
                 let asks_blob = pack_book(&asks);
                 if let Err(e) = store.insert_book_snapshot(
-                    &token, &market, &bids_blob, &asks_blob, ts_ms as i64,
+                    &token,
+                    &market,
+                    &bids_blob,
+                    &asks_blob,
+                    ts_ms as i64,
                 ) {
                     warn!(error = %e, "book_snapshots 写入失败");
                 }
             }
-            RawStoreEvent::Trade { token, market, price, side, size, fee_rate, ts_ms } => {
+            RawStoreEvent::Trade {
+                token,
+                market,
+                price,
+                side,
+                size,
+                fee_rate,
+                ts_ms,
+            } => {
                 if let Err(e) = store.insert_trade_event(
                     &token,
                     &market,

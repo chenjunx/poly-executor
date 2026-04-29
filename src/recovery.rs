@@ -356,11 +356,10 @@ fn apply_liquidity_reward_side_state(
             .get(order_id)
             .map(|entry| entry.order_size)
     });
-    lane.active_price = lane.active_local_order_id.as_ref().and_then(|order_id| {
-        order_correlations
-            .get(order_id)
-            .map(|entry| entry.price)
-    });
+    lane.active_price = lane
+        .active_local_order_id
+        .as_ref()
+        .and_then(|order_id| order_correlations.get(order_id).map(|entry| entry.price));
 
     lane.pending_local_order_id = side_state.pending_local_order_id.filter(|order_id| {
         recoverable_order_matches_side(order_correlations, order_id, side, simulation_enabled)

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "quantitative-research": {
+      "source": "omer-metin/skills-for-antigravity",
+      "sourceType": "github",
+      "skillPath": "skills/quantitative-research/SKILL.md",
+      "computedHash": "843f83d7b590d39d94f018344675e28cd46ac8e7a842100b01dd05ab90d79f57"
+    }
+  }
+}

@@ -208,13 +208,12 @@ pub async fn run(
                         let _ = order_store
                             .update_order_status_by_local(&active_local_order_id, "canceled");
                         correlations.remove(&active_local_order_id);
-                        let _ = strategy_tx.try_send(StrategyEvent::OrderStatus(
-                            OrderStatusEvent {
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
                                 token: token.clone(),
                                 local_order_id: active_local_order_id.clone(),
                                 status: Arc::from("canceled"),
-                            },
-                        ));
+                            }));
                     }
                 } else if request_cancel {
                     request_liquidity_reward_cancel(
