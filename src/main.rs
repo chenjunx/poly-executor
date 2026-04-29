@@ -37,6 +37,8 @@ use strategy::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let app_config = load_app_config()?;
 
     let log_filename = if !app_config.app.log_file.is_empty() {
