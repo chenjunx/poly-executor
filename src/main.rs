@@ -210,7 +210,9 @@ async fn main() -> anyhow::Result<()> {
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * topic_tokens.len().max(1));
     let (strategy_tx, strategy_rx) = tokio::sync::mpsc::channel(1024);
     let (order_tx, order_rx) = tokio::sync::mpsc::channel::<OrderSignal>(64);
-    let monitor_tx = if reward_monitor_configs.is_empty() {
+    let monitor_tx = if reward_monitor_configs.is_empty()
+        || !app_config.liquidity_reward.reward_estimator_enabled
+    {
         None
     } else {
         let (tx, rx) = tokio::sync::mpsc::channel(512);

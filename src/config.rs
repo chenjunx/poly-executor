@@ -72,6 +72,12 @@ pub(crate) struct LiquidityRewardConfig {
     pub(crate) monitor_enabled: bool,
     #[serde(default)]
     pub(crate) simulation: bool,
+    #[serde(default = "default_true")]
+    pub(crate) reward_estimator_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub(crate) fn load_app_config() -> anyhow::Result<AppConfig> {
