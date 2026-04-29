@@ -53,6 +53,8 @@ struct TokenQuoteState {
     last_mid: Option<Decimal>,
     last_best_bid: Option<Decimal>,
     last_best_ask: Option<Decimal>,
+    /// 本对内任一订单成交后置 true，此后不再挂新单
+    halted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -264,6 +266,10 @@ impl Strategy for LiquidityRewardStrategy {
                         state.last_best_bid = Some(bid);
                         state.last_best_ask = Some(ask);
 
+                        if state.halted {
+                            continue;
+                        }
+
                         promote_pending_if_unblocked(&token, state, simulation_enabled, &order_tx);
 
                         let Some(order_size) = rule
@@ -316,13 +322,6 @@ impl Strategy for LiquidityRewardStrategy {
                         let Some(state) = states.get_mut(status_event.token.as_str()) else {
                             continue;
                         };
-                        let is_terminal = matches!(
-                            status_event.status.as_ref(),
-                            "canceled" | "filled" | "rejected" | "failed"
-                        );
-                        if !is_terminal {
-                            continue;
-                        }
 
                         let is_active = state
                             .active_order
@@ -338,6 +337,32 @@ impl Strategy for LiquidityRewardStrategy {
                         }
 
                         let token = status_event.token.clone();
+                        let status = status_event.status.as_ref();
+
+                        // 成交（全部或部分）→ 终止整对做市
+                        if matches!(status, "filled" | "partially_filled") {
+                            info!(
+                                target: "order",
+                                token = %token,
+                                status,
+                                order_id = %status_event.local_order_id,
+                                "liquidity_reward 检测到成交，终止整对做市并撤销所有订单"
+                            );
+                            halt_pair(
+                                &token,
+                                &rules,
+                                &mut states,
+                                simulation_enabled,
+                                &order_tx,
+                                order_store.as_ref(),
+                            );
+                            continue;
+                        }
+
+                        // 非成交终结状态：正常清理
+                        if !matches!(status, "canceled" | "rejected" | "failed") {
+                            continue;
+                        }
 
                         if is_pending {
                             state.pending_replacement = None;
@@ -377,7 +402,38 @@ impl Strategy for LiquidityRewardStrategy {
                         state.pending_replacement = None;
                         persist_state(order_store.as_ref(), &token, state);
                     }
-                    StrategyEvent::OrderFill(_) | StrategyEvent::Positions(_) => {}
+                    StrategyEvent::OrderFill(fill_event) => {
+                        let is_ours = states
+                            .get(fill_event.token.as_str())
+                            .is_some_and(|s| {
+                                s.active_order
+                                    .as_ref()
+                                    .is_some_and(|o| o.order_id == fill_event.local_order_id)
+                                    || s.pending_replacement
+                                        .as_ref()
+                                        .is_some_and(|p| p.order_id == fill_event.local_order_id)
+                            });
+                        if !is_ours {
+                            continue;
+                        }
+                        info!(
+                            target: "order",
+                            token = %fill_event.token,
+                            order_id = %fill_event.local_order_id,
+                            delta_size = %fill_event.delta_size,
+                            total_matched = %fill_event.total_matched_size,
+                            "liquidity_reward 检测到成交事件，终止整对做市并撤销所有订单"
+                        );
+                        halt_pair(
+                            &fill_event.token,
+                            &rules,
+                            &mut states,
+                            simulation_enabled,
+                            &order_tx,
+                            order_store.as_ref(),
+                        );
+                    }
+                    StrategyEvent::Positions(_) => {}
                 }
             }
         })
@@ -550,6 +606,7 @@ fn state_from_restore(restored: LiquidityRewardRestoreState) -> TokenQuoteState 
         last_mid: restored.last_mid,
         last_best_bid: restored.last_best_bid,
         last_best_ask: restored.last_best_ask,
+        halted: false,
     }
 }
 
@@ -562,6 +619,7 @@ fn empty_state(rule: &LiquidityRewardRule) -> TokenQuoteState {
         last_mid: None,
         last_best_bid: None,
         last_best_ask: None,
+        halted: false,
     }
 }
 
@@ -596,6 +654,61 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &TokenQuo
     ) {
         warn!(token = %token, error = %error, "liquidity_reward 持久化策略状态失败");
     }
+}
+
+/// 终止整个做市对：取消两个 token 的所有挂单并标记 halted。
+/// 只要该对中任一订单发生成交（全部或部分），就调用此函数。
+fn halt_pair(
+    token: &str,
+    rules: &std::collections::HashMap<String, LiquidityRewardRule>,
+    states: &mut std::collections::HashMap<String, TokenQuoteState>,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    order_store: Option<&OrderStore>,
+) {
+    let Some(rule) = rules.get(token) else { return };
+    let paired: Option<&str> = if token == rule.token1 {
+        rule.token2.as_deref()
+    } else {
+        Some(rule.token1.as_str())
+    };
+
+    cancel_and_halt(token, states, simulated, order_tx, order_store);
+    if let Some(p) = paired {
+        cancel_and_halt(p, states, simulated, order_tx, order_store);
+    }
+}
+
+/// 撤销单个 token 的挂单并置 halted = true。
+fn cancel_and_halt(
+    token: &str,
+    states: &mut std::collections::HashMap<String, TokenQuoteState>,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    order_store: Option<&OrderStore>,
+) {
+    let Some(state) = states.get_mut(token) else { return };
+    if state.halted {
+        return;
+    }
+    state.halted = true;
+    state.pending_replacement = None;
+    state.cancel_requested = false;
+
+    if let Some(active) = state.active_order.take() {
+        let topic = state.topic.clone();
+        if let Err(e) = order_tx.try_send(OrderSignal::LiquidityRewardCancel {
+            strategy: Arc::from("liquidity_reward"),
+            topic,
+            token: token.to_string(),
+            side: QuoteSide::Buy,
+            active_local_order_id: active.order_id,
+            simulated,
+        }) {
+            warn!(token = %token, error = %e, "liquidity_reward halt 发送撤单失败");
+        }
+    }
+    persist_state(order_store, token, state);
 }
 
 fn resolve_csv_path(csv_file: &str) -> String {
