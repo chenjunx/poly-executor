@@ -51,6 +51,19 @@ market_sqlite_path = ""
 tick_store_enabled = false
 # 是否将全量 book 快照和 last_trade_price 事件写入 SQLite
 raw_store_enabled = false
+
+[notification.dingtalk]
+# liquidity_reward 订单成交（部分成交也算）时发送钉钉通知
+enabled = false
+# 钉钉机器人完整 webhook；真实值建议放到 config.local.toml
+webhook = ""
+# 钉钉机器人加签 secret；为空时不加签
+secret = ""
+# HTTP 请求超时秒数
+timeout_secs = 5
+# 通知队列长度；队列满时丢弃通知，不阻塞订单 websocket
+queue_size = 1024
+
 # 每个主题的订阅线程数，未列出的主题使用 default_threads
 [topic_threads]
 # cs = 2

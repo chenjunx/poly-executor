@@ -143,11 +143,7 @@ pub async fn run(
         info!(host = %host, port, "通过代理建立隧道");
         let tcp = proxy.tunnel(host, port).await?;
 
-        let cx = native_tls::TlsConnector::new()?;
-        let cx = tokio_native_tls::TlsConnector::from(cx);
-        let tls_stream = cx.connect(host, tcp).await.context("TLS 握手失败")?;
-
-        let (ws, _) = tokio_tungstenite::client_async(WS_URL, tls_stream)
+        let (ws, _) = tokio_tungstenite::client_async_tls_with_config(WS_URL, tcp, None, None)
             .await
             .context("WebSocket 握手失败")?;
         info!("WebSocket 已连接（通过代理）");

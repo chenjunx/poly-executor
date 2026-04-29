@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ::config::{Config, File};
+use config::{Config, File};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -13,6 +13,8 @@ pub(crate) struct AppConfig {
     pub(crate) simulation: SimulationConfig,
     #[serde(default, alias = "mid_requote")]
     pub(crate) liquidity_reward: LiquidityRewardConfig,
+    #[serde(default)]
+    pub(crate) notification: NotificationConfig,
     #[serde(default)]
     pub(crate) topic_threads: HashMap<String, usize>,
 }
@@ -78,8 +80,48 @@ pub(crate) struct LiquidityRewardConfig {
     pub(crate) reward_estimator_enabled: bool,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct NotificationConfig {
+    #[serde(default)]
+    pub(crate) dingtalk: DingtalkConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct DingtalkConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) webhook: String,
+    #[serde(default)]
+    pub(crate) secret: String,
+    #[serde(default = "default_dingtalk_timeout_secs")]
+    pub(crate) timeout_secs: u64,
+    #[serde(default = "default_dingtalk_queue_size")]
+    pub(crate) queue_size: usize,
+}
+
+impl Default for DingtalkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook: String::new(),
+            secret: String::new(),
+            timeout_secs: default_dingtalk_timeout_secs(),
+            queue_size: default_dingtalk_queue_size(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_dingtalk_timeout_secs() -> u64 {
+    5
+}
+
+fn default_dingtalk_queue_size() -> usize {
+    1024
 }
 
 pub(crate) fn load_app_config() -> anyhow::Result<AppConfig> {

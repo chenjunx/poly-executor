@@ -4,6 +4,7 @@ mod dispatcher;
 mod logging;
 mod market;
 mod monitor;
+mod notification;
 mod order;
 mod order_ws;
 mod polymarket_rewards;
@@ -236,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let (positions_refresh_tx, positions_refresh_rx) = tokio::sync::mpsc::channel(64);
     let (sim_fill_tx, sim_fill_rx) = tokio::sync::mpsc::channel::<SimulatedFillEvent>(64);
+    let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
 
     let (pair_tx, pair_rx) = tokio::sync::mpsc::channel(256);
     let mut strategy_handles = vec![StrategyHandle {
@@ -333,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
             order_store.clone(),
             positions_refresh_tx.clone(),
             strategy_tx.clone(),
+            notifier.clone(),
         ));
     }
 

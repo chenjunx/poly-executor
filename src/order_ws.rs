@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::AuthConfig,
+    notification::{LiquidityRewardFillNotification, NotificationEvent, Notifier},
     positions::PositionRefreshTrigger,
     storage::OrderStore,
     strategy::{OrderCorrelationMap, OrderFillEvent, OrderStatusEvent, StrategyEvent},
@@ -23,6 +24,7 @@ pub async fn run(
     order_store: OrderStore,
     positions_refresh_tx: tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
     strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
+    notifier: Option<Notifier>,
 ) {
     loop {
         match subscribe_orders(
@@ -31,6 +33,7 @@ pub async fn run(
             &order_store,
             &positions_refresh_tx,
             &strategy_tx,
+            notifier.as_ref(),
         )
         .await
         {
@@ -49,6 +52,7 @@ async fn subscribe_orders(
     order_store: &OrderStore,
     positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
     strategy_tx: &tokio::sync::mpsc::Sender<StrategyEvent>,
+    notifier: Option<&Notifier>,
 ) -> anyhow::Result<()> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
     let address = Address::from_str(&auth.funder)?;
@@ -143,13 +147,47 @@ async fn subscribe_orders(
                     if let Some(delta_size) =
                         fill_delta(previous_size_matched, current_size_matched)
                     {
+                        let total_matched_size = current_size_matched.unwrap_or(Decimal::ZERO);
                         let _ = strategy_tx.try_send(StrategyEvent::OrderFill(OrderFillEvent {
                             token: local_meta.token.clone(),
                             local_order_id: local_meta.local_order_id.clone(),
                             side: local_meta.side,
                             delta_size,
-                            total_matched_size: current_size_matched.unwrap_or(Decimal::ZERO),
+                            total_matched_size,
                         }));
+                        if local_meta.strategy.as_ref() == "liquidity_reward" {
+                            if let Some(notifier) = notifier {
+                                notifier.try_notify(NotificationEvent::LiquidityRewardFill(
+                                    LiquidityRewardFillNotification {
+                                        strategy: local_meta.strategy.to_string(),
+                                        topic: local_meta
+                                            .topic
+                                            .as_ref()
+                                            .map(|topic| topic.to_string()),
+                                        token: local_meta.token.clone(),
+                                        local_order_id: local_meta.local_order_id.clone(),
+                                        remote_order_id: order.id.clone(),
+                                        side: local_meta.side,
+                                        order_price: local_meta.price,
+                                        order_size: local_meta.order_size,
+                                        delta_size,
+                                        total_matched_size,
+                                        market: order.market.to_string(),
+                                        asset_id: order.asset_id.to_string(),
+                                        ws_price: order.price.to_string(),
+                                        ws_original_size: order
+                                            .original_size
+                                            .map(|value| value.to_string()),
+                                        ws_size_matched: order
+                                            .size_matched
+                                            .map(|value| value.to_string()),
+                                        ws_status: status.to_string(),
+                                        ws_msg_type: format!("{:?}", order.msg_type),
+                                        ws_timestamp: order.timestamp,
+                                    },
+                                ));
+                            }
+                        }
                         info!(
                             target: "order",
                             order_id = %order.id,
@@ -157,7 +195,7 @@ async fn subscribe_orders(
                             token = %local_meta.token,
                             side = ?local_meta.side,
                             delta_size = %delta_size,
-                            total_matched_size = %current_size_matched.unwrap_or(Decimal::ZERO),
+                            total_matched_size = %total_matched_size,
                             "根据订单 websocket 成交增量触发策略库存更新"
                         );
                     }
@@ -217,8 +255,8 @@ fn fill_delta(
     previous_size_matched: Option<Decimal>,
     current_size_matched: Option<Decimal>,
 ) -> Option<Decimal> {
-    let previous_size_matched = previous_size_matched?;
     let current_size_matched = current_size_matched?;
+    let previous_size_matched = previous_size_matched.unwrap_or(Decimal::ZERO);
     let delta = current_size_matched - previous_size_matched;
     (delta > Decimal::ZERO).then_some(delta)
 }
@@ -244,4 +282,46 @@ fn classify_ws_status(
         }
     }
     "open"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(value: f64) -> Decimal {
+        Decimal::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn fill_delta_ignores_missing_current_size() {
+        assert_eq!(fill_delta(None, None), None);
+    }
+
+    #[test]
+    fn fill_delta_ignores_first_zero_size() {
+        assert_eq!(fill_delta(None, Some(Decimal::ZERO)), None);
+    }
+
+    #[test]
+    fn fill_delta_detects_first_positive_size() {
+        assert_eq!(fill_delta(None, Some(Decimal::ONE)), Some(Decimal::ONE));
+    }
+
+    #[test]
+    fn fill_delta_ignores_unchanged_size() {
+        assert_eq!(fill_delta(Some(Decimal::ONE), Some(Decimal::ONE)), None);
+    }
+
+    #[test]
+    fn fill_delta_detects_incremental_size() {
+        assert_eq!(
+            fill_delta(Some(Decimal::ONE), Some(dec(1.5))),
+            Some(dec(0.5))
+        );
+    }
+
+    #[test]
+    fn fill_delta_ignores_size_regression() {
+        assert_eq!(fill_delta(Some(dec(2.0)), Some(Decimal::ONE)), None);
+    }
 }

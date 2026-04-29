@@ -138,6 +138,20 @@ cargo build --release
 
 ---
 
+### `[notification.dingtalk]`
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `false` | 是否启用钉钉通知 |
+| `webhook` | String | `""` | 钉钉机器人完整 webhook；真实值建议放到 `config.local.toml` |
+| `secret` | String | `""` | 钉钉机器人加签 secret；为空时不加签 |
+| `timeout_secs` | u64 | `5` | 钉钉 HTTP 请求超时秒数 |
+| `queue_size` | usize | `1024` | 通知队列长度；队列满时丢弃通知，不阻塞订单 WebSocket |
+
+当前通知触发条件：真实订单 WebSocket 检测到 liquidity_reward 订单成交增量，部分成交也会通知。通知发送失败只写日志，不影响策略 halt、撤单或订单状态更新。
+
+---
+
 ### `[topic_threads]`
 
 为特定 topic 分配独立的 WebSocket 连接数，未列出的 topic 使用 `default_threads`。
@@ -313,7 +327,7 @@ replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacemen
 3. 对仍存在的 active/pending 订单发起取消。
 4. 已部分成交的订单也会尝试取消剩余数量。
 
-该逻辑用于避免成交后继续做市导致仓位继续扩大。
+该逻辑用于避免成交后继续做市导致仓位继续扩大。真实订单 WebSocket 检测到 liquidity_reward 成交增量时，如果启用了 `[notification.dingtalk]`，会异步发送钉钉通知；通知失败不会影响 halt 或撤单流程。
 
 #### 关键订单日志 reason
 
