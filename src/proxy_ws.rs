@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use futures::{SinkExt as _, StreamExt as _};
-use polymarket_client_sdk::clob::ws::types::response::WsMessage;
+use polymarket_client_sdk_v2::clob::ws::types::response::WsMessage;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use polymarket_client_sdk::data::{Client, types::request::PositionsRequest};
-use polymarket_client_sdk::types::{Address, Decimal};
+use polymarket_client_sdk_v2::data::{Client, types::request::PositionsRequest};
+use polymarket_client_sdk_v2::types::{Address, Decimal};
 use tracing::{info, warn};
 
 use crate::{
@@ -209,10 +209,10 @@ async fn fetch_all_positions(
 }
 
 fn normalize_position(
-    position: polymarket_client_sdk::data::types::response::Position,
+    position: polymarket_client_sdk_v2::data::types::response::Position,
 ) -> PositionView {
     PositionView {
-        asset_id: position.asset,
+        asset_id: position.asset.to_string(),
         size: position.size,
         avg_price: position.avg_price,
         cur_price: position.cur_price,

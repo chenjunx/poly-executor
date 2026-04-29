@@ -16,9 +16,10 @@ mod strategies;
 mod strategy;
 mod tick_size;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::types::Decimal;
 use tracing::info;
 
 use config::load_app_config;
@@ -26,7 +27,7 @@ use dispatcher::Dispatcher;
 use monitor::RewardMonitorConfig;
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
 use recovery::RecoveryCoordinator;
-use storage::OrderStore;
+use storage::{MarketStore, OrderStore};
 use strategies::liquidity_reward::LiquidityRewardStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
@@ -71,8 +72,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "orders.db"
     };
-    let order_store = OrderStore::open(&resolve_path(sqlite_filename))?;
+    let sqlite_path = resolve_path(sqlite_filename);
+    let order_store = OrderStore::open(&sqlite_path)?;
     order_store.init_schema()?;
+
+    let market_sqlite_path = if !app_config.app.market_sqlite_path.is_empty() {
+        resolve_path(&app_config.app.market_sqlite_path)
+    } else {
+        derive_market_sqlite_path(&sqlite_path)
+    };
+    let market_store = MarketStore::open(&market_sqlite_path)?;
+    market_store.init_schema()?;
 
     let dec = |v: f64| Decimal::try_from(v).unwrap_or_default();
     let filters = Arc::new(Filters {
@@ -220,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
             rx,
             reward_monitor_configs,
             order_correlations.clone(),
-            order_store.clone(),
+            market_store.clone(),
         ));
         Some(tx)
     };
@@ -251,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
     let tick_tx = if app_config.app.tick_store_enabled {
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
-        tokio::spawn(market::run_tick_recorder(rx, order_store.clone()));
+        tokio::spawn(market::run_tick_recorder(rx, market_store.clone()));
         Some(tx)
     } else {
         None
@@ -259,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
 
     let raw_store_tx = if app_config.app.raw_store_enabled {
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
-        tokio::spawn(market::run_raw_recorder(rx, order_store.clone()));
+        tokio::spawn(market::run_raw_recorder(rx, market_store.clone()));
         Some(tx)
     } else {
         None
@@ -328,4 +338,10 @@ async fn main() -> anyhow::Result<()> {
 
     futures::future::pending::<()>().await;
     Ok(())
+}
+
+fn derive_market_sqlite_path(order_sqlite_path: &str) -> String {
+    let mut path = PathBuf::from(order_sqlite_path);
+    path.set_file_name("market.db");
+    path.to_string_lossy().to_string()
 }

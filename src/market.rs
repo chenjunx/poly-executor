@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use polymarket_client_sdk::clob::types::Side;
-use polymarket_client_sdk::clob::ws::types::response::{
+use polymarket_client_sdk_v2::clob::types::Side;
+use polymarket_client_sdk_v2::clob::ws::types::response::{
     BookUpdate, PriceChangeBatchEntry, WsMessage,
 };
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::types::Decimal;
 use tracing::{info, warn};
 
 use crate::monitor::FullBookSnapshot;
 use crate::proxy_ws;
-use crate::storage::OrderStore;
+use crate::storage::MarketStore;
 use crate::strategy::{CleanOrderbook, MarketEvent, StrategyEvent};
 use crate::tick_size::TickSizeMap;
 
@@ -27,7 +27,7 @@ impl LocalOrderbook {
     fn apply_book(&mut self, book: &BookUpdate) -> Option<CleanOrderbook> {
         self.bids.clear();
         self.asks.clear();
-        self.market = book.market.clone();
+        self.market = book.market.to_string();
 
         for level in &book.bids {
             let Some(price) = scale_price(level.price) else {
@@ -98,6 +98,8 @@ impl LocalOrderbook {
             best_ask_price,
             best_ask_size,
             timestamp_ms: self.timestamp_ms,
+            bids: Arc::new(self.bids.clone()),
+            asks: Arc::new(self.asks.clone()),
         })
     }
 }
@@ -150,7 +152,7 @@ pub async fn spawn_subscriptions(
 
 pub async fn run_tick_recorder(
     mut rx: tokio::sync::mpsc::Receiver<(Arc<str>, CleanOrderbook)>,
-    store: OrderStore,
+    store: MarketStore,
 ) {
     const BATCH_SIZE: usize = 500;
     let flush_interval = Duration::from_millis(500);
@@ -198,7 +200,7 @@ pub async fn run_tick_recorder(
     }
 }
 
-fn flush_ticks(store: &OrderStore, buffer: &mut Vec<(String, u16, u32, u16, u32, u64)>) {
+fn flush_ticks(store: &MarketStore, buffer: &mut Vec<(String, u16, u32, u16, u32, u64)>) {
     if let Err(e) = store.insert_market_ticks_batch(buffer) {
         warn!(error = %e, rows = buffer.len(), "market_ticks 批量写入失败");
     }
@@ -226,7 +228,7 @@ pub(crate) enum RawStoreEvent {
 
 pub async fn run_raw_recorder(
     mut rx: tokio::sync::mpsc::Receiver<RawStoreEvent>,
-    store: OrderStore,
+    store: MarketStore,
 ) {
     while let Some(event) = rx.recv().await {
         match event {
@@ -279,19 +281,19 @@ pub async fn run(
 
     while let Some(msg) = ws_rx.recv().await {
         if let WsMessage::TickSizeChange(change) = &msg {
-            tick_size_map.insert(change.asset_id.clone(), change.new_tick_size);
+            tick_size_map.insert(change.asset_id.to_string(), change.new_tick_size);
             continue;
         }
 
         if let Some(ref tx) = raw_store_tx {
             if let WsMessage::LastTradePrice(ltp) = &msg {
                 let _ = tx.try_send(RawStoreEvent::Trade {
-                    token: ltp.asset_id.clone(),
-                    market: ltp.market.clone(),
+                    token: ltp.asset_id.to_string(),
+                    market: ltp.market.to_string(),
                     price: ltp.price.to_string(),
                     side: ltp.side.map(|s| format!("{s:?}")),
                     size: ltp.size.map(|s| s.to_string()),
-                    fee_rate: ltp.fee_rate_bps.clone(),
+                    fee_rate: ltp.fee_rate_bps.map(|f| f.to_string()),
                     ts_ms: ltp.timestamp,
                 });
             }
@@ -311,7 +313,7 @@ pub async fn run(
             );
 
             if let Some(ref tx) = tick_tx {
-                let _ = tx.try_send((asset_id.clone(), book));
+                let _ = tx.try_send((asset_id.clone(), book.clone()));
             }
 
             if let Some(ref tx) = monitor_tx {
@@ -346,7 +348,7 @@ pub async fn run(
                     .send(StrategyEvent::Market(MarketEvent {
                         topic,
                         asset_id: asset_id.clone(),
-                        book,
+                        book: book.clone(),
                     }))
                     .await
                     .is_err()
@@ -399,7 +401,7 @@ fn log_liquidity_reward_orderbook_diagnostics(
         }
         WsMessage::PriceChange(price_change) => {
             for change in &price_change.price_changes {
-                if change.asset_id != asset_id.as_ref() {
+                if change.asset_id.to_string().as_str() != asset_id.as_ref() {
                     continue;
                 }
                 info!(
@@ -430,29 +432,31 @@ fn apply_market_message(
 ) -> Vec<(Arc<str>, CleanOrderbook)> {
     match msg {
         WsMessage::Book(book) => {
-            let asset_id = book.asset_id.clone();
+            let asset_id = book.asset_id.to_string();
             let state = books.entry(asset_id.clone()).or_default();
             state
                 .apply_book(book)
                 .into_iter()
-                .map(|clean| (Arc::from(asset_id.clone()), clean))
+                .map(|clean| (Arc::from(asset_id.as_str()), clean))
                 .collect()
         }
         WsMessage::PriceChange(price_change) => {
             let Some(timestamp_ms) = u64::try_from(price_change.timestamp).ok() else {
                 return Vec::new();
             };
+            let market_str = price_change.market.to_string();
             price_change
                 .price_changes
                 .iter()
                 .filter_map(|change| {
-                    let state = books.entry(change.asset_id.clone()).or_default();
+                    let asset_id = change.asset_id.to_string();
+                    let state = books.entry(asset_id.clone()).or_default();
                     if state.market.is_empty() {
-                        state.market = price_change.market.clone();
+                        state.market = market_str.clone();
                     }
                     state
                         .apply_price_change(change, timestamp_ms)
-                        .map(|clean| (Arc::from(change.asset_id.as_str()), clean))
+                        .map(|clean| (Arc::from(asset_id.as_str()), clean))
                 })
                 .collect()
         }

@@ -2,11 +2,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
-use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType};
-use polymarket_client_sdk::clob::{Client, Config};
-use polymarket_client_sdk::types::{Address, Decimal};
+use alloy::primitives::U256;
+use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
+use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::{Client, Config};
+use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -399,7 +400,7 @@ async fn place_liquidity_reward_order(
     let sdk_side = to_sdk_side(side);
     let signable = client
         .limit_order()
-        .token_id(token)
+        .token_id(U256::from_str(token)?)
         .order_type(OrderType::GTC)
         .price(price)
         .size(order_size)

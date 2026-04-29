@@ -1,6 +1,6 @@
 # poly-executor
 
-Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流动性奖励做市**两种策略，通过 WebSocket 实时订阅行情，订单与行情数据持久化到 SQLite。
+Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流动性奖励做市**两种策略，通过 WebSocket 实时订阅行情，并将真实订单状态与行情/模拟分析数据分库存储到 SQLite。
 
 ---
 
@@ -111,6 +111,7 @@ cargo build --release
 | `enabled` | bool | `false` | 是否启用流动性奖励做市策略 |
 | `file` | String | `"liquidity_reward.csv"` | 做市规则 CSV 文件路径 |
 | `monitor_enabled` | bool | `false` | 是否启动奖励监控轮询任务（非模拟模式下生效） |
+| `reward_estimator_enabled` | bool | `true` | 是否启用本地 Q-score 奖励估算；开启后写入行情库 `liquidity_reward_scores` 表 |
 | `simulation` | bool | `false` | 做市策略内部模拟开关，独立于全局 `[simulation]`；模拟模式下奖励得分写入时会打 `simulation=1` 标记 |
 
 > 注：`[liquidity_reward]` 在代码中兼容历史别名 `[mid_requote]`。
@@ -124,7 +125,8 @@ cargo build --release
 | `log_file` | String | `"alerts.log"` | 告警/策略日志文件名 |
 | `order_log_file` | String | `"orders.log"` | 订单专用日志文件名 |
 | `assets_file` | String | `"assets.csv"` | 配对套利 token 对配置文件路径 |
-| `sqlite_path` | String | `"orders.db"` | SQLite 数据库路径（绝对路径或相对可执行文件目录） |
+| `sqlite_path` | String | `"orders.db"` | 订单库路径，保存真实订单、订单事件和策略恢复状态 |
+| `market_sqlite_path` | String | `""` | 行情/模拟库路径；为空时默认使用订单库同目录下的 `market.db` |
 | `min_diff` | f64 | — | 套利触发阈值：`1 - (ask_YES + ask_NO) > min_diff` |
 | `max_spread` | f64 | — | 单 token 最大 bid/ask 价差上限，超过则跳过 |
 | `min_price` | f64 | — | 有效价格区间下限，低于此值跳过 |
@@ -196,8 +198,8 @@ token0,token1,topic
 
 | 列 | 字段名 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
-| 0 | `token1` | String | 是 | YES token asset ID，策略对此 token 挂双边 limit 单 |
-| 1 | `token2` | String | 否 | 配对 NO token asset ID；为空时仅对 token1 单边做市 |
+| 0 | `token1` | String | 是 | YES token asset ID；策略会对此 token 挂买单 |
+| 1 | `token2` | String | 否 | 配对 NO token asset ID；填写后策略也会对此 token 挂买单；为空时仅对 token1 做市 |
 | 2 | `topic` | String | 否 | 订阅分组名；为空时默认使用 `"liquidity_reward"` |
 | 3 | `reward_min_orders` | u32 | 否 | 奖励达标所需的最少挂单数量（用于 monitor 评估） |
 | 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（**单位：cents**，如 `4` 表示 4 cents；典型值 2–5）。低于此价差的挂单才计入 Q-score。填 `0.04` 表示 0.04 cents，极其严苛，几乎无竞争者得分，建议填整数如 `3` 或 `4`。 |
@@ -211,20 +213,150 @@ token1,token2,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,re
 84133519426074676...,53265937461843025...,us_iran,5,4,100,50
 ```
 
+### LiquidityReward 报价与避开 best_bid 逻辑
+
+策略对 `liquidity_reward.csv` 中配置的每个 token 独立维护一个买单状态。填写 `token1` 和 `token2` 时，会分别在 YES token 和 NO token 上挂买单，而不是在同一个 token 上同时挂买卖双边。
+
+#### 实时价格输入
+
+每次收到 market WebSocket 的 `book` 或 `price_change` 后，`market.rs` 会维护本地完整订单簿，并把最新 top-of-book 和全量 bids/asks 传给策略：
+
+```text
+best_bid = 当前订单簿最高 bid
+best_ask = 当前订单簿最低 ask
+mid      = (best_bid + best_ask) / 2
+```
+
+`mid` 是随行情事件实时更新的。策略是否撤单/重挂不再只看旧单是否低于 `mid - offset`，而是重新计算当前应该挂的目标价。
+
+#### offset 与 tick
+
+`reward_max_spread_cents` 的单位是 cents：
+
+```text
+offset = reward_max_spread_cents / 100
+```
+
+例如 `reward_max_spread_cents = 4` 表示 `offset = 0.04`。策略下单前会读取 token 当前 tick size，并按买单常用方式向下取合法价格，避免买单价格被四舍五入抬高。
+
+#### 目标价与奖励有效区间
+
+策略先计算两个价格：
+
+```text
+target_price     = mid - offset / 2
+min_reward_price = mid - offset
+```
+
+含义：
+
+- `target_price`：理想挂单价，位于奖励有效区间中间，更接近 mid。
+- `min_reward_price`：奖励有效的最低买单价，低于它通常不再计入该配置的 Q-score 区间。
+
+因此旧单只要价格和当前 `desired_price` 不一致，就会进入 replacement 流程；不会再因为仍位于 `[mid - offset, best_bid]` 区间内而继续保留。
+
+#### 避免自己成为 best_bid
+
+策略不希望自己的挂单成为当前 best bid，因此不能直接使用原始 `best_bid` 判断，因为原始订单簿中可能已经包含自己的 active/pending 订单。
+
+策略会从 bids 中扣除自己的订单数量后计算竞争对手最高 bid：
+
+```text
+competitor_best_bid = 排除自己 active/pending 订单数量后的最高 bid
+non_best_cap        = competitor_best_bid - tick
+```
+
+`non_best_cap` 是为了“不成为 best_bid”时允许挂的最高价格。
+
+#### target_price 与 best_bid - tick 的冲突处理
+
+当 `target_price` 和 `competitor_best_bid - tick` 冲突时，策略按下面规则选择 `desired_price`：
+
+| 条件 | 动作 |
+|---|---|
+| `non_best_cap >= target_price` | 按理想价挂单：`desired_price = target_price` |
+| `min_reward_price <= non_best_cap < target_price` | 为了避开 best_bid，降到 `desired_price = non_best_cap` |
+| `non_best_cap < min_reward_price` | 价格已经低于奖励有效区间：撤掉 active，等待盘口恢复 |
+| 没有竞争对手 bid | 不主动挂单；如已有 active，则撤单等待 |
+
+也就是说，策略优先跟随 `mid - offset / 2`，但不会为了跟随 mid 而顶成 best bid；如果避开 best bid 会导致订单掉出奖励有效区间，就取消当前订单并等待。
+
+#### 下单、替换和等待状态机
+
+每个 token 的状态包含：
+
+- `active_order`：当前已挂出的本地订单。
+- `pending_replacement`：等待旧单取消后补上的新订单。
+- `cancel_requested`：是否已经请求取消 active。
+- `last_mid` / `last_best_bid` / `last_best_ask`：最近一次行情快照。
+- `halted`：成交后终止策略的保护状态。
+
+每次行情更新后的决策：
+
+| 当前状态 | 决策 |
+|---|---|
+| 没有 active，也没有 pending，且存在合法 `desired_price` | 直接下新买单 |
+| 有 active，且 `active.price != desired_price` | 创建 pending replacement，并请求取消 active |
+| 有 active，且 `active.price == desired_price` | 保持不变 |
+| 已有 pending replacement | 等待旧 active 的取消确认，不重复发新单 |
+| 无法得到合法 `desired_price`，但有 active | 发送 cancel-only，撤掉 active 后等待 |
+| 无法得到合法 `desired_price`，且没有 active | 继续等待 |
+
+replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacement`，订单执行模块请求取消旧 active；收到旧单 `canceled` 状态后，策略才会把 pending replacement 下出去。这样可以避免同一个 token 上同时暴露两个替换订单。
+
+#### 成交终止保护
+
+如果 liquidity_reward 的任一订单发生成交，部分成交也算，策略会进入终止保护：
+
+1. 标记相关状态为 `halted`。
+2. 不再根据行情继续补单或 replacement。
+3. 对仍存在的 active/pending 订单发起取消。
+4. 已部分成交的订单也会尝试取消剩余数量。
+
+该逻辑用于避免成交后继续做市导致仓位继续扩大。
+
+#### 关键订单日志 reason
+
+订单日志中的 `reason` 可用于判断策略为什么行动：
+
+| reason | 含义 |
+|---|---|
+| `no_order` | 当前没有订单，按最新 desired price 新挂单 |
+| `target_price_changed` | active 价格与最新 desired price 不一致，触发替换 |
+| `unchanged` | active 已在当前 desired price，保持不动 |
+| `pending_replacement` | 已经有待补单，等待旧单取消确认 |
+| `outside_reward_zone_wait` | 避开 best_bid 后会掉出奖励区间，撤单或等待 |
+| `no_competitor_bid_wait` | 没有可参考的竞争对手 bid，撤单或等待 |
+| `invalid_target_price` | 目标价格非法，撤单或等待 |
+
 ---
 
 ## 数据库表结构
 
+项目使用两个 SQLite 库，避免大体量行情/raw 数据和真实订单恢复状态共用同一个 WAL：
+
+- 订单库：`[app] sqlite_path`，默认 `orders.db`。
+- 行情/模拟库：`[app] market_sqlite_path`；为空时默认派生为订单库同目录下的 `market.db`。
+
+### 订单库表
+
 | 表名 | 写入时机 | 说明 |
 |---|---|---|
 | `orders` | 每次下单/状态变更 | 核心订单表；`status` 值：`pending` / `open` / `filled` / `canceled` / `rejected` |
-| `order_events` | 订单生命周期事件 | 订单流水，`payload_json` 存储原始事件 JSON |
+| `order_events` | 订单生命周期事件 | 订单流水，`payload_json` 存储原始事件 JSON；订单 WS 的 `ws_update` 也在这里，用于计算成交增量 |
 | `strategy_state_mid_requote` | 做市策略状态变更 | 做市策略共享状态快照，用于崩溃恢复 |
-| `strategy_state_mid_requote_side` | 做市策略状态变更 | 做市策略双侧（buy/sell）状态快照，PK 为 `(token, side)` |
-| `liquidity_reward_scores` | 奖励估算周期 | 做市奖励得分记录；`my_orders` 为评估时刻内存中关联挂单数量（本地估算值，非 API 数据）；`competitors_qmin=0` 通常表示无竞争者订单满足 `reward_max_spread_cents` 门槛 |
+| `strategy_state_mid_requote_side` | 做市策略状态变更 | 做市策略按 token/side 保存 active、pending、cancel_requested 等状态，PK 为 `(token, side)` |
+
+### 行情/模拟库表
+
+| 表名 | 写入时机 | 说明 |
+|---|---|---|
+| `liquidity_reward_scores` | `reward_estimator_enabled=true` | 做市奖励得分记录；`my_orders` 为评估时刻内存中关联挂单数量（本地估算值，非 API 数据）；`competitors_qmin=0` 通常表示无竞争者订单满足 `reward_max_spread_cents` 门槛 |
 | `market_ticks` | `tick_store_enabled=true` | best bid/ask 变化时的 tick 记录；price/size 精度为 1/10000 的整数 |
 | `book_snapshots` | `raw_store_enabled=true` | 全量订单簿快照；`bids`/`asks` 为 BLOB，格式：每档 6 字节 = `price(u16 LE)` + `size(u32 LE)` |
 | `trade_events` | `raw_store_enabled=true` | `last_trade_price` 成交事件；字段：`token`、`market`、`price`、`side`、`size`、`fee_rate`、`ts_ms` |
+
+旧版本已经写在订单库里的行情表不会自动迁移或删除；新版本只保证新增行情/模拟/奖励估算数据写入行情库。
 
 `book_snapshots` BLOB 解析（Python 示例）：
 

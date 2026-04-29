@@ -1,7 +1,9 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::primitives::U256;
 use dashmap::DashMap;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::types::Decimal;
 use tracing::{info, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
@@ -48,7 +50,8 @@ pub async fn load_for_tokens(tokens: &[String], auth: &AuthConfig, map: &TickSiz
     // 并发查询所有 token，总耗时 ≈ 单次请求时延（而非 N 倍）
     let futs = tokens.iter().map(|token| {
         let client = &client;
-        async move { (token, client.tick_size(token).await) }
+        let token_u256 = U256::from_str(token).unwrap_or_default();
+        async move { (token, client.tick_size(token_u256).await) }
     });
     let results = futures::future::join_all(futs).await;
 

@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer as _, state::Authenticated};
-use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::auth::{LocalSigner, Normal, Signer as _, state::Authenticated};
+use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config as ClobConfig};
 
 use crate::config::AuthConfig;
 
@@ -20,7 +20,7 @@ pub async fn build_authenticated_clob_client(
     )?
     .authentication_builder(&signer)
     .funder(auth.funder.parse()?)
-    .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
+    .signature_type(polymarket_client_sdk_v2::clob::types::SignatureType::Proxy)
     .authenticate()
     .await?)
 }

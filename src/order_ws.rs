@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
-use polymarket_client_sdk::clob::ws::Client;
-use polymarket_client_sdk::types::{Address, Decimal};
+use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
+use polymarket_client_sdk_v2::clob::ws::Client;
+use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -52,9 +52,9 @@ async fn subscribe_orders(
 ) -> anyhow::Result<()> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
     let address = Address::from_str(&auth.funder)?;
-    let rest_client = polymarket_client_sdk::clob::Client::new(
+    let rest_client = polymarket_client_sdk_v2::clob::Client::new(
         "https://clob.polymarket.com",
-        polymarket_client_sdk::clob::Config::builder()
+        polymarket_client_sdk_v2::clob::Config::builder()
             .use_server_time(true)
             .build(),
     )?;

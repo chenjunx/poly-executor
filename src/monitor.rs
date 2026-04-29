@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{TimeDelta, Utc};
-use polymarket_client_sdk::clob::types::request::UserRewardsEarningRequest;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::clob::types::request::UserRewardsEarningRequest;
+use polymarket_client_sdk_v2::types::Decimal;
 use tracing::{info, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
@@ -12,7 +12,7 @@ use crate::config::AuthConfig;
 use crate::polymarket_rewards::{
     Market as RewardMarket, MarketParams, Order as RewardOrder, Side as RewardSide, estimate_reward,
 };
-use crate::storage::OrderStore;
+use crate::storage::MarketStore;
 use crate::strategy::{OrderCorrelationMap, QuoteSide};
 
 const PRICE_SCALE: f64 = 10_000.0;
@@ -44,7 +44,7 @@ pub async fn run_reward_estimator(
     mut rx: tokio::sync::mpsc::Receiver<FullBookSnapshot>,
     configs: HashMap<String, RewardMonitorConfig>,
     correlations: OrderCorrelationMap,
-    order_store: OrderStore,
+    market_store: MarketStore,
 ) {
     // 速率限制键：YES token ID
     let mut last_log: HashMap<String, Instant> = HashMap::new();
@@ -163,7 +163,7 @@ pub async fn run_reward_estimator(
             "liquidity_reward 流动性奖励实时估算"
         );
 
-        if let Err(error) = order_store.insert_liquidity_reward_score(
+        if let Err(error) = market_store.insert_liquidity_reward_score(
             &yes_token,
             mid,
             my_orders.len(),
@@ -300,6 +300,7 @@ async fn poll_user_rewards(auth: &AuthConfig) -> anyhow::Result<()> {
     let reward_percentages = client.reward_percentages().await?;
 
     let total_earnings = rewards
+        .data
         .iter()
         .flat_map(|reward| reward.earnings.iter())
         .fold(Decimal::ZERO, |acc, earning| acc + earning.earnings);
@@ -307,13 +308,13 @@ async fn poll_user_rewards(auth: &AuthConfig) -> anyhow::Result<()> {
     info!(
         target = "order",
         since = %date,
-        market_count = rewards.len(),
+        market_count = rewards.data.len(),
         reward_percentage_count = reward_percentages.len(),
         total_earnings = %total_earnings,
         "user_reward_monitor 当前用户奖励汇总"
     );
 
-    for reward in rewards {
+    for reward in rewards.data {
         let market_earnings = reward
             .earnings
             .iter()

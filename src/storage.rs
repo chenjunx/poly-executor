@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::types::Decimal;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
@@ -11,6 +11,11 @@ use crate::strategy::{LocalOrderMeta, QuoteSide};
 
 #[derive(Clone)]
 pub struct OrderStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+#[derive(Clone)]
+pub struct MarketStore {
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -68,12 +73,8 @@ impl StoredOrder {
 
 impl OrderStore {
     pub fn open(path: &str) -> anyhow::Result<Self> {
-        let conn =
-            Connection::open(path).with_context(|| format!("无法打开 SQLite 文件: {path}"))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(open_sqlite_connection(path)?)),
         })
     }
 
@@ -121,65 +122,6 @@ impl OrderStore {
                     updated_at_ms INTEGER NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS liquidity_reward_scores (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token TEXT NOT NULL,
-                    mid TEXT NOT NULL,
-                    my_orders INTEGER NOT NULL,
-                    my_qone TEXT NOT NULL,
-                    my_qtwo TEXT NOT NULL,
-                    my_qmin TEXT NOT NULL,
-                    competitors_qmin TEXT NOT NULL,
-                    my_share TEXT NOT NULL,
-                    estimated_daily_reward TEXT NOT NULL,
-                    simulation INTEGER NOT NULL DEFAULT 0,
-                    recorded_at_ms INTEGER NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_lr_scores_token_ts
-                    ON liquidity_reward_scores (token, recorded_at_ms DESC);
-
-                CREATE TABLE IF NOT EXISTS market_ticks (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token     TEXT    NOT NULL,
-                    bid_price INTEGER NOT NULL,
-                    bid_size  INTEGER NOT NULL,
-                    ask_price INTEGER NOT NULL,
-                    ask_size  INTEGER NOT NULL,
-                    ts_ms     INTEGER NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_market_ticks_token_ts
-                    ON market_ticks (token, ts_ms DESC);
-
-                -- 全量订单簿快照：bids/asks 以小端字节流存储
-                -- 格式：每档位 = price(u16 LE) + size(u32 LE)，共 6 字节
-                CREATE TABLE IF NOT EXISTS book_snapshots (
-                    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token  TEXT    NOT NULL,
-                    market TEXT    NOT NULL,
-                    bids   BLOB    NOT NULL,
-                    asks   BLOB    NOT NULL,
-                    ts_ms  INTEGER NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_book_snapshots_token_ts
-                    ON book_snapshots (token, ts_ms DESC);
-
-                -- last_trade_price 事件
-                CREATE TABLE IF NOT EXISTS trade_events (
-                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token    TEXT NOT NULL,
-                    market   TEXT NOT NULL,
-                    price    TEXT NOT NULL,
-                    side     TEXT,
-                    size     TEXT,
-                    fee_rate TEXT,
-                    ts_ms    INTEGER NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_trade_events_token_ts
-                    ON trade_events (token, ts_ms DESC);
 
                 CREATE TABLE IF NOT EXISTS strategy_state_mid_requote_side (
                     token TEXT NOT NULL,
@@ -336,47 +278,6 @@ impl OrderStore {
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 ",
                 params![local_order_id, remote_order_id, event_type, payload.to_string(), now],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn insert_liquidity_reward_score(
-        &self,
-        token: &str,
-        mid: f64,
-        my_orders: usize,
-        my_qone: f64,
-        my_qtwo: f64,
-        my_qmin: f64,
-        competitors_qmin: f64,
-        my_share: f64,
-        estimated_daily_reward: f64,
-        simulation: bool,
-    ) -> anyhow::Result<()> {
-        let now = now_ms()?;
-        self.with_conn(|conn| {
-            conn.execute(
-                "
-                INSERT INTO liquidity_reward_scores (
-                    token, mid, my_orders, my_qone, my_qtwo, my_qmin,
-                    competitors_qmin, my_share, estimated_daily_reward,
-                    simulation, recorded_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                ",
-                params![
-                    token,
-                    mid.to_string(),
-                    my_orders as i64,
-                    my_qone.to_string(),
-                    my_qtwo.to_string(),
-                    my_qmin.to_string(),
-                    competitors_qmin.to_string(),
-                    my_share.to_string(),
-                    estimated_daily_reward.to_string(),
-                    if simulation { 1_i64 } else { 0_i64 },
-                    now,
-                ],
             )?;
             Ok(())
         })
@@ -669,7 +570,129 @@ impl OrderStore {
         })
     }
 
-    /// bids / asks 已由调用方打包为小端字节流（每档 6 字节：price u16 LE + size u32 LE）
+    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQLite 连接锁已中毒"))?;
+        f(&guard)
+    }
+}
+
+impl MarketStore {
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            conn: Arc::new(Mutex::new(open_sqlite_connection(path)?)),
+        })
+    }
+
+    pub fn init_schema(&self) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS liquidity_reward_scores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token TEXT NOT NULL,
+                    mid TEXT NOT NULL,
+                    my_orders INTEGER NOT NULL,
+                    my_qone TEXT NOT NULL,
+                    my_qtwo TEXT NOT NULL,
+                    my_qmin TEXT NOT NULL,
+                    competitors_qmin TEXT NOT NULL,
+                    my_share TEXT NOT NULL,
+                    estimated_daily_reward TEXT NOT NULL,
+                    simulation INTEGER NOT NULL DEFAULT 0,
+                    recorded_at_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_lr_scores_token_ts
+                    ON liquidity_reward_scores (token, recorded_at_ms DESC);
+
+                CREATE TABLE IF NOT EXISTS market_ticks (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token     TEXT    NOT NULL,
+                    bid_price INTEGER NOT NULL,
+                    bid_size  INTEGER NOT NULL,
+                    ask_price INTEGER NOT NULL,
+                    ask_size  INTEGER NOT NULL,
+                    ts_ms     INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_market_ticks_token_ts
+                    ON market_ticks (token, ts_ms DESC);
+
+                CREATE TABLE IF NOT EXISTS book_snapshots (
+                    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token  TEXT    NOT NULL,
+                    market TEXT    NOT NULL,
+                    bids   BLOB    NOT NULL,
+                    asks   BLOB    NOT NULL,
+                    ts_ms  INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_book_snapshots_token_ts
+                    ON book_snapshots (token, ts_ms DESC);
+
+                CREATE TABLE IF NOT EXISTS trade_events (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token    TEXT NOT NULL,
+                    market   TEXT NOT NULL,
+                    price    TEXT NOT NULL,
+                    side     TEXT,
+                    size     TEXT,
+                    fee_rate TEXT,
+                    ts_ms    INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_events_token_ts
+                    ON trade_events (token, ts_ms DESC);
+                ",
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_liquidity_reward_score(
+        &self,
+        token: &str,
+        mid: f64,
+        my_orders: usize,
+        my_qone: f64,
+        my_qtwo: f64,
+        my_qmin: f64,
+        competitors_qmin: f64,
+        my_share: f64,
+        estimated_daily_reward: f64,
+        simulation: bool,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO liquidity_reward_scores (
+                    token, mid, my_orders, my_qone, my_qtwo, my_qmin,
+                    competitors_qmin, my_share, estimated_daily_reward,
+                    simulation, recorded_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+                params![
+                    token,
+                    mid.to_string(),
+                    my_orders as i64,
+                    my_qone.to_string(),
+                    my_qtwo.to_string(),
+                    my_qmin.to_string(),
+                    competitors_qmin.to_string(),
+                    my_share.to_string(),
+                    estimated_daily_reward.to_string(),
+                    if simulation { 1_i64 } else { 0_i64 },
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn insert_book_snapshot(
         &self,
         token: &str,
@@ -745,6 +768,13 @@ impl OrderStore {
             .map_err(|_| anyhow::anyhow!("SQLite 连接锁已中毒"))?;
         f(&guard)
     }
+}
+
+fn open_sqlite_connection(path: &str) -> anyhow::Result<Connection> {
+    let conn = Connection::open(path).with_context(|| format!("无法打开 SQLite 文件: {path}"))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(conn)
 }
 
 fn now_ms() -> anyhow::Result<u64> {

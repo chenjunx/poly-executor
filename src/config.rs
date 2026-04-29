@@ -29,6 +29,8 @@ pub(crate) struct AppSettings {
     pub(crate) assets_file: String,
     #[serde(default)]
     pub(crate) sqlite_path: String,
+    #[serde(default)]
+    pub(crate) market_sqlite_path: String,
     pub(crate) min_diff: f64,
     pub(crate) max_spread: f64,
     pub(crate) min_price: f64,

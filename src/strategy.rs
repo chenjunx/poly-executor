@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::types::Decimal;
 
 #[derive(Clone)]
 pub struct Filters {
@@ -192,13 +192,15 @@ pub struct PairEntry {
     pub topic: Arc<str>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CleanOrderbook {
     pub best_bid_price: u16,
     pub best_bid_size: u32,
     pub best_ask_price: u16,
     pub best_ask_size: u32,
     pub timestamp_ms: u64,
+    pub bids: Arc<std::collections::BTreeMap<u16, u32>>,
+    pub asks: Arc<std::collections::BTreeMap<u16, u32>>,
 }
 
 #[derive(Debug, Clone)]

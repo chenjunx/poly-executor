@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::primitives::U256;
+
 use dashmap::DashMap;
-use polymarket_client_sdk::clob::types::request::{OrdersRequest, TradesRequest};
-use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
-use polymarket_client_sdk::error::{Kind as PmErrorKind, Status as PmStatus, StatusCode};
-use polymarket_client_sdk::types::Decimal;
+use polymarket_client_sdk_v2::clob::types::request::{OrdersRequest, TradesRequest};
+use polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse;
+use polymarket_client_sdk_v2::error::{Kind as PmErrorKind, Status as PmStatus, StatusCode};
+use polymarket_client_sdk_v2::types::Decimal;
 
 use crate::clob_client::{AuthenticatedClobClient, build_authenticated_clob_client};
 use crate::config::AuthConfig;
@@ -419,7 +422,7 @@ fn map_open_order_status(order: &OpenOrderResponse) -> &'static str {
 }
 
 fn map_single_order_status(order: &OpenOrderResponse) -> &'static str {
-    use polymarket_client_sdk::clob::types::OrderStatusType;
+    use polymarket_client_sdk_v2::clob::types::OrderStatusType;
 
     match order.status {
         OrderStatusType::Canceled => "canceled",
@@ -433,7 +436,7 @@ fn map_single_order_status(order: &OpenOrderResponse) -> &'static str {
         OrderStatusType::Live | OrderStatusType::Delayed | OrderStatusType::Unmatched => {
             map_open_order_status(order)
         }
-        OrderStatusType::Unknown => "unknown",
+        OrderStatusType::Unknown(_) => "unknown",
         _ => "unknown",
     }
 }
@@ -450,7 +453,7 @@ async fn infer_missing_remote_terminal_status(
     stored_order: &StoredOrder,
 ) -> anyhow::Result<&'static str> {
     let request = TradesRequest::builder()
-        .asset_id(stored_order.token.clone())
+        .asset_id(U256::from_str(&stored_order.token)?)
         .build();
     let page = client.trades(&request, None).await?;
     let has_trade_for_order = page.data.iter().any(|trade| {
@@ -465,7 +468,7 @@ async fn infer_missing_remote_terminal_status(
     })
 }
 
-fn is_not_found_status(error: &polymarket_client_sdk::error::Error) -> bool {
+fn is_not_found_status(error: &polymarket_client_sdk_v2::error::Error) -> bool {
     error.kind() == PmErrorKind::Status
         && error
             .downcast_ref::<PmStatus>()
