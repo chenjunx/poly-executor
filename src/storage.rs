@@ -520,15 +520,37 @@ impl OrderStore {
         })
     }
 
-    pub fn find_local_order_id_by_remote(
+    pub fn find_order_by_remote(
         &self,
         remote_order_id: &str,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<StoredOrder>> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT local_order_id FROM orders WHERE remote_order_id = ?1",
+                "
+                SELECT local_order_id, remote_order_id, strategy, topic, token, side, price,
+                       min_order_size, status, last_mid
+                FROM orders
+                WHERE remote_order_id = ?1
+                ",
                 params![remote_order_id],
-                |row| row.get(0),
+                |row| {
+                    Ok(StoredOrder {
+                        local_order_id: row.get(0)?,
+                        remote_order_id: row.get(1)?,
+                        strategy: row.get(2)?,
+                        topic: row.get(3)?,
+                        token: row.get(4)?,
+                        side: side_from_str(&row.get::<_, String>(5)?).map_err(to_sql_error)?,
+                        price: decimal_from_str(&row.get::<_, String>(6)?).map_err(to_sql_error)?,
+                        order_size: decimal_from_str(&row.get::<_, String>(7)?)
+                            .map_err(to_sql_error)?,
+                        status: row.get(8)?,
+                        last_mid: row
+                            .get::<_, Option<String>>(9)?
+                            .map(|value| decimal_from_str(&value).map_err(to_sql_error))
+                            .transpose()?,
+                    })
+                },
             )
             .optional()
             .map_err(Into::into)

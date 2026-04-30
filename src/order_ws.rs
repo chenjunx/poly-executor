@@ -73,15 +73,33 @@ async fn subscribe_orders(
         match message {
             Ok(order) => {
                 let local_meta = correlations.get(&order.id).map(|entry| entry.clone());
-                let local_order_id = local_meta
-                    .as_ref()
-                    .map(|meta| meta.local_order_id.clone())
-                    .or_else(|| {
-                        order_store
-                            .find_local_order_id_by_remote(&order.id)
-                            .ok()
-                            .flatten()
-                    });
+                let local_meta = match local_meta {
+                    Some(meta) => Some(meta),
+                    None => match order_store.find_order_by_remote(&order.id) {
+                        Ok(Some(stored_order)) => {
+                            let meta = stored_order.to_local_order_meta();
+                            correlations.insert(meta.local_order_id.clone(), meta.clone());
+                            if let Some(remote_order_id) = meta.remote_order_id.clone() {
+                                correlations.insert(remote_order_id, meta.clone());
+                            }
+                            info!(
+                                target: "order",
+                                order_id = %order.id,
+                                local_order_id = %meta.local_order_id,
+                                strategy = %meta.strategy,
+                                token = %meta.token,
+                                "订单 websocket 从数据库恢复本地订单关联"
+                            );
+                            Some(meta)
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            warn!(target: "order", order_id = %order.id, error = %error, "订单 websocket 从数据库恢复本地订单关联失败");
+                            None
+                        }
+                    },
+                };
+                let local_order_id = local_meta.as_ref().map(|meta| meta.local_order_id.clone());
                 let status = classify_ws_status(
                     &format!("{:?}", order.msg_type),
                     order

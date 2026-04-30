@@ -2,10 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{TimeDelta, Utc};
-use polymarket_client_sdk_v2::clob::types::request::UserRewardsEarningRequest;
-use polymarket_client_sdk_v2::clob::types::response::Token;
-use polymarket_client_sdk_v2::types::{B256, Decimal};
+use polymarket_client_sdk_v2::clob::types::response::{MarketResponse, Token};
+use polymarket_client_sdk_v2::types::Decimal;
 use tracing::{info, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
@@ -286,10 +284,13 @@ pub async fn run_liquidity_reward_monitor(
     configured_tokens: Arc<HashSet<String>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+    let mut market_cache: HashMap<String, MarketResponse> = HashMap::new();
 
     loop {
         ticker.tick().await;
-        if let Err(error) = poll_user_rewards(&auth, configured_tokens.as_ref()).await {
+        if let Err(error) =
+            poll_user_rewards(&auth, configured_tokens.as_ref(), &mut market_cache).await
+        {
             warn!(target: "order", error = %error, "user_reward_monitor 拉取当前用户奖励信息失败");
         }
     }
@@ -298,63 +299,96 @@ pub async fn run_liquidity_reward_monitor(
 async fn poll_user_rewards(
     auth: &AuthConfig,
     configured_tokens: &HashSet<String>,
+    market_cache: &mut HashMap<String, MarketResponse>,
 ) -> anyhow::Result<()> {
     let client = build_authenticated_clob_client(auth).await?;
-    let date = Utc::now().date_naive() - TimeDelta::days(30);
-    let request = UserRewardsEarningRequest::builder().date(date).build();
-    let rewards = client
-        .user_earnings_and_markets_config(&request, None)
-        .await?;
     let reward_percentages = client.reward_percentages().await?;
 
-    let api_market_count = rewards.data.len();
+    let reward_percentage_count = reward_percentages.len();
     let mut configured_market_count = 0usize;
-    let mut total_earnings = Decimal::ZERO;
+    let mut skipped_unconfigured_condition_count = 0usize;
+    let mut market_lookup_failed_count = 0usize;
+    let mut market_cache_hit_count = 0usize;
+    let mut market_cache_miss_count = 0usize;
+    let mut matched_current_reward_percentage_total = Decimal::ZERO;
 
-    for reward in rewards.data {
+    for (condition_id, percentage) in reward_percentages.iter() {
+        let condition_id = condition_id_for_market_endpoint(condition_id);
+        let market = if let Some(market) = market_cache.get(&condition_id).cloned() {
+            market_cache_hit_count += 1;
+            market
+        } else {
+            market_cache_miss_count += 1;
+            match client.market(&condition_id).await {
+                Ok(market) => {
+                    market_cache.insert(condition_id.clone(), market.clone());
+                    market
+                }
+                Err(error) => {
+                    market_lookup_failed_count += 1;
+                    warn!(target: "order", condition_id = %condition_id, error = %error, "user_reward_monitor 查询奖励市场详情失败");
+                    continue;
+                }
+            }
+        };
+
         let matched_configured_tokens =
-            matched_configured_tokens(&reward.tokens, configured_tokens);
+            matched_configured_tokens(&market.tokens, configured_tokens);
         if matched_configured_tokens.is_empty() {
+            skipped_unconfigured_condition_count += 1;
+            let market_token_ids: Vec<String> = market
+                .tokens
+                .iter()
+                .map(|token| token.token_id.to_string())
+                .collect();
+            info!(
+                target = "order",
+                condition_id = %condition_id,
+                market_condition_id = ?market.condition_id,
+                question = %market.question,
+                market_slug = %market.market_slug,
+                current_reward_percentage = %percentage,
+                rewards_max_spread = %market.rewards.max_spread,
+                rewards_min_size = %market.rewards.min_size,
+                active = market.active,
+                closed = market.closed,
+                accepting_orders = market.accepting_orders,
+                market_token_ids = ?market_token_ids,
+                configured_token_count = configured_tokens.len(),
+                "user_reward_monitor 当前用户奖励市场未命中配置 token"
+            );
             continue;
         }
+
         configured_market_count += 1;
-
-        let market_earnings = reward
-            .earnings
-            .iter()
-            .fold(Decimal::ZERO, |acc, earning| acc + earning.earnings);
-        total_earnings += market_earnings;
-
-        let condition_id = condition_id_key(&reward.condition_id);
-        let current_reward_percentage =
-            reward_percentage_for_condition(&reward_percentages, &condition_id);
+        matched_current_reward_percentage_total += *percentage;
         info!(
             target = "order",
             condition_id = %condition_id,
-            question = %reward.question,
-            market_slug = %reward.market_slug,
-            event_slug = %reward.event_slug,
-            maker_address = %reward.maker_address,
-            current_reward_percentage = ?current_reward_percentage,
-            historical_earning_percentage = %reward.earning_percentage,
-            market_earnings = %market_earnings,
-            rewards_max_spread = %reward.rewards_max_spread,
-            rewards_min_size = %reward.rewards_min_size,
-            market_competitiveness = %reward.market_competitiveness,
+            market_condition_id = ?market.condition_id,
+            question = %market.question,
+            market_slug = %market.market_slug,
+            current_reward_percentage = %percentage,
+            rewards_max_spread = %market.rewards.max_spread,
+            rewards_min_size = %market.rewards.min_size,
+            active = market.active,
+            closed = market.closed,
+            accepting_orders = market.accepting_orders,
             matched_configured_tokens = ?matched_configured_tokens,
-            reward_configs = reward.rewards_config.len(),
+            token_count = market.tokens.len(),
             "user_reward_monitor 当前用户奖励市场"
         );
     }
 
     info!(
         target = "order",
-        since = %date,
-        api_market_count,
+        reward_percentage_count,
         configured_market_count,
-        skipped_market_count = api_market_count.saturating_sub(configured_market_count),
-        reward_percentage_count = reward_percentages.len(),
-        total_earnings = %total_earnings,
+        skipped_unconfigured_condition_count,
+        market_lookup_failed_count,
+        market_cache_hit_count,
+        market_cache_miss_count,
+        matched_current_reward_percentage_total = %matched_current_reward_percentage_total,
         "user_reward_monitor 当前用户奖励汇总"
     );
 
@@ -381,27 +415,12 @@ fn matched_configured_tokens(tokens: &[Token], configured_tokens: &HashSet<Strin
     )
 }
 
-fn condition_id_key(condition_id: &B256) -> String {
-    condition_id.to_string()
-}
-
-fn reward_percentage_for_condition(
-    reward_percentages: &HashMap<String, Decimal>,
-    condition_id: &str,
-) -> Option<Decimal> {
-    reward_percentages
-        .get(condition_id)
-        .copied()
-        .or_else(|| {
-            condition_id
-                .strip_prefix("0x")
-                .and_then(|key| reward_percentages.get(key).copied())
-        })
-        .or_else(|| {
-            reward_percentages
-                .get(&format!("0x{}", condition_id))
-                .copied()
-        })
+fn condition_id_for_market_endpoint(condition_id: &str) -> String {
+    if condition_id.starts_with("0x") {
+        condition_id.to_string()
+    } else {
+        format!("0x{condition_id}")
+    }
 }
 
 #[cfg(test)]
@@ -426,22 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn reward_percentage_lookup_accepts_prefixed_and_unprefixed_keys() {
-        let value = Decimal::try_from(12.5_f64).unwrap();
-        let mut percentages = HashMap::from_iter([("0xabc".to_string(), value)]);
-        assert_eq!(
-            reward_percentage_for_condition(&percentages, "0xabc"),
-            Some(value)
-        );
-        assert_eq!(
-            reward_percentage_for_condition(&percentages, "abc"),
-            Some(value)
-        );
+    fn condition_id_for_market_endpoint_adds_0x_prefix() {
+        assert_eq!(condition_id_for_market_endpoint("abc"), "0xabc");
+    }
 
-        percentages = HashMap::from_iter([("abc".to_string(), value)]);
-        assert_eq!(
-            reward_percentage_for_condition(&percentages, "0xabc"),
-            Some(value)
-        );
+    #[test]
+    fn condition_id_for_market_endpoint_keeps_existing_0x_prefix() {
+        assert_eq!(condition_id_for_market_endpoint("0xabc"), "0xabc");
     }
 }
