@@ -77,8 +77,12 @@ impl RecoveryCoordinator {
             return Ok(stored_orders);
         }
 
-        let client = build_authenticated_clob_client(&self.auth).await?;
-        let remote_open_orders = fetch_remote_open_orders(&client).await?;
+        let client = build_authenticated_clob_client(&self.auth)
+            .await
+            .map_err(|e| anyhow::anyhow!("启动恢复：构建 Polymarket CLOB 客户端失败: {e:#}"))?;
+        let remote_open_orders = fetch_remote_open_orders(&client)
+            .await
+            .map_err(|e| anyhow::anyhow!("启动恢复：拉取 Polymarket open orders 失败: {e:#}"))?;
         let mut reconciled = Vec::new();
 
         for stored_order in stored_orders {
@@ -119,7 +123,9 @@ impl RecoveryCoordinator {
                     .await?;
                 Ok(None)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(anyhow::anyhow!(
+                "启动恢复：查询单个远端订单 {remote_order_id} 失败: {error:#}"
+            )),
         }
     }
 
@@ -268,7 +274,8 @@ async fn fetch_remote_open_orders(
     loop {
         let page = client
             .orders(&OrdersRequest::default(), cursor.clone())
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("拉取 open orders 页失败，cursor={cursor:?}: {e:#}"))?;
         for order in page.data {
             remote_open_orders.insert(order.id.clone(), order);
         }
@@ -454,7 +461,18 @@ async fn infer_missing_remote_terminal_status(
     let request = TradesRequest::builder()
         .asset_id(U256::from_str(&stored_order.token)?)
         .build();
-    let page = client.trades(&request, None).await?;
+    let page = match client.trades(&request, None).await {
+        Ok(page) => page,
+        Err(error) if is_empty_decimal_decode_error(&error) => {
+            return Ok("unknown");
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "查询 token {} 的成交记录失败: {error:#}",
+                stored_order.token
+            ));
+        }
+    };
     let has_trade_for_order = page.data.iter().any(|trade| {
         trade.maker_orders.iter().any(|maker_order| {
             maker_order.order_id == stored_order.remote_order_id.clone().unwrap_or_default()
@@ -472,4 +490,9 @@ fn is_not_found_status(error: &polymarket_client_sdk_v2::error::Error) -> bool {
         && error
             .downcast_ref::<PmStatus>()
             .is_some_and(|status| status.status_code == StatusCode::NOT_FOUND)
+}
+
+fn is_empty_decimal_decode_error(error: &polymarket_client_sdk_v2::error::Error) -> bool {
+    let message = error.to_string();
+    message.contains("invalid value: string \"\"") && message.contains("Decimal")
 }

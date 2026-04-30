@@ -216,24 +216,28 @@ token0,token1,topic
 | 1 | `token2` | String | 否 | 配对 NO token asset ID；填写后策略也会对此 token 挂买单；为空时仅对 token1 做市 |
 | 2 | `topic` | String | 否 | 订阅分组名；为空时默认使用 `"liquidity_reward"` |
 | 3 | `reward_min_orders` | u32 | 否 | 奖励达标所需的最少挂单数量（用于 monitor 评估） |
-| 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（**单位：cents**，如 `4` 表示 4 cents；典型值 2–5）。低于此价差的挂单才计入 Q-score。填 `0.04` 表示 0.04 cents，极其严苛，几乎无竞争者得分，建议填整数如 `3` 或 `4`。 |
+| 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（**单位：cents**，如 `4` 表示 4 cents，即 offset = 0.04）。挂单价格和奖励区间均由此字段计算，建议填整数如 `3` 或 `4`。 |
 | 5 | `reward_min_size` | f64 | 否 | 奖励有效的最小单笔挂单金额（USDC） |
 | 6 | `reward_daily_pool` | f64 | 否 | 该市场每日奖励总池（USDC），用于估算预期日收益份额 |
+| 7 | `fixed_price` | bool | 否 | 报价模式开关：`true` = FixedPrice 模式；空或 `false` = CompetitorBased 模式（默认）。详见下方说明。 |
 
 示例：
 
 ```csv
-token1,token2,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,reward_daily_pool
-84133519426074676...,53265937461843025...,us_iran,5,4,100,50
+token1,token2,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,reward_daily_pool,fixed_price
+84133519426074676...,53265937461843025...,us_iran,5,4,100,50,        <- CompetitorBased（默认）
+12345678901234567...,98765432109876543...,quiet_market,,4,50,30,true  <- FixedPrice
 ```
 
-### LiquidityReward 报价与避开 best_bid 逻辑
+---
 
-策略对 `liquidity_reward.csv` 中配置的每个 token 独立维护一个买单状态。填写 `token1` 和 `token2` 时，会分别在 YES token 和 NO token 上挂买单，而不是在同一个 token 上同时挂买卖双边。
+### LiquidityReward 报价逻辑
+
+策略对 `liquidity_reward.csv` 中配置的每个 token 独立维护一个买单状态。填写 `token1` 和 `token2` 时，分别在 YES token 和 NO token 上挂买单，而不是在同一 token 上挂买卖双边。
 
 #### 实时价格输入
 
-每次收到 market WebSocket 的 `book` 或 `price_change` 后，`market.rs` 会维护本地完整订单簿，并把最新 top-of-book 和全量 bids/asks 传给策略：
+每次收到 market WebSocket 的 `book` 或 `price_change` 后，`market.rs` 维护本地完整订单簿，并将最新 top-of-book 和全量 bids 传给策略：
 
 ```text
 best_bid = 当前订单簿最高 bid
@@ -241,107 +245,115 @@ best_ask = 当前订单簿最低 ask
 mid      = (best_bid + best_ask) / 2
 ```
 
-`mid` 是随行情事件实时更新的。策略是否撤单/重挂不再只看旧单是否低于 `mid - offset`，而是重新计算当前应该挂的目标价。
-
-#### offset 与 tick
-
-`reward_max_spread_cents` 的单位是 cents：
-
-```text
-offset = reward_max_spread_cents / 100
-```
-
-例如 `reward_max_spread_cents = 4` 表示 `offset = 0.04`。策略下单前会读取 token 当前 tick size，并按买单常用方式向下取合法价格，避免买单价格被四舍五入抬高。
-
 #### 目标价与奖励有效区间
 
-策略先计算两个价格：
+两种模式共用以下价格计算，基于 `reward_max_spread_cents`（单位 cents，除以 100 得到小数）：
 
 ```text
-target_price     = mid - offset / 2
-min_reward_price = mid - offset
+spread           = reward_max_spread_cents / 100
+target_price     = snap_to_tick(mid - spread / 2, tick, 向下取整)
+min_reward_price = mid - spread
 ```
 
-含义：
+- `target_price`：理想挂单价，位于奖励区间内靠近 mid 的一侧。
+- `min_reward_price`：奖励有效的最低买单价，低于此值通常不计入 Q-score。
 
-- `target_price`：理想挂单价，位于奖励有效区间中间，更接近 mid。
-- `min_reward_price`：奖励有效的最低买单价，低于它通常不再计入该配置的 Q-score 区间。
+---
 
-因此旧单只要价格和当前 `desired_price` 不一致，就会进入 replacement 流程；不会再因为仍位于 `[mid - offset, best_bid]` 区间内而继续保留。
+#### 模式一：CompetitorBased（默认，`fixed_price` 为空或 `false`）
 
-#### 避免自己成为 best_bid
+**适合场景**：交投活跃、对手盘深度好的市场。策略跟随对手盘，不暴露为 best bid，尽量降低被成交的风险。
 
-策略不希望自己的挂单成为当前 best bid，因此不能直接使用原始 `best_bid` 判断，因为原始订单簿中可能已经包含自己的 active/pending 订单。
-
-策略会从 bids 中扣除自己的订单数量后计算竞争对手最高 bid：
+策略会从 bids 中扣除自己的 active/pending 订单后，计算竞争对手最高 bid：
 
 ```text
-competitor_best_bid = 排除自己 active/pending 订单数量后的最高 bid
+competitor_best_bid = 排除自己挂单后的最高 bid
 non_best_cap        = competitor_best_bid - tick
 ```
 
-`non_best_cap` 是为了“不成为 best_bid”时允许挂的最高价格。
+最终 `desired_price` 选取规则：
 
-#### target_price 与 best_bid - tick 的冲突处理
+| 条件 | desired_price | 含义 |
+|---|---|---|
+| `non_best_cap >= target_price` | `target_price` | 在理想位挂单 |
+| `min_reward_price <= non_best_cap < target_price` | `non_best_cap` | 退让至竞争者下方，仍在奖励区间内 |
+| `non_best_cap < min_reward_price` | — | 奖励区间外，撤单等待盘口恢复 |
+| 无竞争对手 bid | — | 不挂单，如有 active 则撤单等待 |
 
-当 `target_price` 和 `competitor_best_bid - tick` 冲突时，策略按下面规则选择 `desired_price`：
+---
 
-| 条件 | 动作 |
-|---|---|
-| `non_best_cap >= target_price` | 按理想价挂单：`desired_price = target_price` |
-| `min_reward_price <= non_best_cap < target_price` | 为了避开 best_bid，降到 `desired_price = non_best_cap` |
-| `non_best_cap < min_reward_price` | 价格已经低于奖励有效区间：撤掉 active，等待盘口恢复 |
-| 没有竞争对手 bid | 不主动挂单；如已有 active，则撤单等待 |
+#### 模式二：FixedPrice（`fixed_price = true`）
 
-也就是说，策略优先跟随 `mid - offset / 2`，但不会为了跟随 mid 而顶成 best bid；如果避开 best bid 会导致订单掉出奖励有效区间，就取消当前订单并等待。
+**适合场景**：交投清淡、几乎无成交的市场。策略按 clean mid 计算 `target_price` 后直接挂单，最大化奖励时间占比。
 
-#### 下单、替换和等待状态机
+```text
+current_external_bid = 当前 token 排除自己 active/pending 后的最高 bid
+paired_external_bid  = 配对 token 排除自己 active/pending 后的最高 bid
+current_external_ask = 1 - paired_external_bid
+clean_mid            = (current_external_bid + current_external_ask) / 2
+desired_price        = target_price（始终）
+```
 
-每个 token 的状态包含：
+- paired YES/NO 规则使用 `clean_mid` 计算 `target_price`，避免把自己在配对 token 上的买单当成当前 token 的外部 ask。
+- mid 每次变化重新计算 `target_price`；若与 active 不同则换单，相同则保持不动。
+- 不使用 CompetitorBased 的 `non_best_cap` 退让逻辑；但仍会排除自己的 active/pending 订单来获得外部盘口。
+- 如果无法得到 clean mid，则不新挂单；已有 active 时会先撤掉，等待外部盘口恢复。
+- 策略有意接受偶发成交的风险，成交后由 halt + 市价平仓逻辑兜底。
+
+---
+
+#### 下单、替换和等待状态机（两种模式共用）
+
+每个 token 的状态：
 
 - `active_order`：当前已挂出的本地订单。
 - `pending_replacement`：等待旧单取消后补上的新订单。
-- `cancel_requested`：是否已经请求取消 active。
+- `cancel_requested`：是否已发出取消请求，防重复。
 - `last_mid` / `last_best_bid` / `last_best_ask`：最近一次行情快照。
-- `halted`：成交后终止策略的保护状态。
+- `halted`：成交后终止策略的保护标志。
 
 每次行情更新后的决策：
 
 | 当前状态 | 决策 |
 |---|---|
-| 没有 active，也没有 pending，且存在合法 `desired_price` | 直接下新买单 |
-| 有 active，且 `active.price != desired_price` | 创建 pending replacement，并请求取消 active |
+| 无 active，无 pending，存在合法 `desired_price` | 直接下新买单 |
+| 有 active，且 `active.price != desired_price` | 创建 pending replacement，请求取消 active |
 | 有 active，且 `active.price == desired_price` | 保持不变 |
-| 已有 pending replacement | 等待旧 active 的取消确认，不重复发新单 |
-| 无法得到合法 `desired_price`，但有 active | 发送 cancel-only，撤掉 active 后等待 |
-| 无法得到合法 `desired_price`，且没有 active | 继续等待 |
+| 已有 pending replacement | 等待旧 active 取消确认，不重复发单 |
+| 无法得到合法 `desired_price`，有 active | 发送 cancel-only，撤掉后等待 |
+| 无法得到合法 `desired_price`，无 active | 继续等待 |
 
-replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacement`，订单执行模块请求取消旧 active；收到旧单 `canceled` 状态后，策略才会把 pending replacement 下出去。这样可以避免同一个 token 上同时暴露两个替换订单。
+replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacement`，订单执行模块取消旧 active；收到 `canceled` 后，策略才将 pending replacement 正式下出，避免同一 token 同时暴露两笔替换订单。
 
-#### 成交终止保护
+---
 
-如果 liquidity_reward 的任一订单发生成交，部分成交也算，策略会进入终止保护：
+#### 成交终止保护（两种模式共用）
 
-1. 标记相关状态为 `halted`。
-2. 不再根据行情继续补单或 replacement。
-3. 对仍存在的 active/pending 订单发起取消。
-4. 已部分成交的订单也会尝试取消剩余数量。
+任一订单发生成交（部分成交也算），策略立即进入终止保护：
 
-该逻辑用于避免成交后继续做市导致仓位继续扩大。真实订单 WebSocket 检测到 liquidity_reward 成交增量时，如果启用了 `[notification.dingtalk]`，会异步发送钉钉通知；通知失败不会影响 halt 或撤单流程。
+1. 取消 token 对（YES + NO）上所有 active/pending 订单。
+2. 将两个 token 状态标记为 `halted`，不再补单。
+3. 以 `last_best_bid` 为参考价，立即发出市价卖单，平掉成交的持仓（`delta_size`）。
+
+市价卖单价格来自成交时刻的 `last_best_bid`（snap 到 tick）；在流动性薄的市场，实际成交价可能低于参考价，产生一定价差损失，属于已知风险。
+
+真实订单 WebSocket 检测到成交增量时，若启用了 `[notification.dingtalk]`，会异步发送钉钉通知，通知失败不影响 halt 和撤单流程。
+
+---
 
 #### 关键订单日志 reason
 
-订单日志中的 `reason` 可用于判断策略为什么行动：
-
-| reason | 含义 |
-|---|---|
-| `no_order` | 当前没有订单，按最新 desired price 新挂单 |
-| `target_price_changed` | active 价格与最新 desired price 不一致，触发替换 |
-| `unchanged` | active 已在当前 desired price，保持不动 |
-| `pending_replacement` | 已经有待补单，等待旧单取消确认 |
-| `outside_reward_zone_wait` | 避开 best_bid 后会掉出奖励区间，撤单或等待 |
-| `no_competitor_bid_wait` | 没有可参考的竞争对手 bid，撤单或等待 |
-| `invalid_target_price` | 目标价格非法，撤单或等待 |
+| reason | 触发模式 | 含义 |
+|---|---|---|
+| `no_order` | 两种 | 无订单，按 desired_price 新挂单 |
+| `target_price_changed` | CompetitorBased | active 价格与 desired_price 不一致，触发替换 |
+| `price_drifted` | FixedPrice | mid 偏移导致 target_price 变化，触发替换 |
+| `unchanged` | 两种 | active 已在 desired_price，保持不动 |
+| `pending_replacement` | 两种 | 已有待补单，等待旧单取消确认 |
+| `outside_reward_zone_wait` | CompetitorBased | 退让后掉出奖励区间，撤单或等待 |
+| `no_competitor_bid` | CompetitorBased | 无可参考的竞争对手 bid，撤单或等待 |
+| `no_external_fixed_mid` | FixedPrice | 无法从当前 token 外部 bid 和配对 token 外部 bid 计算 clean mid，撤单或等待 |
+| `invalid_target_price` | 两种 | 目标价格非法（≤ 0），撤单或等待 |
 
 ---
 

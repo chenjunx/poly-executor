@@ -109,7 +109,8 @@ async fn main() -> anyhow::Result<()> {
         app_config.simulation.enabled,
     )
     .recover()
-    .await?;
+    .await
+    .map_err(|e| anyhow::anyhow!("启动恢复订单失败: {e:#}"))?;
     let order_correlations = recovery.order_correlations;
     let restored_liquidity_reward_states = recovery.liquidity_reward_restore_states;
     let liquidity_reward_file = if !app_config.liquidity_reward.file.is_empty() {

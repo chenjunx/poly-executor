@@ -28,6 +28,8 @@ pub struct LiquidityRewardRule {
     pub reward_max_spread_cents: Option<f64>,
     pub reward_min_size: Option<f64>,
     pub reward_daily_pool: Option<f64>,
+    /// true = FixedOffset 模式：直接挂 target_price，不依赖竞价结构
+    pub fixed_price: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,7 @@ struct TokenQuoteState {
     last_mid: Option<Decimal>,
     last_best_bid: Option<Decimal>,
     last_best_ask: Option<Decimal>,
+    last_bids: Option<Arc<BTreeMap<u16, u32>>>,
     /// 本对内任一订单成交后置 true，此后不再挂新单
     halted: bool,
 }
@@ -145,6 +148,10 @@ impl LiquidityRewardStrategy {
             let reward_max_spread_cents = record.get(4).and_then(|v| v.trim().parse::<f64>().ok());
             let reward_min_size = record.get(5).and_then(|v| v.trim().parse::<f64>().ok());
             let reward_daily_pool = record.get(6).and_then(|v| v.trim().parse::<f64>().ok());
+            let fixed_price = record
+                .get(7)
+                .map(|v| matches!(v.trim(), "true" | "1" | "yes"))
+                .unwrap_or(false);
 
             rules.push(LiquidityRewardRule {
                 topic,
@@ -154,6 +161,7 @@ impl LiquidityRewardStrategy {
                 reward_max_spread_cents,
                 reward_min_size,
                 reward_daily_pool,
+                fixed_price,
             });
         }
 
@@ -259,13 +267,26 @@ impl Strategy for LiquidityRewardStrategy {
                             Decimal::from(event.book.best_ask_price) / Decimal::from(PRICE_SCALE);
                         let mid = (bid + ask) / Decimal::TWO;
 
+                        {
+                            let state = states
+                                .entry(token.clone())
+                                .or_insert_with(|| empty_state(rule));
+                            state.topic = rule.topic.clone();
+                            state.last_mid = Some(mid);
+                            state.last_best_bid = Some(bid);
+                            state.last_best_ask = Some(ask);
+                            state.last_bids = Some(event.book.bids.clone());
+                        }
+
+                        let fixed_external_ask = if rule.fixed_price {
+                            paired_external_ask(&token, rule, &states)
+                        } else {
+                            None
+                        };
+
                         let state = states
-                            .entry(token.clone())
-                            .or_insert_with(|| empty_state(rule));
-                        state.topic = rule.topic.clone();
-                        state.last_mid = Some(mid);
-                        state.last_best_bid = Some(bid);
-                        state.last_best_ask = Some(ask);
+                            .get_mut(token.as_str())
+                            .expect("state exists after market update");
 
                         if state.halted {
                             continue;
@@ -293,8 +314,8 @@ impl Strategy for LiquidityRewardStrategy {
                             &token,
                             state,
                             mid,
-                            bid,
-                            order_size,
+                            ask,
+                            fixed_external_ask,
                             spread,
                             &event.book.bids,
                             &tick_size_map,
@@ -313,6 +334,7 @@ impl Strategy for LiquidityRewardStrategy {
                                     min_reward_price = ?decision.min_reward_price,
                                     competitor_best_bid = ?decision.competitor_best_bid,
                                     non_best_cap = ?decision.non_best_cap,
+                                    fixed_external_ask = ?decision.fixed_external_ask,
                                     desired_price = %price,
                                     active_price = ?state.active_order.as_ref().map(|o| o.price),
                                     spread_cents = ?rule.reward_max_spread_cents,
@@ -343,6 +365,7 @@ impl Strategy for LiquidityRewardStrategy {
                                     min_reward_price = ?decision.min_reward_price,
                                     competitor_best_bid = ?decision.competitor_best_bid,
                                     non_best_cap = ?decision.non_best_cap,
+                                    fixed_external_ask = ?decision.fixed_external_ask,
                                     active_price = ?state.active_order.as_ref().map(|o| o.price),
                                     "liquidity_reward 当前盘口不适合挂单，撤销 active 后等待"
                                 );
@@ -367,6 +390,7 @@ impl Strategy for LiquidityRewardStrategy {
                                     min_reward_price = ?decision.min_reward_price,
                                     competitor_best_bid = ?decision.competitor_best_bid,
                                     non_best_cap = ?decision.non_best_cap,
+                                    fixed_external_ask = ?decision.fixed_external_ask,
                                     active_price = ?state.active_order.as_ref().map(|o| o.price),
                                     "liquidity_reward 报价保持不变或等待"
                                 );
@@ -396,7 +420,7 @@ impl Strategy for LiquidityRewardStrategy {
                         let token = status_event.token.clone();
                         let status = status_event.status.as_ref();
 
-                        // 成交（全部或部分）→ 终止整对做市
+                        // 成交（全部或部分）→ 终止整对做市（unwind 由 OrderFill 处理，此处不重复）
                         if matches!(status, "filled" | "partially_filled") {
                             info!(
                                 target: "order",
@@ -412,6 +436,8 @@ impl Strategy for LiquidityRewardStrategy {
                                 simulation_enabled,
                                 &order_tx,
                                 order_store.as_ref(),
+                                None,
+                                &tick_size_map,
                             );
                             continue;
                         }
@@ -486,6 +512,8 @@ impl Strategy for LiquidityRewardStrategy {
                             simulation_enabled,
                             &order_tx,
                             order_store.as_ref(),
+                            Some(fill_event.delta_size),
+                            &tick_size_map,
                         );
                     }
                     StrategyEvent::Positions(_) => {}
@@ -550,6 +578,7 @@ struct QuoteDecision {
     min_reward_price: Decimal,
     competitor_best_bid: Option<Decimal>,
     non_best_cap: Option<Decimal>,
+    fixed_external_ask: Option<Decimal>,
 }
 
 fn quote_decision(
@@ -557,17 +586,114 @@ fn quote_decision(
     token: &str,
     state: &TokenQuoteState,
     mid: Decimal,
-    _best_bid: Decimal,
-    order_size: Decimal,
+    best_ask: Decimal,
+    fixed_external_ask: Option<Decimal>,
     spread: Decimal,
     bids: &BTreeMap<u16, u32>,
     tick_size_map: &TickSizeMap,
 ) -> QuoteDecision {
     let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
     let tick = tick_size_map.get(token).map(|v| *v).unwrap_or(default_tick);
-    let target_price = snap_price_to_tick(mid - spread / Decimal::TWO, tick, true);
-    let min_reward_price = mid - spread;
-    let competitor_best_bid = competitor_best_bid(bids, state, order_size);
+    let competitor_best_bid = competitor_best_bid(bids, state);
+    let fixed_mid = if rule.fixed_price {
+        match (competitor_best_bid, fixed_external_ask) {
+            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
+            (Some(bid), None) if rule.token2.is_none() => Some((bid + best_ask) / Decimal::TWO),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if rule.fixed_price && fixed_mid.is_none() && rule.token2.is_some() {
+        return QuoteDecision {
+            action: if state.active_order.is_some() {
+                QuoteAction::CancelOnly {
+                    reason: "no_external_fixed_mid",
+                }
+            } else {
+                QuoteAction::Wait {
+                    reason: "no_external_fixed_mid",
+                }
+            },
+            target_price: None,
+            min_reward_price: Decimal::ZERO,
+            competitor_best_bid,
+            non_best_cap: None,
+            fixed_external_ask,
+        };
+    }
+
+    let pricing_mid = if rule.fixed_price {
+        fixed_mid.unwrap_or(mid)
+    } else {
+        mid
+    };
+    let target_price = snap_price_to_tick(pricing_mid - spread / Decimal::TWO, tick, true);
+    let min_reward_price = pricing_mid - spread;
+
+    // FixedOffset 模式：直接挂 target_price，不依赖竞价结构
+    if rule.fixed_price {
+        if target_price <= Decimal::ZERO {
+            warn!(token = %token, mid = %mid, spread_cents = ?rule.reward_max_spread_cents, price = %target_price, "liquidity_reward(fixed) 计算出的挂单价格无效");
+            return QuoteDecision {
+                action: if state.active_order.is_some() {
+                    QuoteAction::CancelOnly {
+                        reason: "invalid_target_price",
+                    }
+                } else {
+                    QuoteAction::Wait {
+                        reason: "invalid_target_price",
+                    }
+                },
+                target_price: Some(target_price),
+                min_reward_price,
+                competitor_best_bid: None,
+                non_best_cap: None,
+                fixed_external_ask,
+            };
+        }
+        let action = match &state.active_order {
+            None => {
+                if fixed_mid.is_none() {
+                    QuoteAction::Wait {
+                        reason: "only_own_bid",
+                    }
+                } else if state.pending_replacement.is_none() {
+                    QuoteAction::PlaceOrReplace {
+                        price: target_price,
+                        reason: "no_order",
+                    }
+                } else {
+                    QuoteAction::Wait {
+                        reason: "pending_replacement",
+                    }
+                }
+            }
+            Some(active) => {
+                if active.price != target_price {
+                    QuoteAction::PlaceOrReplace {
+                        price: target_price,
+                        reason: "price_drifted",
+                    }
+                } else {
+                    QuoteAction::Wait {
+                        reason: "unchanged",
+                    }
+                }
+            }
+        };
+        return QuoteDecision {
+            action,
+            target_price: Some(target_price),
+            min_reward_price,
+            competitor_best_bid,
+            non_best_cap: None,
+            fixed_external_ask,
+        };
+    }
+
+    // CompetitorBased 模式（原有逻辑）
     let non_best_cap = competitor_best_bid.map(|price| price - tick);
 
     if target_price <= Decimal::ZERO {
@@ -586,6 +712,7 @@ fn quote_decision(
             min_reward_price,
             competitor_best_bid,
             non_best_cap,
+            fixed_external_ask,
         };
     }
 
@@ -604,6 +731,7 @@ fn quote_decision(
             min_reward_price,
             competitor_best_bid,
             non_best_cap,
+            fixed_external_ask,
         };
     };
 
@@ -626,6 +754,7 @@ fn quote_decision(
             min_reward_price,
             competitor_best_bid,
             non_best_cap: Some(non_best_cap),
+            fixed_external_ask,
         };
     };
 
@@ -662,29 +791,43 @@ fn quote_decision(
         min_reward_price,
         competitor_best_bid,
         non_best_cap: Some(non_best_cap),
+        fixed_external_ask,
     }
 }
 
-fn competitor_best_bid(
-    bids: &BTreeMap<u16, u32>,
-    state: &TokenQuoteState,
-    order_size: Decimal,
+fn paired_token<'a>(token: &str, rule: &'a LiquidityRewardRule) -> Option<&'a str> {
+    if token == rule.token1 {
+        rule.token2.as_deref()
+    } else {
+        Some(rule.token1.as_str())
+    }
+}
+
+fn paired_external_ask(
+    token: &str,
+    rule: &LiquidityRewardRule,
+    states: &HashMap<String, TokenQuoteState>,
 ) -> Option<Decimal> {
+    let paired = paired_token(token, rule)?;
+    let paired_state = states.get(paired)?;
+    let paired_bids = paired_state.last_bids.as_deref()?;
+    let paired_external_bid = competitor_best_bid(paired_bids, paired_state)?;
+    let external_ask = Decimal::ONE - paired_external_bid;
+    (external_ask > Decimal::ZERO).then_some(external_ask)
+}
+
+fn competitor_best_bid(bids: &BTreeMap<u16, u32>, state: &TokenQuoteState) -> Option<Decimal> {
     for (&price, &size) in bids.iter().rev() {
         let mut remaining = size as i64;
-        if state
-            .active_order
-            .as_ref()
-            .is_some_and(|order| scaled_price(order.price) == price)
-        {
-            remaining -= scaled_size(order_size);
+        if let Some(order) = state.active_order.as_ref() {
+            if scaled_price(order.price) == price {
+                remaining -= scaled_size(order.order_size);
+            }
         }
-        if state
-            .pending_replacement
-            .as_ref()
-            .is_some_and(|order| scaled_price(order.price) == price)
-        {
-            remaining -= scaled_size(order_size);
+        if let Some(order) = state.pending_replacement.as_ref() {
+            if scaled_price(order.price) == price {
+                remaining -= scaled_size(order.order_size);
+            }
         }
         if remaining > 0 {
             return Some(Decimal::from(price) / Decimal::from(PRICE_SCALE));
@@ -825,6 +968,7 @@ fn state_from_restore(restored: LiquidityRewardRestoreState) -> TokenQuoteState 
         last_mid: restored.last_mid,
         last_best_bid: restored.last_best_bid,
         last_best_ask: restored.last_best_ask,
+        last_bids: None,
         halted: false,
     }
 }
@@ -838,6 +982,7 @@ fn empty_state(rule: &LiquidityRewardRule) -> TokenQuoteState {
         last_mid: None,
         last_best_bid: None,
         last_best_ask: None,
+        last_bids: None,
         halted: false,
     }
 }
@@ -877,6 +1022,7 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &TokenQuo
 
 /// 终止整个做市对：取消两个 token 的所有挂单并标记 halted。
 /// 只要该对中任一订单发生成交（全部或部分），就调用此函数。
+/// 若 `unwind_size` 非 None，则在撤单后立即以市价卖出该数量的持仓。
 fn halt_pair(
     token: &str,
     rules: &std::collections::HashMap<String, LiquidityRewardRule>,
@@ -884,17 +1030,62 @@ fn halt_pair(
     simulated: bool,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     order_store: Option<&OrderStore>,
+    unwind_size: Option<Decimal>,
+    tick_size_map: &TickSizeMap,
 ) {
     let Some(rule) = rules.get(token) else { return };
-    let paired: Option<&str> = if token == rule.token1 {
-        rule.token2.as_deref()
-    } else {
-        Some(rule.token1.as_str())
-    };
+    let paired = paired_token(token, rule);
 
     cancel_and_halt(token, states, simulated, order_tx, order_store);
     if let Some(p) = paired {
         cancel_and_halt(p, states, simulated, order_tx, order_store);
+    }
+
+    let Some(size) = unwind_size else { return };
+    let state = states.get(token);
+    let topic = state
+        .map(|s| s.topic.clone())
+        .unwrap_or_else(|| Arc::from("liquidity_reward"));
+    let sell_ref_price = state
+        .and_then(|s| s.last_best_bid)
+        .or_else(|| state.and_then(|s| s.last_mid));
+    let Some(ref_price) = sell_ref_price else {
+        warn!(token = %token, "liquidity_reward 无法获取最新买价，跳过市价卖出");
+        return;
+    };
+    let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
+    let tick = tick_size_map.get(token).map(|v| *v).unwrap_or(default_tick);
+    let sell_price = snap_price_to_tick(ref_price, tick, true);
+    if sell_price <= Decimal::ZERO {
+        warn!(token = %token, sell_price = %sell_price, "liquidity_reward 市价卖出价格无效，跳过");
+        return;
+    }
+    let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let order_id = format!("{}-{}-unwind-{}", token, ts, seq);
+    info!(
+        target: "order",
+        token = %token,
+        sell_price = %sell_price,
+        size = %size,
+        order_id = %order_id,
+        "liquidity_reward 成交后立即市价卖出持仓"
+    );
+    if let Err(e) = order_tx.try_send(OrderSignal::LiquidityRewardPlace {
+        strategy: Arc::from("liquidity_reward"),
+        topic,
+        token: token.to_string(),
+        mid: sell_price,
+        side: QuoteSide::Sell,
+        price: sell_price,
+        order_size: size,
+        local_order_id: order_id,
+        simulated,
+    }) {
+        warn!(token = %token, error = %e, "liquidity_reward 发送市价卖出失败");
     }
 }
 
