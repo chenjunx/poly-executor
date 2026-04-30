@@ -22,6 +22,7 @@ pub(crate) struct Notifier {
 #[derive(Debug, Clone)]
 pub(crate) enum NotificationEvent {
     LiquidityRewardFill(LiquidityRewardFillNotification),
+    LiquidityRewardUnwindAction(LiquidityRewardUnwindActionNotification),
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,20 @@ pub(crate) struct LiquidityRewardFillNotification {
     pub(crate) ws_status: String,
     pub(crate) ws_msg_type: String,
     pub(crate) ws_timestamp: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiquidityRewardUnwindActionNotification {
+    pub(crate) strategy: String,
+    pub(crate) topic: Option<String>,
+    pub(crate) token: String,
+    pub(crate) local_order_id: String,
+    pub(crate) side: QuoteSide,
+    pub(crate) price: Decimal,
+    pub(crate) order_size: Decimal,
+    pub(crate) attempts: u8,
+    pub(crate) action: String,
+    pub(crate) simulated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +142,15 @@ async fn send_dingtalk_message(
                 "钉钉 liquidity_reward 成交通知发送成功"
             );
         }
+        NotificationEvent::LiquidityRewardUnwindAction(unwind) => {
+            info!(
+                target: "notification",
+                local_order_id = %unwind.local_order_id,
+                action = %unwind.action,
+                attempts = unwind.attempts,
+                "钉钉 liquidity_reward 市价止损动作通知发送成功"
+            );
+        }
     }
     Ok(())
 }
@@ -139,6 +163,19 @@ fn build_dingtalk_payload(event: &NotificationEvent) -> serde_json::Value {
                 "msgtype": "markdown",
                 "markdown": {
                     "title": "liquidity_reward 成交通知",
+                    "text": text,
+                },
+                "at": {
+                    "isAtAll": false,
+                },
+            })
+        }
+        NotificationEvent::LiquidityRewardUnwindAction(unwind) => {
+            let text = build_liquidity_reward_unwind_action_markdown(unwind);
+            json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "liquidity_reward 市价止损卖出动作",
                     "text": text,
                 },
                 "at": {
@@ -196,6 +233,37 @@ fn build_liquidity_reward_fill_markdown(fill: &LiquidityRewardFillNotification) 
     )
 }
 
+fn build_liquidity_reward_unwind_action_markdown(
+    unwind: &LiquidityRewardUnwindActionNotification,
+) -> String {
+    let notify_time = chrono::Utc::now().to_rfc3339();
+    format!(
+        "### liquidity_reward 市价止损卖出动作通知\n\n\
+        - 策略：{}\n\
+        - Topic：{}\n\
+        - Token：{}\n\
+        - 动作：{}\n\
+        - 方向：{:?}\n\
+        - 价格：{}\n\
+        - 数量：{}\n\
+        - 重试次数：{}\n\
+        - Local Order ID：{}\n\
+        - 模拟模式：{}\n\
+        - 通知时间：{}",
+        unwind.strategy,
+        unwind.topic.as_deref().unwrap_or("-"),
+        unwind.token,
+        unwind.action,
+        unwind.side,
+        unwind.price,
+        unwind.order_size,
+        unwind.attempts,
+        unwind.local_order_id,
+        unwind.simulated,
+        notify_time,
+    )
+}
+
 fn signed_webhook_url(webhook: &str, secret: &str, timestamp_ms: i64) -> anyhow::Result<String> {
     if secret.is_empty() {
         return Ok(webhook.to_string());
@@ -247,6 +315,21 @@ mod tests {
         }
     }
 
+    fn sample_unwind_action() -> LiquidityRewardUnwindActionNotification {
+        LiquidityRewardUnwindActionNotification {
+            strategy: "liquidity_reward".to_string(),
+            topic: Some("liquidity_reward".to_string()),
+            token: "token-1".to_string(),
+            local_order_id: "local-unwind-1".to_string(),
+            side: QuoteSide::Sell,
+            price: Decimal::try_from(0.41_f64).unwrap(),
+            order_size: Decimal::try_from(1.5_f64).unwrap(),
+            attempts: 1,
+            action: "unwind-retry".to_string(),
+            simulated: false,
+        }
+    }
+
     #[test]
     fn unsigned_webhook_url_returns_original_url() {
         let url = "https://example.com/robot/send?access_token=abc";
@@ -275,5 +358,26 @@ mod tests {
         assert!(text.contains("remote-1"));
         assert!(text.contains("1.5"));
         assert!(text.contains("partially_filled"));
+    }
+
+    #[test]
+    fn dingtalk_payload_contains_unwind_action_fields() {
+        let payload = build_dingtalk_payload(&NotificationEvent::LiquidityRewardUnwindAction(
+            sample_unwind_action(),
+        ));
+        assert_eq!(payload["msgtype"], "markdown");
+        assert_eq!(
+            payload["markdown"]["title"].as_str().unwrap(),
+            "liquidity_reward 市价止损卖出动作"
+        );
+        let text = payload["markdown"]["text"].as_str().unwrap();
+        assert!(text.contains("liquidity_reward"));
+        assert!(text.contains("token-1"));
+        assert!(text.contains("local-unwind-1"));
+        assert!(text.contains("unwind-retry"));
+        assert!(text.contains("0.41"));
+        assert!(text.contains("1.5"));
+        assert!(text.contains("重试次数：1"));
+        assert!(text.contains("模拟模式：false"));
     }
 }

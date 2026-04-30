@@ -244,6 +244,7 @@ pub struct OrderStatusEvent {
     pub token: String,
     pub local_order_id: String,
     pub status: Arc<str>,
+    pub reason: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]

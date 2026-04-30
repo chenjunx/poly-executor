@@ -125,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let lr_simulation = app_config.liquidity_reward.simulation;
+    let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
     let reward_monitor_configs: std::collections::HashMap<String, RewardMonitorConfig> =
         liquidity_reward_strategy_opt
             .as_ref()
@@ -166,12 +167,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let liquidity_reward = liquidity_reward_strategy_opt.map(|strategy| {
-        strategy.with_restore_state(
-            restored_liquidity_reward_states.clone(),
-            Some(order_store.clone()),
-            lr_simulation,
-            tick_size_map.clone(),
-        )
+        strategy
+            .with_restore_state(
+                restored_liquidity_reward_states.clone(),
+                Some(order_store.clone()),
+                lr_simulation,
+                tick_size_map.clone(),
+            )
+            .with_notifier(notifier.clone())
     });
 
     let liquidity_reward_tokens: Arc<std::collections::HashSet<String>> = Arc::new(
@@ -195,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(monitor::run_liquidity_reward_monitor(
             app_config.auth.clone(),
             app_config.app.monitor_interval_secs.max(1),
+            liquidity_reward_tokens.clone(),
         ));
     }
 
@@ -240,7 +244,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let (positions_refresh_tx, positions_refresh_rx) = tokio::sync::mpsc::channel(64);
     let (sim_fill_tx, sim_fill_rx) = tokio::sync::mpsc::channel::<SimulatedFillEvent>(64);
-    let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
 
     let (pair_tx, pair_rx) = tokio::sync::mpsc::channel(256);
     let mut strategy_handles = vec![StrategyHandle {

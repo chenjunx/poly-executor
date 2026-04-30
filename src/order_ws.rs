@@ -211,6 +211,7 @@ async fn subscribe_orders(
                                 token: local_meta.token.clone(),
                                 local_order_id: local_meta.local_order_id.clone(),
                                 status: Arc::from(status),
+                                reason: None,
                             }));
                     }
                 } else {

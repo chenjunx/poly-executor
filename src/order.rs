@@ -23,6 +23,12 @@ use crate::{
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
 
+#[derive(Debug)]
+enum PlaceOrderOutcome {
+    Placed,
+    Rejected { reason: Option<String> },
+}
+
 pub async fn run(
     mut order_rx: tokio::sync::mpsc::Receiver<OrderSignal>,
     auth: AuthConfig,
@@ -119,11 +125,28 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(placed) => {
-                        if placed {
-                            let _ = positions_refresh_tx
-                                .try_send(PositionRefreshTrigger::OrderPlacement);
+                    Ok(PlaceOrderOutcome::Placed) => {
+                        let _ =
+                            positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("open"),
+                                reason: None,
+                            }));
+                    }
+                    Ok(PlaceOrderOutcome::Rejected { reason }) => {
+                        if let Some(reason) = reason.as_deref() {
+                            schedule_balance_retry_if_needed(reason, &positions_refresh_tx);
                         }
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("failed"),
+                                reason: reason.map(Arc::from),
+                            }));
                     }
                     Err(error) => {
                         let error = error.to_string();
@@ -147,6 +170,7 @@ pub async fn run(
                                 token: token.clone(),
                                 local_order_id: local_order_id.clone(),
                                 status: Arc::from("failed"),
+                                reason: Some(Arc::from(error.as_str())),
                             }));
                         schedule_balance_retry_if_needed(&error, &positions_refresh_tx);
                         warn!(
@@ -213,6 +237,7 @@ pub async fn run(
                                 token: token.clone(),
                                 local_order_id: active_local_order_id.clone(),
                                 status: Arc::from("canceled"),
+                                reason: None,
                             }));
                     }
                 } else if request_cancel {
@@ -257,6 +282,7 @@ pub async fn run(
                         token: token.clone(),
                         local_order_id: active_local_order_id.clone(),
                         status: Arc::from("canceled"),
+                        reason: None,
                     }));
                 } else {
                     request_liquidity_reward_cancel(
@@ -386,7 +412,7 @@ async fn place_liquidity_reward_order(
     price: Decimal,
     order_size: Decimal,
     local_order_id: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<PlaceOrderOutcome> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
     let funder = Address::from_str(&auth.funder)?;
     let client = Client::new(CLOB_HOST, Config::builder().use_server_time(true).build())?
@@ -419,7 +445,9 @@ async fn place_liquidity_reward_order(
             token = %token,
             "liquidity_reward 下单成功后未找到本地订单元数据，跳过关联写回"
         );
-        return Ok(false);
+        return Ok(PlaceOrderOutcome::Rejected {
+            reason: Some("missing local order metadata after submit".to_string()),
+        });
     };
 
     meta.remote_order_id = Some(response.order_id.clone());
@@ -471,14 +499,28 @@ async fn place_liquidity_reward_order(
         "liquidity_reward 真实挂单成功，已写入本地与远端订单关联"
     );
 
-    Ok(response.success)
+    if response.success {
+        Ok(PlaceOrderOutcome::Placed)
+    } else {
+        Ok(PlaceOrderOutcome::Rejected {
+            reason: response.error_msg.filter(|msg| !msg.is_empty()),
+        })
+    }
+}
+
+fn is_not_enough_balance_error(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        reason
+            .to_ascii_lowercase()
+            .contains("not enough balance / allowance")
+    })
 }
 
 fn schedule_balance_retry_if_needed(
     error: &str,
     positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
 ) {
-    if !error.contains("not enough balance / allowance") {
+    if !is_not_enough_balance_error(Some(error)) {
         return;
     }
     let positions_refresh_tx = positions_refresh_tx.clone();
@@ -517,6 +559,23 @@ fn to_sdk_side(side: QuoteSide) -> Side {
     match side {
         QuoteSide::Buy => Side::Buy,
         QuoteSide::Sell => Side::Sell,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_not_enough_balance_error() {
+        assert!(is_not_enough_balance_error(Some(
+            "not enough balance / allowance: the balance is not enough"
+        )));
+        assert!(is_not_enough_balance_error(Some(
+            "NOT ENOUGH BALANCE / ALLOWANCE"
+        )));
+        assert!(!is_not_enough_balance_error(Some("invalid price")));
+        assert!(!is_not_enough_balance_error(None));
     }
 }
 
