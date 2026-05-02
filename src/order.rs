@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use alloy::primitives::U256;
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{
+    Amount, OrderStatusType, OrderType, Side, SignatureType,
+};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
@@ -26,6 +28,7 @@ const CLOB_HOST: &str = "https://clob.polymarket.com";
 #[derive(Debug)]
 enum PlaceOrderOutcome {
     Placed,
+    Matched,
     Rejected { reason: Option<String> },
 }
 
@@ -136,6 +139,17 @@ pub async fn run(
                                 reason: None,
                             }));
                     }
+                    Ok(PlaceOrderOutcome::Matched) => {
+                        let _ =
+                            positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("filled"),
+                                reason: None,
+                            }));
+                    }
                     Ok(PlaceOrderOutcome::Rejected { reason }) => {
                         if let Some(reason) = reason.as_deref() {
                             schedule_balance_retry_if_needed(reason, &positions_refresh_tx);
@@ -182,6 +196,145 @@ pub async fn run(
                             order_size = %order_size,
                             error = %error,
                             "liquidity_reward 真实下单失败"
+                        );
+                    }
+                }
+            }
+            UnifiedOrder::LiquidityRewardMarketSell {
+                strategy,
+                topic,
+                token,
+                price,
+                order_size,
+                local_order_id,
+                simulated,
+            } => {
+                let meta = LocalOrderMeta {
+                    local_order_id: local_order_id.clone(),
+                    remote_order_id: None,
+                    strategy: strategy.clone(),
+                    topic: Some(topic.clone()),
+                    token: token.clone(),
+                    side: QuoteSide::Sell,
+                    price,
+                    order_size,
+                };
+                correlations.insert(local_order_id.clone(), meta.clone());
+                persist_new_order(&order_store, &meta, price, simulated || simulation_enabled);
+
+                if simulated || simulation_enabled {
+                    info!(
+                        target: "order",
+                        topic = %topic,
+                        token = %token,
+                        price = %price,
+                        order_size = %order_size,
+                        local_order_id = %local_order_id,
+                        simulated,
+                        "liquidity_reward 模拟 FAK 市价卖单成功，已记录本地订单元数据"
+                    );
+                    let _ = order_store.update_order_status_by_local(&local_order_id, "filled");
+                    let _ = order_store.append_order_event(
+                        Some(&local_order_id),
+                        None,
+                        "submit_succeeded",
+                        json!({
+                            "mode": "simulation",
+                            "execution": "market_fak",
+                            "strategy": strategy.as_ref(),
+                            "topic": topic.as_ref(),
+                            "token": token,
+                            "side": "Sell",
+                            "price": price.to_string(),
+                            "order_size": order_size.to_string(),
+                        }),
+                    );
+                    let _ = strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                        token: token.clone(),
+                        local_order_id: local_order_id.clone(),
+                        status: Arc::from("filled"),
+                        reason: None,
+                    }));
+                    continue;
+                }
+
+                match place_liquidity_reward_market_sell(
+                    &auth,
+                    &correlations,
+                    &order_store,
+                    &strategy,
+                    &topic,
+                    &token,
+                    price,
+                    order_size,
+                    &local_order_id,
+                )
+                .await
+                {
+                    Ok(PlaceOrderOutcome::Placed) => {
+                        let _ =
+                            positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("open"),
+                                reason: None,
+                            }));
+                    }
+                    Ok(PlaceOrderOutcome::Matched) => {
+                        let _ =
+                            positions_refresh_tx.try_send(PositionRefreshTrigger::OrderPlacement);
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("filled"),
+                                reason: None,
+                            }));
+                    }
+                    Ok(PlaceOrderOutcome::Rejected { reason }) => {
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("failed"),
+                                reason: reason.map(Arc::from),
+                            }));
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        let _ = order_store.update_order_status_by_local(&local_order_id, "failed");
+                        let _ = order_store.append_order_event(
+                            Some(&local_order_id),
+                            None,
+                            "submit_failed",
+                            json!({
+                                "execution": "market_fak",
+                                "strategy": strategy.as_ref(),
+                                "topic": topic.as_ref(),
+                                "token": token,
+                                "side": "Sell",
+                                "price": price.to_string(),
+                                "order_size": order_size.to_string(),
+                                "error": error,
+                            }),
+                        );
+                        let _ =
+                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
+                                token: token.clone(),
+                                local_order_id: local_order_id.clone(),
+                                status: Arc::from("failed"),
+                                reason: Some(Arc::from(error.as_str())),
+                            }));
+                        warn!(
+                            target: "order",
+                            topic = %topic,
+                            token = %token,
+                            price = %price,
+                            order_size = %order_size,
+                            error = %error,
+                            "liquidity_reward FAK 市价卖单失败"
                         );
                     }
                 }
@@ -453,7 +606,13 @@ async fn place_liquidity_reward_order(
     meta.remote_order_id = Some(response.order_id.clone());
     correlations.insert(local_order_id.to_string(), meta.clone());
     correlations.insert(response.order_id.clone(), meta.clone());
-    let status = if response.success { "open" } else { "failed" };
+    let status = if !response.success {
+        "failed"
+    } else if response.status == OrderStatusType::Matched {
+        "filled"
+    } else {
+        "open"
+    };
     let _ = order_store.update_order_remote_and_status(
         local_order_id,
         &response.order_id,
@@ -499,11 +658,127 @@ async fn place_liquidity_reward_order(
         "liquidity_reward 真实挂单成功，已写入本地与远端订单关联"
     );
 
-    if response.success {
-        Ok(PlaceOrderOutcome::Placed)
-    } else {
+    if !response.success {
         Ok(PlaceOrderOutcome::Rejected {
             reason: response.error_msg.filter(|msg| !msg.is_empty()),
+        })
+    } else if response.status == OrderStatusType::Matched {
+        Ok(PlaceOrderOutcome::Matched)
+    } else {
+        Ok(PlaceOrderOutcome::Placed)
+    }
+}
+
+async fn place_liquidity_reward_market_sell(
+    auth: &AuthConfig,
+    correlations: &OrderCorrelationMap,
+    order_store: &OrderStore,
+    strategy: &Arc<str>,
+    topic: &Arc<str>,
+    token: &str,
+    price: Decimal,
+    order_size: Decimal,
+    local_order_id: &str,
+) -> anyhow::Result<PlaceOrderOutcome> {
+    let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
+    let funder = Address::from_str(&auth.funder)?;
+    let client = Client::new(CLOB_HOST, Config::builder().use_server_time(true).build())?
+        .authentication_builder(&signer)
+        .funder(funder)
+        .signature_type(SignatureType::Proxy)
+        .authenticate()
+        .await?;
+
+    let signable = client
+        .market_order()
+        .token_id(U256::from_str(token)?)
+        .side(Side::Sell)
+        .amount(Amount::shares(order_size)?)
+        .order_type(OrderType::FAK)
+        .build()
+        .await?;
+    let signed = client.sign(&signer, signable).await?;
+    let t_submit = Instant::now();
+    let response = client.post_order(signed).await?;
+    let submit_ms = t_submit.elapsed().as_millis();
+
+    let Some(mut meta) = correlations.get(local_order_id).map(|entry| entry.clone()) else {
+        warn!(
+            target: "order",
+            local_order_id = %local_order_id,
+            remote_order_id = %response.order_id,
+            token = %token,
+            "liquidity_reward FAK 市价卖单成功后未找到本地订单元数据，跳过关联写回"
+        );
+        return Ok(PlaceOrderOutcome::Rejected {
+            reason: Some("missing local order metadata after market sell submit".to_string()),
+        });
+    };
+
+    meta.remote_order_id = Some(response.order_id.clone());
+    correlations.insert(local_order_id.to_string(), meta.clone());
+    correlations.insert(response.order_id.clone(), meta.clone());
+    let status = if response.success && response.status == OrderStatusType::Matched {
+        "filled"
+    } else {
+        "failed"
+    };
+    let _ = order_store.update_order_remote_and_status(
+        local_order_id,
+        &response.order_id,
+        status,
+        Some(price),
+    );
+    let _ = order_store.append_order_event(
+        Some(local_order_id),
+        Some(&response.order_id),
+        if status == "filled" {
+            "submit_succeeded"
+        } else {
+            "submit_failed"
+        },
+        json!({
+            "execution": "market_fak",
+            "strategy": strategy.as_ref(),
+            "topic": topic.as_ref(),
+            "token": token,
+            "side": "Sell",
+            "price": price.to_string(),
+            "order_size": order_size.to_string(),
+            "status": format!("{:?}", response.status),
+            "success": response.success,
+            "error_msg": response.error_msg,
+        }),
+    );
+
+    info!(
+        target: "order",
+        topic = %topic,
+        token = %token,
+        local_order_id = %local_order_id,
+        remote_order_id = %response.order_id,
+        price = %price,
+        order_size = %order_size,
+        status = ?response.status,
+        success = response.success,
+        error_msg = ?response.error_msg,
+        submit_rtt_ms = submit_ms,
+        "liquidity_reward FAK 市价卖单完成，已写入本地与远端订单关联"
+    );
+
+    if response.success && response.status == OrderStatusType::Matched {
+        Ok(PlaceOrderOutcome::Matched)
+    } else {
+        Ok(PlaceOrderOutcome::Rejected {
+            reason: response
+                .error_msg
+                .filter(|msg| !msg.is_empty())
+                .or_else(|| {
+                    Some(format!(
+                        "FAK market sell did not match immediately: status={:?}, success={}",
+                        response.status, response.success
+                    ))
+                }),
         })
     }
 }

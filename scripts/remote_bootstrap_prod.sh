@@ -253,10 +253,27 @@ fi
 
 git checkout --detach "$DEPLOY_SHA"
 cargo build --release
+
+if [[ -f "$REMOTE_DIR/scripts/logrotate.conf" ]]; then
+  cp "$REMOTE_DIR/scripts/logrotate.conf" /etc/logrotate.d/poly-executor
+fi
+
 bash "$RESTART_SCRIPT"
 bash "$OPS_SCRIPT" status
 INNER
 chmod +x "$BIN_DIR/deploy_poly_executor.sh"
+
+cat > /etc/logrotate.d/poly-executor <<'LOGROTATE'
+/root/poly-executor/orders.log /root/poly-executor/alerts.log {
+    size 20M
+    rotate 5
+    copytruncate
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+LOGROTATE
 
 echo "Bootstrap complete in $REMOTE_DIR"
 EOF

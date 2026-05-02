@@ -342,7 +342,7 @@ async fn poll_user_rewards(
                 .map(|token| token.token_id.to_string())
                 .collect();
             info!(
-                target = "order",
+                target: "order",
                 condition_id = %condition_id,
                 market_condition_id = ?market.condition_id,
                 question = %market.question,
@@ -363,7 +363,7 @@ async fn poll_user_rewards(
         configured_market_count += 1;
         matched_current_reward_percentage_total += *percentage;
         info!(
-            target = "order",
+            target: "order",
             condition_id = %condition_id,
             market_condition_id = ?market.condition_id,
             question = %market.question,
@@ -381,7 +381,7 @@ async fn poll_user_rewards(
     }
 
     info!(
-        target = "order",
+        target: "order",
         reward_percentage_count,
         configured_market_count,
         skipped_unconfigured_condition_count,

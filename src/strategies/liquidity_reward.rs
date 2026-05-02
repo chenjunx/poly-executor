@@ -8,7 +8,10 @@ use polymarket_client_sdk_v2::types::Decimal;
 use tracing::{info, warn};
 
 use crate::{
-    notification::{LiquidityRewardUnwindActionNotification, NotificationEvent, Notifier},
+    notification::{
+        LiquidityRewardFillNotification, LiquidityRewardUnwindActionNotification,
+        NotificationEvent, Notifier,
+    },
     storage::OrderStore,
     strategy::{
         OrderSignal, QuoteSide, Strategy, StrategyEvent, StrategyRegistration, TopicRegistration,
@@ -56,7 +59,9 @@ struct PendingUnwind {
     local_order_id: String,
     price: Decimal,
     order_size: Decimal,
+    matched_size: Decimal,
     attempts: u8,
+    size_adjusted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -434,13 +439,29 @@ impl Strategy for LiquidityRewardStrategy {
                         {
                             match status {
                                 "open" => {
-                                    state.pending_unwinds.remove(&status_event.local_order_id);
-                                    info!(
-                                        target: "order",
-                                        token = %token,
-                                        order_id = %status_event.local_order_id,
-                                        "liquidity_reward unwind 卖单提交成功，停止重试"
-                                    );
+                                    if let Some(unwind) =
+                                        state.pending_unwinds.remove(&status_event.local_order_id)
+                                    {
+                                        warn!(
+                                            target: "order",
+                                            token = %token,
+                                            order_id = %status_event.local_order_id,
+                                            attempts = unwind.attempts,
+                                            "liquidity_reward FAK unwind 卖单返回 open，需要手动处理"
+                                        );
+                                        let topic = state.topic.clone();
+                                        notify_unwind_action(
+                                            notifier.as_ref(),
+                                            Some(topic.to_string()),
+                                            token.clone(),
+                                            unwind.local_order_id,
+                                            unwind.price,
+                                            unwind.order_size,
+                                            unwind.attempts,
+                                            "unwind-manual-required",
+                                            simulation_enabled,
+                                        );
+                                    }
                                 }
                                 "failed" => {
                                     let reason = status_event.reason.as_ref().map(|r| r.as_ref());
@@ -454,8 +475,58 @@ impl Strategy for LiquidityRewardStrategy {
                                         notifier.as_ref(),
                                     );
                                 }
-                                "canceled" | "rejected" | "filled" => {
-                                    state.pending_unwinds.remove(&status_event.local_order_id);
+                                "filled" => {
+                                    if let Some(unwind) =
+                                        state.pending_unwinds.remove(&status_event.local_order_id)
+                                    {
+                                        let topic = state.topic.clone();
+                                        notify_unwind_action(
+                                            notifier.as_ref(),
+                                            Some(topic.to_string()),
+                                            token.clone(),
+                                            unwind.local_order_id,
+                                            unwind.price,
+                                            unwind.order_size,
+                                            unwind.attempts,
+                                            "unwind-filled",
+                                            simulation_enabled,
+                                        );
+                                    }
+                                }
+                                "canceled" | "rejected" => {
+                                    if let Some(unwind) =
+                                        state.pending_unwinds.remove(&status_event.local_order_id)
+                                    {
+                                        let remaining = unwind.order_size - unwind.matched_size;
+                                        let action = if remaining > Decimal::ZERO {
+                                            "unwind-canceled-partial"
+                                        } else {
+                                            "unwind-canceled"
+                                        };
+                                        let topic = state.topic.clone();
+                                        notify_unwind_action(
+                                            notifier.as_ref(),
+                                            Some(topic.to_string()),
+                                            token.clone(),
+                                            unwind.local_order_id.clone(),
+                                            unwind.price,
+                                            unwind.order_size,
+                                            unwind.attempts,
+                                            action,
+                                            simulation_enabled,
+                                        );
+                                        if remaining > Decimal::ZERO {
+                                            submit_remaining_unwind(
+                                                &token,
+                                                state,
+                                                remaining,
+                                                simulation_enabled,
+                                                &order_tx,
+                                                notifier.as_ref(),
+                                                &tick_size_map,
+                                            );
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -475,15 +546,59 @@ impl Strategy for LiquidityRewardStrategy {
                             continue;
                         }
 
-                        // 成交（全部或部分）→ 终止整对做市（unwind 由 OrderFill 处理，此处不重复）
+                        // 成交（全部或部分）→ 终止整对做市
                         if matches!(status, "filled" | "partially_filled") {
+                            let fill_size = if is_active {
+                                state.active_order.as_ref().map(|o| o.order_size)
+                            } else {
+                                state.pending_replacement.as_ref().map(|p| p.order_size)
+                            }
+                            .unwrap_or(Decimal::ZERO);
+                            let order_price = if is_active {
+                                state.active_order.as_ref().map(|o| o.price)
+                            } else {
+                                state.pending_replacement.as_ref().map(|p| p.price)
+                            }
+                            .unwrap_or(Decimal::ZERO);
+                            let topic_str = state.topic.to_string();
+
                             info!(
                                 target: "order",
                                 token = %token,
                                 status,
                                 order_id = %status_event.local_order_id,
+                                fill_size = %fill_size,
                                 "liquidity_reward 检测到成交，终止整对做市并撤销所有订单"
                             );
+
+                            // 即时成交（Matched）WS 不推送 fill 事件，此处补发成交通知
+                            if let Some(n) = notifier.as_ref() {
+                                n.try_notify(NotificationEvent::LiquidityRewardFill(
+                                    LiquidityRewardFillNotification {
+                                        strategy: "liquidity_reward".to_string(),
+                                        topic: Some(topic_str),
+                                        token: token.to_string(),
+                                        local_order_id: status_event.local_order_id.to_string(),
+                                        remote_order_id: String::new(),
+                                        side: QuoteSide::Buy,
+                                        order_price,
+                                        order_size: fill_size,
+                                        delta_size: fill_size,
+                                        total_matched_size: fill_size,
+                                        market: String::new(),
+                                        asset_id: token.to_string(),
+                                        ws_price: order_price.to_string(),
+                                        ws_original_size: Some(fill_size.to_string()),
+                                        ws_size_matched: Some(fill_size.to_string()),
+                                        ws_status: "Matched".to_string(),
+                                        ws_msg_type: "matched".to_string(),
+                                        ws_timestamp: None,
+                                    },
+                                ));
+                            }
+
+                            // state 借用在此结束，下方 halt_pair 可重新借用 states
+                            let _ = state;
                             halt_pair(
                                 &token,
                                 &rules,
@@ -492,7 +607,7 @@ impl Strategy for LiquidityRewardStrategy {
                                 &order_tx,
                                 notifier.as_ref(),
                                 order_store.as_ref(),
-                                None,
+                                Some(fill_size),
                                 &tick_size_map,
                             );
                             continue;
@@ -542,6 +657,14 @@ impl Strategy for LiquidityRewardStrategy {
                         persist_state(order_store.as_ref(), &token, state);
                     }
                     StrategyEvent::OrderFill(fill_event) => {
+                        if let Some(state) = states.get_mut(fill_event.token.as_str()) {
+                            if let Some(unwind) =
+                                state.pending_unwinds.get_mut(&fill_event.local_order_id)
+                            {
+                                unwind.matched_size = fill_event.total_matched_size;
+                                continue;
+                            }
+                        }
                         let is_ours = states.get(fill_event.token.as_str()).is_some_and(|s| {
                             s.active_order
                                 .as_ref()
@@ -589,22 +712,98 @@ fn schedule_unwind_retry_if_needed(
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     notifier: Option<&Notifier>,
 ) {
+    let Some(mut unwind) = state.pending_unwinds.remove(local_order_id) else {
+        return;
+    };
+
+    if is_size_precision_error(reason) {
+        if unwind.size_adjusted {
+            warn!(
+                target: "order",
+                token = %token,
+                order_id = %local_order_id,
+                attempts = unwind.attempts,
+                reason = ?reason,
+                "liquidity_reward unwind 规整数量后仍失败，需要手动处理"
+            );
+            notify_unwind_action(
+                notifier,
+                Some(state.topic.to_string()),
+                token.to_string(),
+                unwind.local_order_id,
+                unwind.price,
+                unwind.order_size,
+                unwind.attempts,
+                "unwind-manual-required",
+                simulated,
+            );
+            return;
+        }
+
+        let adjusted_size = snap_unwind_size_to_lot(unwind.order_size);
+        if adjusted_size <= Decimal::ZERO {
+            warn!(
+                target: "order",
+                token = %token,
+                order_id = %local_order_id,
+                original_size = %unwind.order_size,
+                adjusted_size = %adjusted_size,
+                reason = ?reason,
+                "liquidity_reward unwind 数量规整后无有效数量，需要手动处理"
+            );
+            notify_unwind_action(
+                notifier,
+                Some(state.topic.to_string()),
+                token.to_string(),
+                unwind.local_order_id,
+                unwind.price,
+                unwind.order_size,
+                unwind.attempts,
+                "unwind-manual-required",
+                simulated,
+            );
+            return;
+        }
+
+        unwind.attempts += 1;
+        unwind.order_size = adjusted_size;
+        unwind.size_adjusted = true;
+        schedule_unwind_retry(
+            token,
+            state,
+            unwind,
+            simulated,
+            order_tx,
+            notifier,
+            "unwind-size-adjust-retry",
+            Duration::ZERO,
+        );
+        return;
+    }
+
     if !is_not_enough_balance_error(reason) {
-        let removed = state.pending_unwinds.remove(local_order_id);
         warn!(
             target: "order",
             token = %token,
             order_id = %local_order_id,
             reason = ?reason,
-            attempts = ?removed.as_ref().map(|u| u.attempts),
-            "liquidity_reward unwind 卖单失败，原因不可重试"
+            attempts = unwind.attempts,
+            "liquidity_reward unwind 卖单失败，原因不可重试，需要手动处理"
+        );
+        notify_unwind_action(
+            notifier,
+            Some(state.topic.to_string()),
+            token.to_string(),
+            unwind.local_order_id,
+            unwind.price,
+            unwind.order_size,
+            unwind.attempts,
+            "unwind-manual-required",
+            simulated,
         );
         return;
     }
 
-    let Some(mut unwind) = state.pending_unwinds.remove(local_order_id) else {
-        return;
-    };
     if unwind.attempts >= UNWIND_RETRY_MAX_ATTEMPTS {
         warn!(
             target: "order",
@@ -612,12 +811,45 @@ fn schedule_unwind_retry_if_needed(
             order_id = %local_order_id,
             attempts = unwind.attempts,
             reason = ?reason,
-            "liquidity_reward unwind 卖单余额延迟重试达到上限"
+            "liquidity_reward unwind 卖单余额延迟重试达到上限，需要手动处理"
+        );
+        notify_unwind_action(
+            notifier,
+            Some(state.topic.to_string()),
+            token.to_string(),
+            unwind.local_order_id,
+            unwind.price,
+            unwind.order_size,
+            unwind.attempts,
+            "unwind-manual-required",
+            simulated,
         );
         return;
     }
 
     unwind.attempts += 1;
+    schedule_unwind_retry(
+        token,
+        state,
+        unwind,
+        simulated,
+        order_tx,
+        notifier,
+        "unwind-retry",
+        UNWIND_RETRY_DELAY,
+    );
+}
+
+fn schedule_unwind_retry(
+    token: &str,
+    state: &mut TokenQuoteState,
+    mut unwind: PendingUnwind,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    notifier: Option<&Notifier>,
+    action: &'static str,
+    delay: Duration,
+) {
     let retry_order_id = next_unwind_retry_order_id(token, unwind.attempts);
     let topic = state.topic.clone();
     let topic_for_notify = Some(topic.to_string());
@@ -631,13 +863,13 @@ fn schedule_unwind_retry_if_needed(
     let notifier = notifier.cloned();
     let token = token.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep(UNWIND_RETRY_DELAY).await;
-        if let Err(error) = order_tx.try_send(OrderSignal::LiquidityRewardPlace {
+        if delay > Duration::ZERO {
+            tokio::time::sleep(delay).await;
+        }
+        if let Err(error) = order_tx.try_send(OrderSignal::LiquidityRewardMarketSell {
             strategy: Arc::from("liquidity_reward"),
             topic,
             token: token.clone(),
-            mid: price,
-            side: QuoteSide::Sell,
             price,
             order_size,
             local_order_id: retry_order_id.clone(),
@@ -659,6 +891,7 @@ fn schedule_unwind_retry_if_needed(
                 attempts,
                 price = %price,
                 order_size = %order_size,
+                action,
                 "liquidity_reward 已发送 unwind 重试卖单"
             );
             notify_unwind_action(
@@ -669,7 +902,7 @@ fn schedule_unwind_retry_if_needed(
                 price,
                 order_size,
                 attempts,
-                "unwind-retry",
+                action,
                 simulated,
             );
         }
@@ -713,6 +946,21 @@ fn is_not_enough_balance_error(reason: Option<&str>) -> bool {
     })
 }
 
+fn is_size_precision_error(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        let reason = reason.to_ascii_lowercase();
+        (reason.contains("decimal places") && reason.contains("maximum lot size is 2"))
+            || (reason.contains("unable to build amount")
+                && reason.contains("decimal points")
+                && reason.contains("must be <= 2"))
+    })
+}
+
+fn snap_unwind_size_to_lot(size: Decimal) -> Decimal {
+    let scale = Decimal::from(100);
+    (size * scale).floor() / scale
+}
+
 fn next_unwind_retry_order_id(token: &str, attempts: u8) -> String {
     let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = std::time::SystemTime::now()
@@ -736,6 +984,29 @@ mod tests {
         )));
         assert!(!is_not_enough_balance_error(Some("invalid price")));
         assert!(!is_not_enough_balance_error(None));
+    }
+
+    #[test]
+    fn detects_size_precision_error() {
+        assert!(is_size_precision_error(Some(
+            "Validation: invalid: Unable to build Order: Size 4.050846 has 6 decimal places. Maximum lot size is 2"
+        )));
+        assert!(is_size_precision_error(Some(
+            "Validation: invalid: Unable to build Amount with 6 decimal points, must be <= 2"
+        )));
+        assert!(!is_size_precision_error(Some(
+            "not enough balance / allowance"
+        )));
+        assert!(!is_size_precision_error(None));
+    }
+
+    #[test]
+    fn snaps_unwind_size_to_two_decimal_places() {
+        let size = Decimal::try_from(4.050846_f64).unwrap();
+        assert_eq!(
+            snap_unwind_size_to_lot(size),
+            Decimal::try_from(4.05_f64).unwrap()
+        );
     }
 
     #[test]
@@ -895,9 +1166,19 @@ fn quote_decision(
             }
             Some(active) => {
                 if active.price != target_price {
-                    QuoteAction::PlaceOrReplace {
-                        price: target_price,
-                        reason: "price_drifted",
+                    if state
+                        .pending_replacement
+                        .as_ref()
+                        .is_some_and(|p| p.price == target_price)
+                    {
+                        QuoteAction::Wait {
+                            reason: "pending_replacement_same_price",
+                        }
+                    } else {
+                        QuoteAction::PlaceOrReplace {
+                            price: target_price,
+                            reason: "price_drifted",
+                        }
                     }
                 } else {
                     QuoteAction::Wait {
@@ -996,9 +1277,19 @@ fn quote_decision(
         }
         Some(active) => {
             if active.price != desired_price {
-                QuoteAction::PlaceOrReplace {
-                    price: desired_price,
-                    reason: "target_price_changed",
+                if state
+                    .pending_replacement
+                    .as_ref()
+                    .is_some_and(|p| p.price == desired_price)
+                {
+                    QuoteAction::Wait {
+                        reason: "pending_replacement_same_price",
+                    }
+                } else {
+                    QuoteAction::PlaceOrReplace {
+                        price: desired_price,
+                        reason: "target_price_changed",
+                    }
                 }
             } else {
                 QuoteAction::Wait {
@@ -1301,12 +1592,10 @@ fn halt_pair(
         order_id = %order_id,
         "liquidity_reward 成交后立即市价卖出持仓"
     );
-    match order_tx.try_send(OrderSignal::LiquidityRewardPlace {
+    match order_tx.try_send(OrderSignal::LiquidityRewardMarketSell {
         strategy: Arc::from("liquidity_reward"),
         topic,
         token: token.to_string(),
-        mid: sell_price,
-        side: QuoteSide::Sell,
         price: sell_price,
         order_size: size,
         local_order_id: order_id.clone(),
@@ -1320,7 +1609,9 @@ fn halt_pair(
                         local_order_id: order_id.clone(),
                         price: sell_price,
                         order_size: size,
+                        matched_size: Decimal::ZERO,
                         attempts: 0,
+                        size_adjusted: false,
                     },
                 );
             }
@@ -1374,6 +1665,81 @@ fn cancel_and_halt(
         }
     }
     persist_state(order_store, token, state);
+}
+
+fn submit_remaining_unwind(
+    token: &str,
+    state: &mut TokenQuoteState,
+    remaining_size: Decimal,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    notifier: Option<&Notifier>,
+    tick_size_map: &TickSizeMap,
+) {
+    let sell_ref_price = state.last_best_bid.or(state.last_mid);
+    let Some(ref_price) = sell_ref_price else {
+        warn!(target: "order", token = %token, "liquidity_reward unwind 部分取消后无法获取买价，跳过剩余卖出");
+        return;
+    };
+    let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
+    let tick = tick_size_map.get(token).map(|v| *v).unwrap_or(default_tick);
+    let sell_price = snap_price_to_tick(ref_price, tick, true);
+    if sell_price <= Decimal::ZERO {
+        warn!(target: "order", token = %token, sell_price = %sell_price, "liquidity_reward unwind 剩余卖出价格无效，跳过");
+        return;
+    }
+    let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let order_id = format!("{}-{}-unwind-remaining-{}", token, ts, seq);
+    let topic = state.topic.clone();
+    info!(
+        target: "order",
+        token = %token,
+        sell_price = %sell_price,
+        size = %remaining_size,
+        order_id = %order_id,
+        "liquidity_reward unwind 部分取消，重新提交剩余持仓卖单"
+    );
+    match order_tx.try_send(OrderSignal::LiquidityRewardMarketSell {
+        strategy: Arc::from("liquidity_reward"),
+        topic: topic.clone(),
+        token: token.to_string(),
+        price: sell_price,
+        order_size: remaining_size,
+        local_order_id: order_id.clone(),
+        simulated,
+    }) {
+        Ok(()) => {
+            state.pending_unwinds.insert(
+                order_id.clone(),
+                PendingUnwind {
+                    local_order_id: order_id.clone(),
+                    price: sell_price,
+                    order_size: remaining_size,
+                    matched_size: Decimal::ZERO,
+                    attempts: 0,
+                    size_adjusted: false,
+                },
+            );
+            notify_unwind_action(
+                notifier,
+                Some(topic.to_string()),
+                token.to_string(),
+                order_id,
+                sell_price,
+                remaining_size,
+                0,
+                "unwind-remaining",
+                simulated,
+            );
+        }
+        Err(e) => {
+            warn!(target: "order", token = %token, error = %e, "liquidity_reward 发送 unwind 剩余卖单失败");
+        }
+    }
 }
 
 fn resolve_csv_path(csv_file: &str) -> String {

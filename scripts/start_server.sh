@@ -87,6 +87,10 @@ for src in "${liquidity_files[@]}"; do
   cp -f "$src" "$RELEASE_DIR/"
 done
 
+if [[ -f "$SCRIPT_DIR/logrotate.conf" ]] && command -v logrotate &>/dev/null; then
+  cp "$SCRIPT_DIR/logrotate.conf" /etc/logrotate.d/poly-executor 2>/dev/null || true
+fi
+
 stop_existing_processes
 
 cd "$RELEASE_DIR"
