@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use chrono::NaiveDate;
 use polymarket_client_sdk_v2::types::Decimal;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -54,6 +56,51 @@ pub struct StoredLiquidityRewardSideState {
     pub pending_mid: Option<Decimal>,
     pub last_quoted_mid: Option<Decimal>,
     pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredRewardMarketPoolState {
+    pub condition_id: String,
+    pub market_slug: Option<String>,
+    pub question: Option<String>,
+    pub token1: String,
+    pub token2: String,
+    pub in_pool: bool,
+    pub kicked_at_ms: Option<u64>,
+    pub kick_reason: Option<String>,
+}
+
+pub struct RewardMarketPoolStorageEntry<'a> {
+    pub condition_id: &'a str,
+    pub market_slug: Option<&'a str>,
+    pub question: Option<&'a str>,
+    pub token1: &'a str,
+    pub token2: &'a str,
+    pub tokens_json: &'a str,
+    pub market_competitiveness: Option<&'a str>,
+    pub rewards_min_size: Option<&'a str>,
+    pub rewards_max_spread: Option<&'a str>,
+    pub market_daily_reward: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveRewardMarketPoolEntry {
+    pub condition_id: String,
+    pub market_slug: Option<String>,
+    pub question: Option<String>,
+    pub token1: String,
+    pub token2: String,
+    pub tokens_json: String,
+    pub market_competitiveness: Option<String>,
+    pub rewards_min_size: Option<String>,
+    pub rewards_max_spread: Option<String>,
+    pub market_daily_reward: Option<String>,
+    pub build_date_utc: Option<String>,
+    pub pool_version: Option<u64>,
+    pub liquidity_reward_selected: bool,
+    pub liquidity_reward_selected_at_ms: Option<u64>,
+    pub liquidity_reward_select_reason: Option<String>,
+    pub liquidity_reward_select_rank: Option<u32>,
 }
 
 impl StoredOrder {
@@ -668,7 +715,80 @@ impl MarketStore {
 
                 CREATE INDEX IF NOT EXISTS idx_trade_events_token_ts
                     ON trade_events (token, ts_ms DESC);
+
+                CREATE TABLE IF NOT EXISTS reward_market_pool_state (
+                    condition_id TEXT PRIMARY KEY,
+                    market_slug TEXT,
+                    question TEXT,
+                    token1 TEXT NOT NULL,
+                    token2 TEXT NOT NULL,
+                    tokens_json TEXT NOT NULL,
+                    market_competitiveness TEXT,
+                    rewards_min_size TEXT,
+                    rewards_max_spread TEXT,
+                    market_daily_reward TEXT,
+                    build_date_utc TEXT,
+                    pool_version INTEGER,
+                    liquidity_reward_selected INTEGER NOT NULL DEFAULT 0,
+                    liquidity_reward_selected_at_ms INTEGER,
+                    liquidity_reward_select_reason TEXT,
+                    liquidity_reward_select_rank INTEGER,
+                    in_pool INTEGER NOT NULL DEFAULT 1,
+                    first_seen_at_ms INTEGER NOT NULL,
+                    last_seen_at_ms INTEGER NOT NULL,
+                    last_token1_best_bid TEXT,
+                    last_token1_best_ask TEXT,
+                    last_token1_spread TEXT,
+                    last_checked_at_ms INTEGER,
+                    kicked_at_ms INTEGER,
+                    kick_reason TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reward_market_pool_state_in_pool
+                    ON reward_market_pool_state (in_pool, last_seen_at_ms DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_reward_market_pool_state_kicked_at
+                    ON reward_market_pool_state (kicked_at_ms DESC);
                 ",
+            )?;
+            ensure_column(conn, "reward_market_pool_state", "build_date_utc", "TEXT")?;
+            ensure_column(conn, "reward_market_pool_state", "pool_version", "INTEGER")?;
+            ensure_column(conn, "reward_market_pool_state", "rewards_min_size", "TEXT")?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "rewards_max_spread",
+                "TEXT",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "market_daily_reward",
+                "TEXT",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_selected",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_selected_at_ms",
+                "INTEGER",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_select_reason",
+                "TEXT",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_select_rank",
+                "INTEGER",
             )?;
             Ok(())
         })
@@ -783,6 +903,240 @@ impl MarketStore {
         })
     }
 
+    pub fn replace_reward_market_pool_entries(
+        &self,
+        build_date_utc: NaiveDate,
+        pool_version: u64,
+        entries: &[RewardMarketPoolStorageEntry<'_>],
+        now_ms: u64,
+        liquidity_reward_market_count: usize,
+    ) -> anyhow::Result<usize> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> anyhow::Result<usize> {
+                conn.execute("DELETE FROM reward_market_pool_state", [])?;
+                let mut stmt = conn.prepare_cached(
+                    "
+                    INSERT INTO reward_market_pool_state (
+                        condition_id, market_slug, question, token1, token2, tokens_json,
+                        market_competitiveness, rewards_min_size, rewards_max_spread,
+                        market_daily_reward, build_date_utc, pool_version, in_pool,
+                        first_seen_at_ms, last_seen_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?13)
+                    ",
+                )?;
+                let build_date_utc = build_date_utc.to_string();
+                for entry in entries {
+                    stmt.execute(params![
+                        entry.condition_id,
+                        entry.market_slug,
+                        entry.question,
+                        entry.token1,
+                        entry.token2,
+                        entry.tokens_json,
+                        entry.market_competitiveness,
+                        entry.rewards_min_size,
+                        entry.rewards_max_spread,
+                        entry.market_daily_reward,
+                        build_date_utc,
+                        pool_version as i64,
+                        now_ms as i64,
+                    ])?;
+                }
+                mark_liquidity_reward_pool_selection_in_conn(
+                    conn,
+                    entries,
+                    liquidity_reward_market_count,
+                    now_ms,
+                )
+            })();
+            match result {
+                Ok(selected_count) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(selected_count)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    pub fn upsert_reward_market_pool_entry(
+        &self,
+        condition_id: &str,
+        market_slug: Option<&str>,
+        question: Option<&str>,
+        token1: &str,
+        token2: &str,
+        tokens_json: &str,
+        market_competitiveness: Option<&str>,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO reward_market_pool_state (
+                    condition_id, market_slug, question, token1, token2, tokens_json,
+                    market_competitiveness, in_pool, first_seen_at_ms, last_seen_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)
+                ON CONFLICT(condition_id) DO UPDATE SET
+                    market_slug = excluded.market_slug,
+                    question = excluded.question,
+                    token1 = excluded.token1,
+                    token2 = excluded.token2,
+                    tokens_json = excluded.tokens_json,
+                    market_competitiveness = excluded.market_competitiveness,
+                    in_pool = CASE
+                        WHEN reward_market_pool_state.kicked_at_ms IS NULL THEN 1
+                        ELSE reward_market_pool_state.in_pool
+                    END,
+                    last_seen_at_ms = excluded.last_seen_at_ms
+                ",
+                params![
+                    condition_id,
+                    market_slug,
+                    question,
+                    token1,
+                    token2,
+                    tokens_json,
+                    market_competitiveness,
+                    now_ms as i64,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_active_reward_market_pool_entries(
+        &self,
+    ) -> anyhow::Result<Vec<ActiveRewardMarketPoolEntry>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                SELECT condition_id, market_slug, question, token1, token2, tokens_json,
+                       market_competitiveness, rewards_min_size, rewards_max_spread,
+                       market_daily_reward, build_date_utc, pool_version,
+                       liquidity_reward_selected, liquidity_reward_selected_at_ms,
+                       liquidity_reward_select_reason, liquidity_reward_select_rank
+                FROM reward_market_pool_state
+                WHERE in_pool = 1
+                ORDER BY condition_id
+",
+            )?;
+            let rows = stmt.query_map([], |row| active_reward_market_pool_entry_from_row(row))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn load_liquidity_reward_pool_entries(
+        &self,
+    ) -> anyhow::Result<Vec<ActiveRewardMarketPoolEntry>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                SELECT condition_id, market_slug, question, token1, token2, tokens_json,
+                       market_competitiveness, rewards_min_size, rewards_max_spread,
+                       market_daily_reward, build_date_utc, pool_version,
+                       liquidity_reward_selected, liquidity_reward_selected_at_ms,
+                       liquidity_reward_select_reason, liquidity_reward_select_rank
+                FROM reward_market_pool_state
+                WHERE in_pool = 1
+                  AND liquidity_reward_selected = 1
+                ORDER BY liquidity_reward_select_rank, condition_id
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| active_reward_market_pool_entry_from_row(row))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn update_reward_market_pool_token1_check(
+        &self,
+        condition_id: &str,
+        token1_best_bid: f64,
+        token1_best_ask: f64,
+        token1_spread: f64,
+        checked_at_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                UPDATE reward_market_pool_state
+                SET last_token1_best_bid = ?2,
+                    last_token1_best_ask = ?3,
+                    last_token1_spread = ?4,
+                    last_checked_at_ms = ?5
+                WHERE condition_id = ?1
+                ",
+                params![
+                    condition_id,
+                    token1_best_bid.to_string(),
+                    token1_best_ask.to_string(),
+                    token1_spread.to_string(),
+                    checked_at_ms as i64,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn kick_reward_market_pool_entry(
+        &self,
+        condition_id: &str,
+        reason: &str,
+        kicked_at_ms: u64,
+    ) -> anyhow::Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "
+                UPDATE reward_market_pool_state
+                SET in_pool = 0,
+                    kicked_at_ms = ?2,
+                    kick_reason = ?3
+                WHERE condition_id = ?1
+                  AND in_pool = 1
+                ",
+                params![condition_id, kicked_at_ms as i64, reason],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn get_reward_market_pool_state(
+        &self,
+        condition_id: &str,
+    ) -> anyhow::Result<Option<StoredRewardMarketPoolState>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "
+                SELECT condition_id, market_slug, question, token1, token2, in_pool,
+                       kicked_at_ms, kick_reason
+                FROM reward_market_pool_state
+                WHERE condition_id = ?1
+                ",
+                params![condition_id],
+                |row| {
+                    Ok(StoredRewardMarketPoolState {
+                        condition_id: row.get(0)?,
+                        market_slug: row.get(1)?,
+                        question: row.get(2)?,
+                        token1: row.get(3)?,
+                        token2: row.get(4)?,
+                        in_pool: row.get::<_, i64>(5)? != 0,
+                        kicked_at_ms: row
+                            .get::<_, Option<i64>>(6)?
+                            .and_then(|value| u64::try_from(value).ok()),
+                        kick_reason: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let guard = self
             .conn
@@ -790,6 +1144,127 @@ impl MarketStore {
             .map_err(|_| anyhow::anyhow!("SQLite 连接锁已中毒"))?;
         f(&guard)
     }
+}
+
+struct LiquidityRewardPoolSelection<'a> {
+    condition_id: &'a str,
+    reason: &'static str,
+    rank: u32,
+}
+
+fn mark_liquidity_reward_pool_selection_in_conn(
+    conn: &Connection,
+    entries: &[RewardMarketPoolStorageEntry<'_>],
+    market_count: usize,
+    selected_at_ms: u64,
+) -> anyhow::Result<usize> {
+    let selections = select_liquidity_reward_pool_entries(entries, market_count);
+    if selections.is_empty() {
+        return Ok(0);
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "
+        UPDATE reward_market_pool_state
+        SET liquidity_reward_selected = 1,
+            liquidity_reward_selected_at_ms = ?2,
+            liquidity_reward_select_reason = ?3,
+            liquidity_reward_select_rank = ?4
+        WHERE condition_id = ?1
+        ",
+    )?;
+    for selection in &selections {
+        stmt.execute(params![
+            selection.condition_id,
+            selected_at_ms as i64,
+            selection.reason,
+            selection.rank as i64,
+        ])?;
+    }
+
+    Ok(selections.len())
+}
+
+fn select_liquidity_reward_pool_entries<'a>(
+    entries: &'a [RewardMarketPoolStorageEntry<'a>],
+    market_count: usize,
+) -> Vec<LiquidityRewardPoolSelection<'a>> {
+    if market_count == 0 {
+        return Vec::new();
+    }
+
+    let mut sorted = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .market_competitiveness
+                .and_then(|value| value.parse::<f64>().ok())
+                .map(|competitiveness| (entry, competitiveness))
+        })
+        .collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let head_count = market_count / 2;
+    let tail_count = market_count.saturating_sub(head_count);
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for (entry, _) in sorted.iter().take(head_count) {
+        if seen.insert(entry.condition_id) {
+            selected.push(LiquidityRewardPoolSelection {
+                condition_id: entry.condition_id,
+                reason: "competitiveness_low_tail",
+                rank: selected.len() as u32 + 1,
+            });
+        }
+    }
+    for (entry, _) in sorted.iter().rev().take(tail_count).rev() {
+        if seen.insert(entry.condition_id) {
+            selected.push(LiquidityRewardPoolSelection {
+                condition_id: entry.condition_id,
+                reason: "competitiveness_high_tail",
+                rank: selected.len() as u32 + 1,
+            });
+        }
+    }
+
+    selected
+}
+
+fn active_reward_market_pool_entry_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ActiveRewardMarketPoolEntry> {
+    let pool_version = row
+        .get::<_, Option<i64>>(11)?
+        .and_then(|value| u64::try_from(value).ok());
+    let liquidity_reward_selected_at_ms = row
+        .get::<_, Option<i64>>(13)?
+        .and_then(|value| u64::try_from(value).ok());
+    let liquidity_reward_select_rank = row
+        .get::<_, Option<i64>>(15)?
+        .and_then(|value| u32::try_from(value).ok());
+    Ok(ActiveRewardMarketPoolEntry {
+        condition_id: row.get(0)?,
+        market_slug: row.get(1)?,
+        question: row.get(2)?,
+        token1: row.get(3)?,
+        token2: row.get(4)?,
+        tokens_json: row.get(5)?,
+        market_competitiveness: row.get(6)?,
+        rewards_min_size: row.get(7)?,
+        rewards_max_spread: row.get(8)?,
+        market_daily_reward: row.get(9)?,
+        build_date_utc: row.get(10)?,
+        pool_version,
+        liquidity_reward_selected: row.get::<_, i64>(12)? != 0,
+        liquidity_reward_selected_at_ms,
+        liquidity_reward_select_reason: row.get(14)?,
+        liquidity_reward_select_rank,
+    })
 }
 
 fn open_sqlite_connection(path: &str) -> anyhow::Result<Connection> {
@@ -822,6 +1297,301 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
         "buy" => Ok(QuoteSide::Buy),
         "sell" => Ok(QuoteSide::Sell),
         other => Err(anyhow::anyhow!("未知 side: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reward_market_pool_state_kick_is_persistent() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        store
+            .upsert_reward_market_pool_entry(
+                "0xabc",
+                Some("slug"),
+                Some("question"),
+                "token1",
+                "token2",
+                "[]",
+                Some("1.23"),
+                100,
+            )
+            .expect("entry should insert");
+        let state = store
+            .get_reward_market_pool_state("0xabc")
+            .expect("state query should work")
+            .expect("state should exist");
+        assert!(state.in_pool);
+        assert_eq!(state.token1, "token1");
+        assert_eq!(state.token2, "token2");
+
+        store
+            .update_reward_market_pool_token1_check("0xabc", 0.45, 0.56, 0.11, 150)
+            .expect("price check should update");
+        assert!(
+            store
+                .kick_reward_market_pool_entry("0xabc", "token1_spread_gt_threshold", 200)
+                .expect("kick should update")
+        );
+        assert!(
+            !store
+                .kick_reward_market_pool_entry("0xabc", "repeat", 201)
+                .expect("second kick should be ignored")
+        );
+
+        store
+            .upsert_reward_market_pool_entry(
+                "0xabc",
+                Some("slug2"),
+                Some("question2"),
+                "token1",
+                "token2",
+                "[]",
+                Some("2.34"),
+                300,
+            )
+            .expect("upsert after kick should not restore");
+        let state = store
+            .get_reward_market_pool_state("0xabc")
+            .expect("state query should work")
+            .expect("state should exist");
+        assert!(!state.in_pool);
+        assert_eq!(state.kicked_at_ms, Some(200));
+        assert_eq!(
+            state.kick_reason.as_deref(),
+            Some("token1_spread_gt_threshold")
+        );
+        assert_eq!(state.market_slug.as_deref(), Some("slug2"));
+    }
+
+    #[test]
+    fn replace_reward_market_pool_entries_deletes_old_pool_and_resets_kick() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        store
+            .upsert_reward_market_pool_entry(
+                "0xabc",
+                Some("old"),
+                Some("old question"),
+                "token1",
+                "token2",
+                "[]",
+                Some("1.23"),
+                100,
+            )
+            .expect("entry should insert");
+        store
+            .kick_reward_market_pool_entry("0xabc", "old kick", 150)
+            .expect("kick should update");
+
+        let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xdef",
+            market_slug: Some("new"),
+            question: Some("new question"),
+            token1: "new token1",
+            token2: "new token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("2.34"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+        store
+            .replace_reward_market_pool_entries(build_date, 2, &entries, 200, 0)
+            .expect("pool should replace");
+
+        assert!(
+            store
+                .get_reward_market_pool_state("0xabc")
+                .expect("state query should work")
+                .is_none()
+        );
+        let state = store
+            .get_reward_market_pool_state("0xdef")
+            .expect("state query should work")
+            .expect("new state should exist");
+        assert!(state.in_pool);
+        assert_eq!(state.kicked_at_ms, None);
+        assert_eq!(state.kick_reason, None);
+        assert_eq!(state.market_slug.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn load_active_reward_market_pool_entries_returns_only_in_pool() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let entries = vec![
+            RewardMarketPoolStorageEntry {
+                condition_id: "0xaaa",
+                market_slug: Some("active"),
+                question: Some("active question"),
+                token1: "active token1",
+                token2: "active token2",
+                tokens_json: "[{\"token_id\":\"active token1\"}]",
+                market_competitiveness: Some("1.11"),
+                rewards_min_size: Some("100"),
+                rewards_max_spread: Some("4"),
+                market_daily_reward: Some("50"),
+            },
+            RewardMarketPoolStorageEntry {
+                condition_id: "0xbbb",
+                market_slug: Some("kicked"),
+                question: Some("kicked question"),
+                token1: "kicked token1",
+                token2: "kicked token2",
+                tokens_json: "[]",
+                market_competitiveness: Some("2.22"),
+                rewards_min_size: Some("200"),
+                rewards_max_spread: Some("5"),
+                market_daily_reward: Some("60"),
+            },
+        ];
+        store
+            .replace_reward_market_pool_entries(build_date, 123, &entries, 200, 0)
+            .expect("pool should replace");
+        store
+            .kick_reward_market_pool_entry("0xbbb", "out", 250)
+            .expect("kick should update");
+
+        let active = store
+            .load_active_reward_market_pool_entries()
+            .expect("active entries should load");
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].condition_id, "0xaaa");
+        assert_eq!(active[0].market_slug.as_deref(), Some("active"));
+        assert_eq!(active[0].token1, "active token1");
+        assert_eq!(active[0].token2, "active token2");
+        assert_eq!(active[0].tokens_json, "[{\"token_id\":\"active token1\"}]");
+        assert_eq!(active[0].rewards_min_size.as_deref(), Some("100"));
+        assert_eq!(active[0].rewards_max_spread.as_deref(), Some("4"));
+        assert_eq!(active[0].market_daily_reward.as_deref(), Some("50"));
+        assert_eq!(active[0].build_date_utc.as_deref(), Some("2026-05-04"));
+        assert_eq!(active[0].pool_version, Some(123));
+    }
+
+    #[test]
+    fn load_liquidity_reward_pool_entries_selects_competitiveness_tails() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let entries = (0..8)
+            .map(|index| RewardMarketPoolStorageEntry {
+                condition_id: match index {
+                    0 => "0x0",
+                    1 => "0x1",
+                    2 => "0x2",
+                    3 => "0x3",
+                    4 => "0x4",
+                    5 => "0x5",
+                    6 => "0x6",
+                    _ => "0x7",
+                },
+                market_slug: None,
+                question: None,
+                token1: match index {
+                    0 => "token10",
+                    1 => "token11",
+                    2 => "token12",
+                    3 => "token13",
+                    4 => "token14",
+                    5 => "token15",
+                    6 => "token16",
+                    _ => "token17",
+                },
+                token2: match index {
+                    0 => "token20",
+                    1 => "token21",
+                    2 => "token22",
+                    3 => "token23",
+                    4 => "token24",
+                    5 => "token25",
+                    6 => "token26",
+                    _ => "token27",
+                },
+                tokens_json: "[]",
+                market_competitiveness: match index {
+                    0 => Some("0"),
+                    1 => Some("1"),
+                    2 => Some("2"),
+                    3 => Some("3"),
+                    4 => Some("4"),
+                    5 => Some("5"),
+                    6 => Some("6"),
+                    _ => Some("7"),
+                },
+                rewards_min_size: Some("100"),
+                rewards_max_spread: Some("4"),
+                market_daily_reward: Some("50"),
+            })
+            .collect::<Vec<_>>();
+        store
+            .replace_reward_market_pool_entries(build_date, 123, &entries, 200, 6)
+            .expect("pool should replace");
+        let selected = store
+            .load_liquidity_reward_pool_entries()
+            .expect("pool entries should load");
+        let condition_ids = selected
+            .iter()
+            .map(|entry| entry.condition_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            condition_ids,
+            vec!["0x0", "0x1", "0x2", "0x5", "0x6", "0x7"]
+        );
+        assert!(selected.iter().all(|entry| entry.liquidity_reward_selected));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|entry| entry.liquidity_reward_select_reason.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("competitiveness_low_tail"),
+                Some("competitiveness_low_tail"),
+                Some("competitiveness_low_tail"),
+                Some("competitiveness_high_tail"),
+                Some("competitiveness_high_tail"),
+                Some("competitiveness_high_tail"),
+            ]
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|entry| entry.liquidity_reward_select_rank)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|entry| entry.liquidity_reward_selected_at_ms)
+                .collect::<Vec<_>>(),
+            vec![Some(200); 6]
+        );
+
+        store
+            .kick_reward_market_pool_entry("0x6", "out", 250)
+            .expect("kick should update");
+        let selected_after_kick = store
+            .load_liquidity_reward_pool_entries()
+            .expect("pool entries should load");
+        let condition_ids_after_kick = selected_after_kick
+            .iter()
+            .map(|entry| entry.condition_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            condition_ids_after_kick,
+            vec!["0x0", "0x1", "0x2", "0x5", "0x7"]
+        );
     }
 }
 

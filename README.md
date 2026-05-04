@@ -7,6 +7,7 @@ Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流
 ## 目录
 
 - [功能概览](#功能概览)
+- [当前整体情况](#当前整体情况)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [CSV 文件格式](#csv-文件格式)
@@ -26,6 +27,62 @@ Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流
 | 行情录制 | 可选将 best tick / 全量订单簿快照 / 成交事件异步写入 SQLite |
 | 奖励监控 | 实时估算做市奖励得分并落盘；定期轮询 Polymarket 奖励 API |
 | 代理支持 | 支持 SOCKS5 / HTTP 代理连接 WebSocket |
+
+---
+
+## 当前整体情况
+
+当前工程以 Polymarket 自动化交易为主，主流程由 `main.rs` 串起：加载配置，初始化订单库和行情库，启动恢复流程，创建策略，连接公开行情 WebSocket、私有订单 WebSocket、持仓刷新、订单执行和可选的奖励市场池任务。
+
+### 运行链路
+
+```text
+公开行情 WS -> market.rs 本地订单簿 -> dispatcher.rs -> 策略
+策略 OrderSignal -> order.rs -> Polymarket CLOB / 模拟成交 -> orders.db
+私有订单 WS -> order_ws.rs -> orders.db / 策略成交事件 / 钉钉通知
+启动恢复 -> recovery.rs -> orders.db + 远端 open/trades -> OrderCorrelationMap + 策略状态
+奖励市场加载/监听 -> reward_market_cache.rs / reward_market_pool_monitor.rs -> market.db
+```
+
+### 当前策略
+
+- `PairArbitrage`：读取 `assets.csv`，发现 `1 - (ask0 + ask1) > min_diff` 后发出配对套利信号。
+- `LiquidityReward`：读取 CSV 或 DB selected pool，按 token pair 做流动性奖励挂单。策略只主动挂买单；任一侧成交后会 halt 整对 token，撤掉未成交买单，并尝试用 FAK 卖单 unwind 已成交仓位。
+
+### LiquidityReward 当前状态机重点
+
+- 每个 token 正常只允许一张 active 买单。
+- 换价采用两阶段：先写 `pending_replacement` 并请求撤 active，收到旧单 `canceled` 后才 promote 新单。
+- `token1/token2` 必须属于同一市场 pair；配错会导致 halt、unwind 和单边状态串到错误市场。
+- 成交由私有订单 WS 或下单即成交状态驱动；如果远端订单没有本地 `orders` 记录和 correlation，系统无法自动发钉钉、无法触发 halt/unwind。
+- 删除本地 `orders.db` 不会取消远端 open orders；远端孤儿单仍可能占用余额并继续成交。
+- 遇到 `not enough balance / allowance` 后，策略进入账户级余额冷却，暂停新买单和 pending promote；撤单和 unwind 不受冷却影响。
+
+### 当前流动性奖励市场来源
+
+`[liquidity_reward] source` 控制策略市场来源：
+
+- `csv`：默认值，从 `liquidity_reward.csv` 读取固定市场。
+- `db_pool`：从行情库 `reward_market_pool_state` 中读取 `liquidity_reward_selected=1` 且仍在池内的市场。
+
+即使策略来源仍是 `csv`，当 `liquidity_reward.enabled=true`、`monitor_enabled=true` 且非全局模拟模式时，奖励市场 loader/monitor 仍会启动并维护 `market.db` 中的奖励市场池；它不一定会被策略采用，除非 `source="db_pool"`。
+
+### 奖励市场池当前规则
+
+奖励市场池每天按 UTC 日期构建一次，成功后等待下一个 UTC 零点；失败会保留旧数据并按监控间隔重试。当前默认筛选规则：
+
+1. 每日奖励 `market_daily_reward > 50`。
+2. 距离市场结束时间大于 48 小时。
+3. 按 `market_competitiveness` 排序，去掉前 20% 和后 20%。
+4. 从剩余市场中选择可配置数量 `pool_market_count`：头部一半和尾部一半写入 `liquidity_reward_selected=1`。
+5. pool monitor 订阅 selected/active 市场 token；只检查 `token1`，若 spread 大于 `0.1` 或 best bid 不在 `[0.1, 0.9]`，则把市场标记踢出池。
+
+### 数据库边界
+
+- `orders.db` 是订单恢复真相来源，保存本地订单、远端订单 ID、订单事件、策略 active/pending 状态。
+- `market.db` 是行情、奖励估算和奖励市场池来源，保存 tick/raw book、Q-score 估算和 pool 状态。
+- 启动恢复只会基于本地非终结订单去远端 reconcile；它不会在本地 DB 为空时反向导入所有远端 open orders。
+- 真实模式排障时必须同时确认：运行进程、实际配置路径、实际 `sqlite_path`、远端 open orders、本地订单库和订单日志。
 
 ---
 
@@ -109,10 +166,13 @@ cargo build --release
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `false` | 是否启用流动性奖励做市策略 |
-| `file` | String | `"liquidity_reward.csv"` | 做市规则 CSV 文件路径 |
-| `monitor_enabled` | bool | `false` | 是否启动奖励监控轮询任务（非模拟模式下生效） |
+| `file` | String | `"liquidity_reward.csv"` | CSV 来源下的做市规则文件路径 |
+| `source` | String | `"csv"` | 做市市场来源：`csv` 从文件读取；`db_pool` 从 `market.db.reward_market_pool_state` 的 selected 市场读取 |
+| `pool_market_count` | usize | `6` | 每日奖励市场池中标记给 liquidity reward 策略使用的市场数量 |
+| `monitor_enabled` | bool | `false` | 是否启动奖励监控、奖励市场 loader 和 pool monitor（非模拟模式下生效） |
 | `reward_estimator_enabled` | bool | `true` | 是否启用本地 Q-score 奖励估算；开启后写入行情库 `liquidity_reward_scores` 表 |
 | `simulation` | bool | `false` | 做市策略内部模拟开关，独立于全局 `[simulation]`；模拟模式下奖励得分写入时会打 `simulation=1` 标记 |
+| `balance_cooldown_secs` | u64 | `60` | 余额或 allowance 不足时暂停新买单和 pending promote 的秒数 |
 
 > 注：`[liquidity_reward]` 在代码中兼容历史别名 `[mid_requote]`。
 
@@ -381,6 +441,7 @@ replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacemen
 | `market_ticks` | `tick_store_enabled=true` | best bid/ask 变化时的 tick 记录；price/size 精度为 1/10000 的整数 |
 | `book_snapshots` | `raw_store_enabled=true` | 全量订单簿快照；`bids`/`asks` 为 BLOB，格式：每档 6 字节 = `price(u16 LE)` + `size(u32 LE)` |
 | `trade_events` | `raw_store_enabled=true` | `last_trade_price` 成交事件；字段：`token`、`market`、`price`、`side`、`size`、`fee_rate`、`ts_ms` |
+| `reward_market_pool_state` | `monitor_enabled=true` 且非模拟模式 | 每日奖励市场池状态；包含 token1/token2、competitiveness、奖励参数、是否仍在池、踢出原因，以及是否被选入 liquidity reward 策略 |
 
 旧版本已经写在订单库里的行情表不会自动迁移或删除；新版本只保证新增行情/模拟/奖励估算数据写入行情库。
 
@@ -409,8 +470,10 @@ def parse_levels(blob: bytes) -> list[tuple[float, float]]:
 | `order.rs` | 接收策略的 `OrderSignal`，真实或模拟下单，写订单日志和 SQLite |
 | `order_ws.rs` | 连接 Polymarket 私有订单频道，实时回写订单状态 |
 | `positions.rs` | 真实模式拉取持仓；模拟模式维护内存仓位 |
-| `monitor.rs` | 实时估算做市奖励得分；定期轮询 Polymarket 奖励 API |
-| `recovery.rs` | 启动时从 SQLite 恢复订单关联关系和做市挂单状态 |
-| `storage.rs` | SQLite 封装；WAL + NORMAL sync 模式 |
+| `monitor.rs` | 实时估算做市奖励得分；监控 liquidity reward 相关订单和行情 |
+| `reward_market_cache.rs` | 拉取 Polymarket 当前奖励市场和市场详情，按规则构建每日奖励市场池并写入行情库 |
+| `reward_market_pool_monitor.rs` | 动态订阅奖励市场池行情，按 token1 spread 和 bid 区间把不合格市场踢出池 |
+| `recovery.rs` | 启动时从 SQLite 恢复订单关联关系和做市挂单状态，并和远端订单/成交保守对账 |
+| `storage.rs` | SQLite 封装；订单库与行情库分离，使用 WAL + NORMAL sync 模式 |
 | `proxy_ws.rs` | SOCKS5 / HTTP 代理 WebSocket 连接层 |
 | `polymarket_rewards.rs` | Polymarket 官方 Q-score 做市奖励积分计算算法 |

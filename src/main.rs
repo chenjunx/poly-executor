@@ -12,6 +12,8 @@ mod positions;
 mod price_store;
 mod proxy_ws;
 mod recovery;
+mod reward_market_cache;
+mod reward_market_pool_monitor;
 mod storage;
 mod strategies;
 mod strategy;
@@ -119,7 +121,14 @@ async fn main() -> anyhow::Result<()> {
         "liquidity_reward.csv"
     };
     let liquidity_reward_strategy_opt = if app_config.liquidity_reward.enabled {
-        LiquidityRewardStrategy::from_csv(liquidity_reward_file)?
+        match app_config.liquidity_reward.source.as_str() {
+            "csv" | "" => LiquidityRewardStrategy::from_csv(liquidity_reward_file)?,
+            "db_pool" => {
+                let entries = market_store.load_liquidity_reward_pool_entries()?;
+                LiquidityRewardStrategy::from_pool_entries(entries)?
+            }
+            other => return Err(anyhow::anyhow!("未知 liquidity_reward.source: {other}")),
+        }
     } else {
         None
     };
@@ -174,6 +183,9 @@ async fn main() -> anyhow::Result<()> {
                 lr_simulation,
                 tick_size_map.clone(),
             )
+            .with_balance_cooldown(std::time::Duration::from_secs(
+                app_config.liquidity_reward.balance_cooldown_secs,
+            ))
             .with_notifier(notifier.clone())
     });
 
@@ -190,6 +202,11 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or_default(),
     );
+    let proxy = if !app_config.proxy.url.is_empty() {
+        proxy_ws::Proxy::from_raw(&app_config.proxy.url)
+    } else {
+        proxy_ws::Proxy::from_env()
+    };
 
     if app_config.liquidity_reward.enabled
         && app_config.liquidity_reward.monitor_enabled
@@ -199,6 +216,26 @@ async fn main() -> anyhow::Result<()> {
             app_config.auth.clone(),
             app_config.app.monitor_interval_secs.max(1),
             liquidity_reward_tokens.clone(),
+        ));
+        let reward_market_monitor_interval =
+            std::time::Duration::from_secs(app_config.app.monitor_interval_secs.max(60));
+        let reward_market_loader_retry_interval = reward_market_monitor_interval;
+        tokio::spawn(reward_market_cache::run_reward_market_loader(
+            app_config.auth.clone(),
+            market_store.clone(),
+            reward_market_loader_retry_interval,
+            app_config.liquidity_reward.pool_market_count,
+        ));
+        tokio::spawn(reward_market_pool_monitor::run_reward_market_pool_monitor(
+            market_store.clone(),
+            proxy.clone(),
+            reward_market_pool_monitor::RewardMarketPoolMonitorConfig {
+                refresh_interval: reward_market_monitor_interval,
+                token1_spread_threshold: 0.1,
+                token1_min_bid: 0.1,
+                token1_max_bid: 0.9,
+                max_tokens_per_connection: 200,
+            },
         ));
     }
 
@@ -218,11 +255,6 @@ async fn main() -> anyhow::Result<()> {
     info!("正在连接 Polymarket WebSocket...");
     info!(token_count, "开始监听 token 价格变动");
 
-    let proxy = if !app_config.proxy.url.is_empty() {
-        proxy_ws::Proxy::from_raw(&app_config.proxy.url)
-    } else {
-        proxy_ws::Proxy::from_env()
-    };
     let default_threads = app_config.app.default_threads.max(1);
 
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * topic_tokens.len().max(1));

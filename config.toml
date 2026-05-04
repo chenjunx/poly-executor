@@ -25,6 +25,7 @@ enabled = true
 file = "liquidity_reward.csv"
 monitor_enabled = true
 reward_estimator_enabled = false   # false 时关闭本地 Q-score 估算，不再写 liquidity_reward_scores 表
+balance_cooldown_secs = 60          # 余额/allowance 不足时暂停新买单的秒数
 
 [app]
 # 告警日志文件名

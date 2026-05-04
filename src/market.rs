@@ -23,6 +23,26 @@ struct LocalOrderbook {
     market: String,
 }
 
+pub(crate) struct MarketBookCache {
+    books: HashMap<String, LocalOrderbook>,
+}
+
+impl MarketBookCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            books: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn apply(&mut self, msg: &WsMessage) -> Vec<(Arc<str>, CleanOrderbook)> {
+        apply_market_message(&mut self.books, msg)
+    }
+
+    fn local_state(&self, asset_id: &str) -> Option<&LocalOrderbook> {
+        self.books.get(asset_id)
+    }
+}
+
 impl LocalOrderbook {
     fn apply_book(&mut self, book: &BookUpdate) -> Option<CleanOrderbook> {
         self.bids.clear();
@@ -295,7 +315,7 @@ pub async fn run(
     raw_store_tx: Option<tokio::sync::mpsc::Sender<RawStoreEvent>>,
     tick_size_map: TickSizeMap,
 ) {
-    let mut books: HashMap<String, LocalOrderbook> = HashMap::new();
+    let mut book_cache = MarketBookCache::new();
 
     while let Some(msg) = ws_rx.recv().await {
         if let WsMessage::TickSizeChange(change) = &msg {
@@ -317,7 +337,7 @@ pub async fn run(
             }
         }
 
-        let events = apply_market_message(&mut books, &msg);
+        let events = book_cache.apply(&msg);
         if events.is_empty() {
             continue;
         }
@@ -335,7 +355,7 @@ pub async fn run(
             }
 
             if let Some(ref tx) = monitor_tx {
-                if let Some(state) = books.get(asset_id.as_ref()) {
+                if let Some(state) = book_cache.local_state(asset_id.as_ref()) {
                     let _ = tx.try_send(FullBookSnapshot {
                         asset_id: asset_id.clone(),
                         bids: Arc::new(state.bids.clone()),
@@ -346,7 +366,7 @@ pub async fn run(
             }
 
             if let Some(ref tx) = raw_store_tx {
-                if let Some(state) = books.get(asset_id.as_ref()) {
+                if let Some(state) = book_cache.local_state(asset_id.as_ref()) {
                     let _ = tx.try_send(RawStoreEvent::Book {
                         token: asset_id.to_string(),
                         market: state.market.clone(),

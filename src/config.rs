@@ -66,18 +66,39 @@ pub(crate) struct SimulationConfig {
     pub(crate) enabled: bool,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct LiquidityRewardConfig {
     #[serde(default)]
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) file: String,
+    #[serde(default = "default_liquidity_reward_source")]
+    pub(crate) source: String,
+    #[serde(default = "default_liquidity_reward_pool_market_count")]
+    pub(crate) pool_market_count: usize,
     #[serde(default)]
     pub(crate) monitor_enabled: bool,
     #[serde(default)]
     pub(crate) simulation: bool,
     #[serde(default = "default_true")]
     pub(crate) reward_estimator_enabled: bool,
+    #[serde(default = "default_liquidity_reward_balance_cooldown_secs")]
+    pub(crate) balance_cooldown_secs: u64,
+}
+
+impl Default for LiquidityRewardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file: String::new(),
+            source: default_liquidity_reward_source(),
+            pool_market_count: default_liquidity_reward_pool_market_count(),
+            monitor_enabled: false,
+            simulation: false,
+            reward_estimator_enabled: default_true(),
+            balance_cooldown_secs: default_liquidity_reward_balance_cooldown_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -114,6 +135,18 @@ impl Default for DingtalkConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_liquidity_reward_source() -> String {
+    "csv".to_string()
+}
+
+fn default_liquidity_reward_pool_market_count() -> usize {
+    6
+}
+
+fn default_liquidity_reward_balance_cooldown_secs() -> u64 {
+    60
 }
 
 fn default_dingtalk_timeout_secs() -> u64 {
