@@ -675,8 +675,8 @@ impl Strategy for LiquidityRewardStrategy {
                             continue;
                         }
 
-                        // 成交（全部或部分）→ 终止整对做市
-                        if matches!(status, "filled" | "partially_filled") {
+                        // partially_filled 必须走 OrderFill.delta_size；这里仅处理下单接口直接 Matched 的整单成交。
+                        if status == "filled" {
                             let fill_size = if is_active {
                                 state.active_order.as_ref().map(|o| o.order_size)
                             } else {
