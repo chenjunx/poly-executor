@@ -22,12 +22,14 @@ use crate::strategy::{OrderCorrelationMap, QuoteSide};
 
 const END_CURSOR: &str = "LTE=";
 
+// 启动恢复负责把 orders.db 的 active 订单与远端 CLOB 状态重新对齐。
 pub struct RecoveryCoordinator {
     order_store: OrderStore,
     auth: AuthConfig,
     simulation_enabled: bool,
 }
 
+// 恢复产物会交给订单执行器和策略，作为重启后继续管理存量订单的入口。
 pub struct RecoveryArtifacts {
     pub order_correlations: OrderCorrelationMap,
     pub liquidity_reward_restore_states: HashMap<String, LiquidityRewardRestoreState>,
@@ -43,6 +45,7 @@ impl RecoveryCoordinator {
     }
 
     pub async fn recover(&self) -> anyhow::Result<RecoveryArtifacts> {
+        // 先读取本地快照，再用远端状态筛掉不可恢复订单，最后重建策略内存状态。
         let local_projection = self.load_local_projection()?;
         let reconciled_active_orders = self
             .reconcile_orders_against_exchange(local_projection.active_orders)
@@ -73,6 +76,7 @@ impl RecoveryCoordinator {
         &self,
         stored_orders: Vec<StoredOrder>,
     ) -> anyhow::Result<Vec<StoredOrder>> {
+        // 模拟模式没有远端订单，直接信任本地 active 记录。
         if self.simulation_enabled {
             return Ok(stored_orders);
         }
@@ -80,6 +84,7 @@ impl RecoveryCoordinator {
         let client = build_authenticated_clob_client(&self.auth)
             .await
             .map_err(|e| anyhow::anyhow!("启动恢复：构建 Polymarket CLOB 客户端失败: {e:#}"))?;
+        // 先批量拉 open orders，只有本地 active 但不在 open 列表里的订单才逐个查询。
         let remote_open_orders = fetch_remote_open_orders(&client)
             .await
             .map_err(|e| anyhow::anyhow!("启动恢复：拉取 Polymarket open orders 失败: {e:#}"))?;
@@ -104,6 +109,7 @@ impl RecoveryCoordinator {
         stored_order: StoredOrder,
     ) -> anyhow::Result<Option<StoredOrder>> {
         let Some(remote_order_id) = stored_order.remote_order_id.as_deref() else {
+            // 没有远端 id 的订单不能继续被 order_ws 或撤单逻辑可靠关联。
             self.mark_missing_remote_order_id_unknown(&stored_order)?;
             return Ok(None);
         };
@@ -230,6 +236,7 @@ impl RecoveryCoordinator {
         &self,
         reconciled_active_orders: &[StoredOrder],
     ) -> anyhow::Result<OrderCorrelationMap> {
+        // 同一份 meta 同时按 local id 和 remote id 索引，方便策略与私有 WS 双向回查。
         let order_correlations: OrderCorrelationMap = Arc::new(DashMap::new());
 
         for stored_order in reconciled_active_orders {
@@ -268,6 +275,7 @@ struct LocalProjection {
 async fn fetch_remote_open_orders(
     client: &AuthenticatedClobClient,
 ) -> anyhow::Result<HashMap<String, OpenOrderResponse>> {
+    // Polymarket 分页以固定 END_CURSOR 表示结束，不能只看 cursor 是否为空。
     let mut remote_open_orders = HashMap::new();
     let mut cursor: Option<String> = None;
 
@@ -294,6 +302,7 @@ fn build_liquidity_reward_restore_states(
     order_correlations: &OrderCorrelationMap,
     simulation_enabled: bool,
 ) -> HashMap<String, LiquidityRewardRestoreState> {
+    // shared 保存行情上下文，side 保存买/卖两侧订单状态；恢复时需要重新合并。
     let mut restored_liquidity_reward_states =
         restore_liquidity_reward_states_from_shared_states(shared_states);
 
@@ -397,6 +406,7 @@ fn recoverable_order_matches_side(
     side: QuoteSide,
     simulation_enabled: bool,
 ) -> bool {
+    // 真实模式必须有 remote id，否则重启后无法确认、撤销或接收该订单后续状态。
     order_correlations.get(order_id).is_some_and(|entry| {
         entry.side == side && (simulation_enabled || entry.remote_order_id.is_some())
     })
@@ -458,6 +468,7 @@ async fn infer_missing_remote_terminal_status(
     client: &AuthenticatedClobClient,
     stored_order: &StoredOrder,
 ) -> anyhow::Result<&'static str> {
+    // 订单查不到时再查 token 成交，用 maker order id 判断它是否已成交。
     let request = TradesRequest::builder()
         .asset_id(U256::from_str(&stored_order.token)?)
         .build();
