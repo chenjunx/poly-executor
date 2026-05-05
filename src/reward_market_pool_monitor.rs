@@ -5,9 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::market::MarketBookCache;
+use crate::notification::{LiquidityRewardPoolRemovalNotification, NotificationEvent, Notifier};
 use crate::proxy_ws;
 use crate::storage::{ActiveRewardMarketPoolEntry, MarketStore};
-use crate::strategy::CleanOrderbook;
+use crate::strategy::{CleanOrderbook, RewardPoolRemovalEvent, StrategyEvent};
 
 const PRICE_SCALE: f64 = 10_000.0;
 
@@ -17,6 +18,8 @@ pub struct RewardMarketPoolMonitorConfig {
     pub token1_min_bid: f64,
     pub token1_max_bid: f64,
     pub max_tokens_per_connection: usize,
+    pub strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
+    pub notifier: Option<Notifier>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +187,7 @@ fn evaluate_token1_book(
         );
         if store.kick_reward_market_pool_entry(&pair.condition_id, &reason, now)? {
             info!(target: "order", condition_id = %pair.condition_id, token1 = %pair.token1, spread, "reward_market_pool_monitor 奖励市场踢出");
+            notify_pool_removal(pair, &reason, bid, ask, spread, config);
         }
         return Ok(());
     }
@@ -195,10 +199,49 @@ fn evaluate_token1_book(
         );
         if store.kick_reward_market_pool_entry(&pair.condition_id, &reason, now)? {
             info!(target: "order", condition_id = %pair.condition_id, token1 = %pair.token1, bid, "reward_market_pool_monitor 奖励市场踢出");
+            notify_pool_removal(pair, &reason, bid, ask, spread, config);
         }
     }
 
     Ok(())
+}
+
+fn notify_pool_removal(
+    pair: &RewardMarketPoolPair,
+    reason: &str,
+    bid: f64,
+    ask: f64,
+    spread: f64,
+    config: &RewardMarketPoolMonitorConfig,
+) {
+    if let Err(error) = config
+        .strategy_tx
+        .try_send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+            condition_id: pair.condition_id.clone(),
+            token1: pair.token1.clone(),
+            token2: pair.token2.clone(),
+            reason: reason.to_string(),
+        }))
+    {
+        warn!(target: "order", condition_id = %pair.condition_id, error = %error, "reward_market_pool_monitor 投递奖励池剔除事件失败");
+    }
+
+    if let Some(notifier) = config.notifier.as_ref() {
+        notifier.try_notify(NotificationEvent::LiquidityRewardPoolRemoval(
+            LiquidityRewardPoolRemovalNotification {
+                strategy: "liquidity_reward".to_string(),
+                condition_id: pair.condition_id.clone(),
+                market_slug: pair.market_slug.clone(),
+                question: pair.question.clone(),
+                token1: pair.token1.clone(),
+                token2: pair.token2.clone(),
+                reason: reason.to_string(),
+                token1_best_bid: Some(bid.to_string()),
+                token1_best_ask: Some(ask.to_string()),
+                token1_spread: Some(spread.to_string()),
+            },
+        ));
+    }
 }
 
 fn scaled_price_to_f64(price: u16) -> f64 {
@@ -265,6 +308,10 @@ mod tests {
             liquidity_reward_selected_at_ms: None,
             liquidity_reward_select_reason: None,
             liquidity_reward_select_rank: None,
+            liquidity_reward_halted: false,
+            liquidity_reward_halted_at_ms: None,
+            liquidity_reward_halt_reason: None,
+            liquidity_reward_halted_pool_version: None,
         }];
 
         let pairs = pool_pairs_from_active_entries(entries);

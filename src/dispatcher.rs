@@ -101,6 +101,28 @@ impl Dispatcher {
                         }
                     }
                 }
+                StrategyEvent::RewardPoolRemoval(removal_event) => {
+                    let mut notified: std::collections::HashSet<Arc<str>> =
+                        std::collections::HashSet::new();
+                    for token in [&removal_event.token1, &removal_event.token2] {
+                        let Some(strategies) = self.position_routes.get(token) else {
+                            continue;
+                        };
+                        for strategy in strategies {
+                            if !notified.insert(strategy.name.clone()) {
+                                continue;
+                            }
+                            if let Err(err) = strategy.tx.try_send(event.clone()) {
+                                warn!(
+                                    strategy = %strategy.name,
+                                    condition_id = %removal_event.condition_id,
+                                    error = %err,
+                                    "dispatcher 投递奖励池剔除事件失败"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

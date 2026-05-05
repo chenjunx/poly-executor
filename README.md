@@ -63,7 +63,7 @@ Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流
 `[liquidity_reward] source` 控制策略市场来源：
 
 - `csv`：默认值，从 `liquidity_reward.csv` 读取固定市场。
-- `db_pool`：从行情库 `reward_market_pool_state` 中读取 `liquidity_reward_selected=1` 且仍在池内的市场。
+- `db_pool`：从行情库 `reward_market_pool_state` 中读取 `liquidity_reward_selected=1`、仍在池内、且当前 `pool_version` 未被 halt 的市场。
 
 即使策略来源仍是 `csv`，当 `liquidity_reward.enabled=true`、`monitor_enabled=true` 且非全局模拟模式时，奖励市场 loader/monitor 仍会启动并维护 `market.db` 中的奖励市场池；它不一定会被策略采用，除非 `source="db_pool"`。
 
@@ -75,7 +75,9 @@ Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流
 2. 距离市场结束时间大于 48 小时。
 3. 按 `market_competitiveness` 排序，去掉前 20% 和后 20%。
 4. 从剩余市场中选择可配置数量 `pool_market_count`：头部一半和尾部一半写入 `liquidity_reward_selected=1`。
-5. pool monitor 订阅 selected/active 市场 token；只检查 `token1`，若 spread 大于 `0.1` 或 best bid 不在 `[0.1, 0.9]`，则把市场标记踢出池。
+5. pool monitor 订阅 selected/active 市场 token；只检查 `token1`，若 spread 大于 `0.1` 或 best bid 不在 `[0.1, 0.9]`，则把市场标记踢出池，通知策略 halt/cancel/unwind，并发送钉钉剔除通知。
+6. UTC 重建池子时，旧 selected 市场如果不在新池子中，会通知策略停止该 token pair；新 selected 市场不会热加入，需等进程下次从 DB pool 构建策略。
+7. loader 启动时会读取 DB 中最新 `build_date_utc/pool_version`；如果当天 UTC 池子已构建，则不会因为进程重启立即重刷。
 
 ### 数据库边界
 
@@ -399,6 +401,10 @@ replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacemen
 
 真实订单 WebSocket 检测到成交增量时，若启用了 `[notification.dingtalk]`，会异步发送钉钉通知，通知失败不影响 halt 和撤单流程。
 
+当策略来源为 `db_pool` 时，halt 会持久化到当前池子版本：`reward_market_pool_state.liquidity_reward_halted=1`，并记录 `liquidity_reward_halted_pool_version`、`liquidity_reward_halted_at_ms` 和 `liquidity_reward_halt_reason`。进程重启后，同一个 `pool_version` 下已 halted 的市场不会再次进入策略；UTC 重新构建池子生成新 `pool_version` 后，旧 halt 不再阻止该市场重新参与策略。
+
+奖励池 monitor 踢出市场、以及 UTC 重建时旧 selected 市场消失，也会走同一套 halt/cancel/unwind 保护；其中 monitor 踢出还会发送钉钉剔除通知。
+
 ---
 
 #### 关键订单日志 reason
@@ -441,7 +447,7 @@ replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacemen
 | `market_ticks` | `tick_store_enabled=true` | best bid/ask 变化时的 tick 记录；price/size 精度为 1/10000 的整数 |
 | `book_snapshots` | `raw_store_enabled=true` | 全量订单簿快照；`bids`/`asks` 为 BLOB，格式：每档 6 字节 = `price(u16 LE)` + `size(u32 LE)` |
 | `trade_events` | `raw_store_enabled=true` | `last_trade_price` 成交事件；字段：`token`、`market`、`price`、`side`、`size`、`fee_rate`、`ts_ms` |
-| `reward_market_pool_state` | `monitor_enabled=true` 且非模拟模式 | 每日奖励市场池状态；包含 token1/token2、competitiveness、奖励参数、是否仍在池、踢出原因，以及是否被选入 liquidity reward 策略 |
+| `reward_market_pool_state` | `monitor_enabled=true` 且非模拟模式 | 每日奖励市场池状态；包含 token1/token2、competitiveness、奖励参数、是否仍在池、踢出原因、是否被选入 liquidity reward 策略，以及当前池子版本内是否已被 halt |
 
 旧版本已经写在订单库里的行情表不会自动迁移或删除；新版本只保证新增行情/模拟/奖励估算数据写入行情库。
 

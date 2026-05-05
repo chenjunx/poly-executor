@@ -10,7 +10,11 @@ use tracing::{info, warn};
 
 use crate::clob_client::{AuthenticatedClobClient, build_authenticated_clob_client};
 use crate::config::AuthConfig;
-use crate::storage::{MarketStore, RewardMarketPoolStorageEntry};
+use crate::storage::{
+    MarketStore, RemovedLiquidityRewardPoolEntry, RewardMarketPoolStorageEntry,
+    StoredRewardMarketPoolMeta,
+};
+use crate::strategy::{RewardPoolRemovalEvent, StrategyEvent};
 
 #[derive(Clone)]
 pub struct RewardMarketPoolEntry {
@@ -122,10 +126,17 @@ pub async fn run_reward_market_loader(
     store: MarketStore,
     refresh_interval: Duration,
     liquidity_reward_market_count: usize,
+    strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 ) {
     let pool_rules = RewardMarketPoolRules::default_active_pool();
     let retry_interval = refresh_interval.max(Duration::from_secs(60));
-    let mut last_success_meta: Option<RewardMarketPoolMeta> = None;
+    let mut last_success_meta = match load_initial_reward_market_pool_meta(&store) {
+        Ok(meta) => meta,
+        Err(error) => {
+            warn!(target: "order", error = %error, "reward_market_loader 读取已有奖励市场池构建状态失败，将按需重建");
+            None
+        }
+    };
     loop {
         let now = Utc::now();
         let build_date_utc = now.date_naive();
@@ -140,6 +151,7 @@ pub async fn run_reward_market_loader(
             &pool_rules,
             build_date_utc,
             liquidity_reward_market_count,
+            &strategy_tx,
         )
         .await
         {
@@ -167,12 +179,29 @@ pub async fn run_reward_market_loader(
     }
 }
 
+fn load_initial_reward_market_pool_meta(
+    store: &MarketStore,
+) -> anyhow::Result<Option<RewardMarketPoolMeta>> {
+    Ok(store
+        .load_latest_reward_market_pool_meta()?
+        .map(reward_market_pool_meta_from_storage))
+}
+
+fn reward_market_pool_meta_from_storage(meta: StoredRewardMarketPoolMeta) -> RewardMarketPoolMeta {
+    RewardMarketPoolMeta {
+        build_date_utc: meta.build_date_utc,
+        version: meta.version,
+        built_at_ms: meta.built_at_ms,
+    }
+}
+
 async fn load_reward_markets_once(
     auth: &AuthConfig,
     store: &MarketStore,
     pool_rules: &RewardMarketPoolRules,
     build_date_utc: NaiveDate,
     liquidity_reward_market_count: usize,
+    strategy_tx: &tokio::sync::mpsc::Sender<StrategyEvent>,
 ) -> anyhow::Result<RewardMarketPoolMeta> {
     let client = build_authenticated_clob_client(auth).await?;
     let mut markets = Vec::new();
@@ -219,13 +248,19 @@ async fn load_reward_markets_once(
             market_daily_reward: entry.market_daily_reward.as_deref(),
         })
         .collect::<Vec<_>>();
-    let selected_liquidity_reward_market_count = store.replace_reward_market_pool_entries(
+    let replace_result = store.replace_reward_market_pool_entries(
         build_date_utc,
         built_at_ms,
         &borrowed_entries,
         built_at_ms,
         liquidity_reward_market_count,
     )?;
+    let selected_liquidity_reward_market_count = replace_result.selected_count;
+    notify_removed_liquidity_reward_pool_entries(
+        replace_result.removed_selected_entries,
+        strategy_tx,
+        build_date_utc,
+    );
     let meta = RewardMarketPoolMeta {
         build_date_utc,
         version: built_at_ms,
@@ -246,6 +281,26 @@ async fn load_reward_markets_once(
     );
 
     Ok(meta)
+}
+
+fn notify_removed_liquidity_reward_pool_entries(
+    removed_entries: Vec<RemovedLiquidityRewardPoolEntry>,
+    strategy_tx: &tokio::sync::mpsc::Sender<StrategyEvent>,
+    build_date_utc: NaiveDate,
+) {
+    for entry in removed_entries {
+        let reason = format!("reward_pool_rebuild_removed: build_date_utc={build_date_utc}");
+        if let Err(error) =
+            strategy_tx.try_send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: entry.condition_id.clone(),
+                token1: entry.token1,
+                token2: entry.token2,
+                reason,
+            }))
+        {
+            warn!(target: "order", condition_id = %entry.condition_id, error = %error, "reward_market_loader 投递重建移除奖励市场事件失败");
+        }
+    }
 }
 
 async fn load_pool_entries(
@@ -519,6 +574,62 @@ mod tests {
         let entries = pool_entries_to_storage_entries(&[entry]);
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn loads_initial_reward_market_pool_meta_from_store() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date_utc = NaiveDate::from_ymd_opt(2026, 5, 5).unwrap();
+        let entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xabc",
+            market_slug: Some("slug"),
+            question: Some("question"),
+            token1: "token1",
+            token2: "token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("1"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+        store
+            .replace_reward_market_pool_entries(build_date_utc, 123, &entries, 123, 1)
+            .expect("pool should replace");
+
+        let meta = load_initial_reward_market_pool_meta(&store)
+            .expect("initial meta query should work")
+            .expect("initial meta should exist");
+
+        assert_eq!(meta.build_date_utc, build_date_utc);
+        assert_eq!(meta.version, 123);
+        assert_eq!(meta.built_at_ms, 123);
+    }
+
+    #[test]
+    fn notifies_removed_liquidity_reward_pool_entries() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        notify_removed_liquidity_reward_pool_entries(
+            vec![RemovedLiquidityRewardPoolEntry {
+                condition_id: "0xremoved".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+            }],
+            &tx,
+            NaiveDate::from_ymd_opt(2026, 5, 5).unwrap(),
+        );
+
+        let event = rx.try_recv().expect("removal event should be sent");
+        let StrategyEvent::RewardPoolRemoval(removal) = event else {
+            panic!("expected reward pool removal event");
+        };
+        assert_eq!(removal.condition_id, "0xremoved");
+        assert_eq!(removal.token1, "token1");
+        assert_eq!(removal.token2, "token2");
+        assert_eq!(
+            removal.reason,
+            "reward_pool_rebuild_removed: build_date_utc=2026-05-05"
+        );
     }
 
     #[test]

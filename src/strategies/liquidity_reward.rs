@@ -18,7 +18,7 @@ use crate::{
         LiquidityRewardFillNotification, LiquidityRewardUnwindActionNotification,
         NotificationEvent, Notifier,
     },
-    storage::{ActiveRewardMarketPoolEntry, OrderStore},
+    storage::{ActiveRewardMarketPoolEntry, MarketStore, OrderStore},
     strategy::{
         OrderSignal, QuoteSide, Strategy, StrategyEvent, StrategyRegistration, TopicRegistration,
     },
@@ -50,6 +50,8 @@ pub struct LiquidityRewardRule {
     pub reward_daily_pool: Option<f64>,
     /// FixedOffset 模式直接按 pair 外部价格推导 target_price，不参与竞价跟随。
     pub fixed_price: bool,
+    pub condition_id: Option<String>,
+    pub pool_version: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +138,7 @@ pub struct LiquidityRewardStrategy {
     registration: Arc<StrategyRegistration>,
     restored_states: HashMap<String, LiquidityRewardRestoreState>,
     order_store: Option<OrderStore>,
+    market_store: Option<MarketStore>,
     simulation_enabled: bool,
     tick_size_map: TickSizeMap,
     notifier: Option<Notifier>,
@@ -171,6 +174,11 @@ impl LiquidityRewardStrategy {
         self.order_store = order_store;
         self.simulation_enabled = simulation_enabled;
         self.tick_size_map = tick_size_map;
+        self
+    }
+
+    pub fn with_market_store(mut self, market_store: MarketStore) -> Self {
+        self.market_store = Some(market_store);
         self
     }
 
@@ -233,6 +241,8 @@ impl LiquidityRewardStrategy {
                 reward_min_size,
                 reward_daily_pool,
                 fixed_price,
+                condition_id: None,
+                pool_version: None,
             });
         }
 
@@ -244,6 +254,12 @@ impl LiquidityRewardStrategy {
     ) -> anyhow::Result<Option<Self>> {
         let mut rules = Vec::new();
         for entry in entries {
+            if entry.liquidity_reward_halted
+                && entry.liquidity_reward_halted_pool_version.is_some()
+                && entry.liquidity_reward_halted_pool_version == entry.pool_version
+            {
+                continue;
+            }
             let Some(reward_max_spread_cents) = parse_pool_f64(
                 entry.rewards_max_spread.as_deref(),
                 &entry.condition_id,
@@ -275,6 +291,8 @@ impl LiquidityRewardStrategy {
                 reward_min_size: Some(reward_min_size),
                 reward_daily_pool: Some(reward_daily_pool),
                 fixed_price: false,
+                condition_id: Some(entry.condition_id),
+                pool_version: entry.pool_version,
             });
         }
 
@@ -334,6 +352,7 @@ impl LiquidityRewardStrategy {
             registration,
             restored_states: HashMap::new(),
             order_store: None,
+            market_store: None,
             simulation_enabled: false,
             tick_size_map: Arc::new(dashmap::DashMap::new()),
             notifier: None,
@@ -372,6 +391,7 @@ impl Strategy for LiquidityRewardStrategy {
     ) -> tokio::task::JoinHandle<()> {
         let rules = self.rules.clone();
         let order_store = self.order_store.clone();
+        let market_store = self.market_store.clone();
         let restored_states = self.restored_states;
         let simulation_enabled = self.simulation_enabled;
         let tick_size_map = self.tick_size_map.clone();
@@ -381,6 +401,7 @@ impl Strategy for LiquidityRewardStrategy {
         tokio::spawn(async move {
             let mut balance_cooldown_until: Option<Instant> = None;
             let mut balance_cooldown_resume_logged = false;
+            let mut latest_positions: Option<Arc<crate::strategy::PositionSnapshot>> = None;
             let mut states: HashMap<String, TokenQuoteState> = restored_states
                 .into_iter()
                 .map(|(token, restored)| (token, state_from_restore(restored)))
@@ -736,6 +757,7 @@ impl Strategy for LiquidityRewardStrategy {
                                 &order_tx,
                                 notifier.as_ref(),
                                 order_store.as_ref(),
+                                market_store.as_ref(),
                                 Some(fill_size),
                                 Some(status_event.local_order_id.as_ref()),
                                 &tick_size_map,
@@ -846,12 +868,55 @@ impl Strategy for LiquidityRewardStrategy {
                             &order_tx,
                             notifier.as_ref(),
                             order_store.as_ref(),
+                            market_store.as_ref(),
                             Some(fill_event.delta_size),
                             Some(fill_event.local_order_id.as_ref()),
                             &tick_size_map,
                         );
                     }
-                    StrategyEvent::Positions(_) => {}
+                    StrategyEvent::Positions(positions_event) => {
+                        latest_positions = Some(positions_event.snapshot);
+                    }
+                    StrategyEvent::RewardPoolRemoval(removal_event) => {
+                        let token = if rules.contains_key(removal_event.token1.as_str()) {
+                            removal_event.token1.as_str()
+                        } else if rules.contains_key(removal_event.token2.as_str()) {
+                            removal_event.token2.as_str()
+                        } else {
+                            continue;
+                        };
+                        let unwind_size = latest_positions.as_ref().and_then(|snapshot| {
+                            [&removal_event.token1, &removal_event.token2]
+                                .into_iter()
+                                .find_map(|token| {
+                                    snapshot
+                                        .by_asset
+                                        .get(token.as_str())
+                                        .map(|position| (token.as_str(), position.size))
+                                })
+                        });
+                        info!(
+                            target: "order",
+                            condition_id = %removal_event.condition_id,
+                            token1 = %removal_event.token1,
+                            token2 = %removal_event.token2,
+                            reason = %removal_event.reason,
+                            "liquidity_reward 收到奖励池剔除事件，终止整对做市"
+                        );
+                        halt_pair(
+                            token,
+                            &rules,
+                            &mut states,
+                            simulation_enabled,
+                            &order_tx,
+                            notifier.as_ref(),
+                            order_store.as_ref(),
+                            market_store.as_ref(),
+                            unwind_size.map(|(_, size)| size),
+                            None,
+                            &tick_size_map,
+                        );
+                    }
                 }
             }
         })
@@ -1128,6 +1193,162 @@ fn next_unwind_retry_order_id(token: &str, attempts: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::{
+        PositionSnapshot, PositionView, PositionsUpdateEvent, RewardPoolRemovalEvent,
+    };
+
+    #[tokio::test]
+    async fn reward_pool_removal_halts_pair_cancels_orders_and_unwinds_positions() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let mut restored_states = HashMap::new();
+        restored_states.insert("token1".to_string(), restore_state("token1-active"));
+        restored_states.insert("token2".to_string(), restore_state("token2-active"));
+        let strategy = strategy.with_restore_state(
+            restored_states,
+            None,
+            false,
+            Arc::new(dashmap::DashMap::new()),
+        );
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::from([(
+                        "token1".to_string(),
+                        position("token1", 12.5, 0.44),
+                    )])),
+                }),
+                changed_assets: Arc::from(["token1".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+
+        let mut signals = Vec::new();
+        for _ in 0..3 {
+            signals.push(
+                tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                    .await
+                    .expect("expected order signal")
+                    .expect("order channel should remain open"),
+            );
+        }
+
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardCancel { token, active_local_order_id, .. }
+                if token == "token1" && active_local_order_id == "token1-active"
+        )));
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardCancel { token, active_local_order_id, .. }
+                if token == "token2" && active_local_order_id == "token2-active"
+        )));
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, price, order_size, .. }
+                if token == "token1"
+                    && *price == Decimal::try_from(0.49_f64).unwrap()
+                    && *order_size == Decimal::try_from(12.5_f64).unwrap()
+        )));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reward_pool_removal_persists_current_pool_version_halt() {
+        let market_store = MarketStore::open(":memory:").expect("market store should open");
+        market_store
+            .init_schema()
+            .expect("schema should initialize");
+        let build_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 5).unwrap();
+        let entries = vec![crate::storage::RewardMarketPoolStorageEntry {
+            condition_id: "0xabc",
+            market_slug: Some("slug"),
+            question: Some("question"),
+            token1: "token1",
+            token2: "token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("1"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+        market_store
+            .replace_reward_market_pool_entries(build_date, 123, &entries, 100, 1)
+            .expect("pool should replace");
+        let strategy = LiquidityRewardStrategy::from_pool_entries(
+            market_store
+                .load_liquidity_reward_pool_entries()
+                .expect("pool entries should load"),
+        )
+        .expect("strategy should build")
+        .expect("strategy should exist")
+        .with_market_store(market_store.clone());
+
+        let mut restored_states = HashMap::new();
+        restored_states.insert("token1".to_string(), restore_state("token1-active"));
+        restored_states.insert("token2".to_string(), restore_state("token2-active"));
+        let strategy = strategy.with_restore_state(
+            restored_states,
+            None,
+            false,
+            Arc::new(dashmap::DashMap::new()),
+        );
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .expect("expected cancel signal")
+                .expect("order channel should remain open");
+        }
+
+        let selected = market_store
+            .load_liquidity_reward_pool_entries()
+            .expect("selected entries should load");
+        assert!(selected.is_empty());
+
+        handle.abort();
+    }
 
     #[test]
     fn detects_not_enough_balance_error() {
@@ -1198,6 +1419,46 @@ mod tests {
     }
 
     #[test]
+    fn builds_no_strategy_when_current_pool_version_entry_is_halted() {
+        let mut entry = pool_entry(
+            "0xabc",
+            "token1",
+            "token2",
+            Some("100"),
+            Some("4"),
+            Some("50"),
+        );
+        entry.liquidity_reward_halted = true;
+        entry.liquidity_reward_halted_pool_version = Some(1);
+
+        let strategy = LiquidityRewardStrategy::from_pool_entries(vec![entry])
+            .expect("pool strategy should build");
+
+        assert!(strategy.is_none());
+    }
+
+    #[test]
+    fn builds_strategy_when_halt_belongs_to_old_pool_version() {
+        let mut entry = pool_entry(
+            "0xabc",
+            "token1",
+            "token2",
+            Some("100"),
+            Some("4"),
+            Some("50"),
+        );
+        entry.pool_version = Some(2);
+        entry.liquidity_reward_halted = true;
+        entry.liquidity_reward_halted_pool_version = Some(1);
+
+        let strategy = LiquidityRewardStrategy::from_pool_entries(vec![entry])
+            .expect("pool strategy should build")
+            .expect("strategy should exist");
+
+        assert!(strategy.rules().any(|(token, _)| token == "token1"));
+    }
+
+    #[test]
     fn skips_pool_entries_with_missing_reward_fields() {
         let strategy = LiquidityRewardStrategy::from_pool_entries(vec![pool_entry(
             "0xabc",
@@ -1223,6 +1484,8 @@ mod tests {
             reward_min_size: Some(100.0),
             reward_daily_pool: Some(50.0),
             fixed_price: false,
+            condition_id: None,
+            pool_version: None,
         }])
         .expect("strategy should build")
         .expect("strategy should exist");
@@ -1240,6 +1503,19 @@ mod tests {
 
         assert!(strategy.restored_states.contains_key("token1"));
         assert!(!strategy.restored_states.contains_key("old-token"));
+    }
+
+    fn position(asset_id: &str, size: f64, cur_price: f64) -> PositionView {
+        PositionView {
+            asset_id: asset_id.to_string(),
+            size: Decimal::try_from(size).unwrap(),
+            avg_price: Decimal::try_from(cur_price).unwrap(),
+            cur_price: Decimal::try_from(cur_price).unwrap(),
+            current_value: Decimal::ZERO,
+            cash_pnl: Decimal::ZERO,
+            title: Arc::from("test"),
+            outcome: Arc::from("Yes"),
+        }
     }
 
     fn restore_state(active_order_id: &str) -> LiquidityRewardRestoreState {
@@ -1284,6 +1560,10 @@ mod tests {
             liquidity_reward_selected_at_ms: Some(1),
             liquidity_reward_select_reason: Some("competitiveness_low_tail".to_string()),
             liquidity_reward_select_rank: Some(1),
+            liquidity_reward_halted: false,
+            liquidity_reward_halted_at_ms: None,
+            liquidity_reward_halt_reason: None,
+            liquidity_reward_halted_pool_version: None,
         }
     }
 }
@@ -1818,12 +2098,14 @@ fn halt_pair(
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     notifier: Option<&Notifier>,
     order_store: Option<&OrderStore>,
+    market_store: Option<&MarketStore>,
     unwind_size: Option<Decimal>,
     filled_local_order_id: Option<&str>,
     tick_size_map: &TickSizeMap,
 ) {
     let Some(rule) = rules.get(token) else { return };
     let paired = paired_token(token, rule);
+    persist_pool_halt(market_store, rule, "liquidity_reward_halt");
 
     cancel_and_halt(
         token,
@@ -1915,6 +2197,26 @@ fn halt_pair(
         }
         Err(e) => {
             warn!(token = %token, error = %e, "liquidity_reward 发送市价卖出失败");
+        }
+    }
+}
+
+fn persist_pool_halt(market_store: Option<&MarketStore>, rule: &LiquidityRewardRule, reason: &str) {
+    let Some(store) = market_store else { return };
+    let (Some(condition_id), Some(pool_version)) = (&rule.condition_id, rule.pool_version) else {
+        return;
+    };
+    let halted_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    match store.halt_liquidity_reward_pool_entry(condition_id, pool_version, reason, halted_at_ms) {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(target: "order", condition_id = %condition_id, pool_version, "liquidity_reward 写入池子 halt 状态未命中当前 selected 市场");
+        }
+        Err(error) => {
+            warn!(target: "order", condition_id = %condition_id, pool_version, error = %error, "liquidity_reward 写入池子 halt 状态失败");
         }
     }
 }

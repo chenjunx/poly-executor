@@ -23,6 +23,7 @@ pub(crate) struct Notifier {
 pub(crate) enum NotificationEvent {
     LiquidityRewardFill(LiquidityRewardFillNotification),
     LiquidityRewardUnwindAction(LiquidityRewardUnwindActionNotification),
+    LiquidityRewardPoolRemoval(LiquidityRewardPoolRemovalNotification),
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,20 @@ pub(crate) struct LiquidityRewardUnwindActionNotification {
     pub(crate) attempts: u8,
     pub(crate) action: String,
     pub(crate) simulated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiquidityRewardPoolRemovalNotification {
+    pub(crate) strategy: String,
+    pub(crate) condition_id: String,
+    pub(crate) market_slug: Option<String>,
+    pub(crate) question: Option<String>,
+    pub(crate) token1: String,
+    pub(crate) token2: String,
+    pub(crate) reason: String,
+    pub(crate) token1_best_bid: Option<String>,
+    pub(crate) token1_best_ask: Option<String>,
+    pub(crate) token1_spread: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +166,14 @@ async fn send_dingtalk_message(
                 "钉钉 liquidity_reward 市价止损动作通知发送成功"
             );
         }
+        NotificationEvent::LiquidityRewardPoolRemoval(removal) => {
+            info!(
+                target: "notification",
+                condition_id = %removal.condition_id,
+                reason = %removal.reason,
+                "钉钉 liquidity_reward 奖励池剔除通知发送成功"
+            );
+        }
     }
     Ok(())
 }
@@ -176,6 +199,19 @@ fn build_dingtalk_payload(event: &NotificationEvent) -> serde_json::Value {
                 "msgtype": "markdown",
                 "markdown": {
                     "title": "liquidity_reward 市价止损卖出动作",
+                    "text": text,
+                },
+                "at": {
+                    "isAtAll": false,
+                },
+            })
+        }
+        NotificationEvent::LiquidityRewardPoolRemoval(removal) => {
+            let text = build_liquidity_reward_pool_removal_markdown(removal);
+            json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "liquidity_reward 奖励池剔除",
                     "text": text,
                 },
                 "at": {
@@ -264,6 +300,37 @@ fn build_liquidity_reward_unwind_action_markdown(
     )
 }
 
+fn build_liquidity_reward_pool_removal_markdown(
+    removal: &LiquidityRewardPoolRemovalNotification,
+) -> String {
+    let notify_time = chrono::Utc::now().to_rfc3339();
+    format!(
+        "### liquidity_reward 奖励池剔除\n\n\
+        - 策略：{}\n\
+        - Condition ID：{}\n\
+        - Market：{}\n\
+        - Question：{}\n\
+        - Token1：{}\n\
+        - Token2：{}\n\
+        - 剔除原因：{}\n\
+        - Token1 Best Bid：{}\n\
+        - Token1 Best Ask：{}\n\
+        - Token1 Spread：{}\n\
+        - 通知时间：{}",
+        removal.strategy,
+        removal.condition_id,
+        removal.market_slug.as_deref().unwrap_or("-"),
+        removal.question.as_deref().unwrap_or("-"),
+        removal.token1,
+        removal.token2,
+        removal.reason,
+        removal.token1_best_bid.as_deref().unwrap_or("-"),
+        removal.token1_best_ask.as_deref().unwrap_or("-"),
+        removal.token1_spread.as_deref().unwrap_or("-"),
+        notify_time,
+    )
+}
+
 fn signed_webhook_url(webhook: &str, secret: &str, timestamp_ms: i64) -> anyhow::Result<String> {
     if secret.is_empty() {
         return Ok(webhook.to_string());
@@ -315,6 +382,21 @@ mod tests {
         }
     }
 
+    fn sample_pool_removal() -> LiquidityRewardPoolRemovalNotification {
+        LiquidityRewardPoolRemovalNotification {
+            strategy: "liquidity_reward".to_string(),
+            condition_id: "0xabc".to_string(),
+            market_slug: Some("test-market".to_string()),
+            question: Some("Test question?".to_string()),
+            token1: "token-1".to_string(),
+            token2: "token-2".to_string(),
+            reason: "token1_spread_gt_threshold: spread=0.4 threshold=0.1".to_string(),
+            token1_best_bid: Some("0.02".to_string()),
+            token1_best_ask: Some("0.42".to_string()),
+            token1_spread: Some("0.4".to_string()),
+        }
+    }
+
     fn sample_unwind_action() -> LiquidityRewardUnwindActionNotification {
         LiquidityRewardUnwindActionNotification {
             strategy: "liquidity_reward".to_string(),
@@ -358,6 +440,29 @@ mod tests {
         assert!(text.contains("remote-1"));
         assert!(text.contains("1.5"));
         assert!(text.contains("partially_filled"));
+    }
+
+    #[test]
+    fn dingtalk_payload_contains_pool_removal_fields() {
+        let payload = build_dingtalk_payload(&NotificationEvent::LiquidityRewardPoolRemoval(
+            sample_pool_removal(),
+        ));
+        assert_eq!(payload["msgtype"], "markdown");
+        assert_eq!(
+            payload["markdown"]["title"].as_str().unwrap(),
+            "liquidity_reward 奖励池剔除"
+        );
+        let text = payload["markdown"]["text"].as_str().unwrap();
+        assert!(text.contains("liquidity_reward"));
+        assert!(text.contains("0xabc"));
+        assert!(text.contains("test-market"));
+        assert!(text.contains("Test question?"));
+        assert!(text.contains("token-1"));
+        assert!(text.contains("token-2"));
+        assert!(text.contains("token1_spread_gt_threshold"));
+        assert!(text.contains("0.02"));
+        assert!(text.contains("0.42"));
+        assert!(text.contains("0.4"));
     }
 
     #[test]

@@ -292,11 +292,20 @@ pub struct OrderFillEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct RewardPoolRemovalEvent {
+    pub condition_id: String,
+    pub token1: String,
+    pub token2: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
     Positions(PositionsUpdateEvent),
     OrderStatus(OrderStatusEvent),
     OrderFill(OrderFillEvent),
+    RewardPoolRemoval(RewardPoolRemovalEvent),
 }
 
 #[derive(Debug, Clone)]

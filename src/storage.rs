@@ -70,6 +70,26 @@ pub struct StoredRewardMarketPoolState {
     pub kick_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedLiquidityRewardPoolEntry {
+    pub condition_id: String,
+    pub token1: String,
+    pub token2: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewardMarketPoolReplaceResult {
+    pub selected_count: usize,
+    pub removed_selected_entries: Vec<RemovedLiquidityRewardPoolEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredRewardMarketPoolMeta {
+    pub build_date_utc: NaiveDate,
+    pub version: u64,
+    pub built_at_ms: u64,
+}
+
 pub struct RewardMarketPoolStorageEntry<'a> {
     pub condition_id: &'a str,
     pub market_slug: Option<&'a str>,
@@ -101,6 +121,10 @@ pub struct ActiveRewardMarketPoolEntry {
     pub liquidity_reward_selected_at_ms: Option<u64>,
     pub liquidity_reward_select_reason: Option<String>,
     pub liquidity_reward_select_rank: Option<u32>,
+    pub liquidity_reward_halted: bool,
+    pub liquidity_reward_halted_at_ms: Option<u64>,
+    pub liquidity_reward_halt_reason: Option<String>,
+    pub liquidity_reward_halted_pool_version: Option<u64>,
 }
 
 impl StoredOrder {
@@ -733,6 +757,10 @@ impl MarketStore {
                     liquidity_reward_selected_at_ms INTEGER,
                     liquidity_reward_select_reason TEXT,
                     liquidity_reward_select_rank INTEGER,
+                    liquidity_reward_halted INTEGER NOT NULL DEFAULT 0,
+                    liquidity_reward_halted_at_ms INTEGER,
+                    liquidity_reward_halt_reason TEXT,
+                    liquidity_reward_halted_pool_version INTEGER,
                     in_pool INTEGER NOT NULL DEFAULT 1,
                     first_seen_at_ms INTEGER NOT NULL,
                     last_seen_at_ms INTEGER NOT NULL,
@@ -788,6 +816,30 @@ impl MarketStore {
                 conn,
                 "reward_market_pool_state",
                 "liquidity_reward_select_rank",
+                "INTEGER",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_halted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_halted_at_ms",
+                "INTEGER",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_halt_reason",
+                "TEXT",
+            )?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_halted_pool_version",
                 "INTEGER",
             )?;
             Ok(())
@@ -910,10 +962,12 @@ impl MarketStore {
         entries: &[RewardMarketPoolStorageEntry<'_>],
         now_ms: u64,
         liquidity_reward_market_count: usize,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<RewardMarketPoolReplaceResult> {
         self.with_conn(|conn| {
             conn.execute_batch("BEGIN")?;
-            let result = (|| -> anyhow::Result<usize> {
+            let result = (|| -> anyhow::Result<RewardMarketPoolReplaceResult> {
+                let removed_selected_entries =
+                    load_selected_entries_missing_from_next_pool(conn, entries)?;
                 conn.execute("DELETE FROM reward_market_pool_state", [])?;
                 let mut stmt = conn.prepare_cached(
                     "
@@ -943,17 +997,21 @@ impl MarketStore {
                         now_ms as i64,
                     ])?;
                 }
-                mark_liquidity_reward_pool_selection_in_conn(
+                let selected_count = mark_liquidity_reward_pool_selection_in_conn(
                     conn,
                     entries,
                     liquidity_reward_market_count,
                     now_ms,
-                )
+                )?;
+                Ok(RewardMarketPoolReplaceResult {
+                    selected_count,
+                    removed_selected_entries,
+                })
             })();
             match result {
-                Ok(selected_count) => {
+                Ok(replace_result) => {
                     conn.execute_batch("COMMIT")?;
-                    Ok(selected_count)
+                    Ok(replace_result)
                 }
                 Err(error) => {
                     let _ = conn.execute_batch("ROLLBACK");
@@ -1009,6 +1067,44 @@ impl MarketStore {
         })
     }
 
+    pub fn load_latest_reward_market_pool_meta(
+        &self,
+    ) -> anyhow::Result<Option<StoredRewardMarketPoolMeta>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "
+                SELECT build_date_utc, pool_version, pool_version
+                FROM reward_market_pool_state
+                WHERE build_date_utc IS NOT NULL
+                  AND pool_version IS NOT NULL
+                ORDER BY pool_version DESC
+                LIMIT 1
+                ",
+                [],
+                |row| {
+                    let build_date_utc: String = row.get(0)?;
+                    let version = row.get::<_, i64>(1)? as u64;
+                    let built_at_ms = row.get::<_, i64>(2)? as u64;
+                    let build_date_utc = NaiveDate::parse_from_str(&build_date_utc, "%Y-%m-%d")
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok(StoredRewardMarketPoolMeta {
+                        build_date_utc,
+                        version,
+                        built_at_ms,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
     pub fn load_active_reward_market_pool_entries(
         &self,
     ) -> anyhow::Result<Vec<ActiveRewardMarketPoolEntry>> {
@@ -1019,7 +1115,9 @@ impl MarketStore {
                        market_competitiveness, rewards_min_size, rewards_max_spread,
                        market_daily_reward, build_date_utc, pool_version,
                        liquidity_reward_selected, liquidity_reward_selected_at_ms,
-                       liquidity_reward_select_reason, liquidity_reward_select_rank
+                       liquidity_reward_select_reason, liquidity_reward_select_rank,
+                       liquidity_reward_halted, liquidity_reward_halted_at_ms,
+                       liquidity_reward_halt_reason, liquidity_reward_halted_pool_version
                 FROM reward_market_pool_state
                 WHERE in_pool = 1
                 ORDER BY condition_id
@@ -1040,15 +1138,57 @@ impl MarketStore {
                        market_competitiveness, rewards_min_size, rewards_max_spread,
                        market_daily_reward, build_date_utc, pool_version,
                        liquidity_reward_selected, liquidity_reward_selected_at_ms,
-                       liquidity_reward_select_reason, liquidity_reward_select_rank
+                       liquidity_reward_select_reason, liquidity_reward_select_rank,
+                       liquidity_reward_halted, liquidity_reward_halted_at_ms,
+                       liquidity_reward_halt_reason, liquidity_reward_halted_pool_version
                 FROM reward_market_pool_state
                 WHERE in_pool = 1
                   AND liquidity_reward_selected = 1
+                  AND (
+                      liquidity_reward_halted = 0
+                      OR liquidity_reward_halted_pool_version IS NULL
+                      OR liquidity_reward_halted_pool_version != pool_version
+                  )
                 ORDER BY liquidity_reward_select_rank, condition_id
                 ",
             )?;
             let rows = stmt.query_map([], |row| active_reward_market_pool_entry_from_row(row))?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn halt_liquidity_reward_pool_entry(
+        &self,
+        condition_id: &str,
+        pool_version: u64,
+        reason: &str,
+        halted_at_ms: u64,
+    ) -> anyhow::Result<bool> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                "
+                UPDATE reward_market_pool_state
+                SET liquidity_reward_halted = 1,
+                    liquidity_reward_halted_at_ms = ?3,
+                    liquidity_reward_halt_reason = ?4,
+                    liquidity_reward_halted_pool_version = ?2
+                WHERE condition_id = ?1
+                  AND pool_version = ?2
+                  AND liquidity_reward_selected = 1
+                  AND (
+                      liquidity_reward_halted = 0
+                      OR liquidity_reward_halted_pool_version IS NULL
+                      OR liquidity_reward_halted_pool_version != ?2
+                  )
+                ",
+                params![
+                    condition_id,
+                    pool_version as i64,
+                    halted_at_ms as i64,
+                    reason
+                ],
+            )?;
+            Ok(updated > 0)
         })
     }
 
@@ -1152,6 +1292,37 @@ struct LiquidityRewardPoolSelection<'a> {
     rank: u32,
 }
 
+fn load_selected_entries_missing_from_next_pool(
+    conn: &Connection,
+    next_entries: &[RewardMarketPoolStorageEntry<'_>],
+) -> anyhow::Result<Vec<RemovedLiquidityRewardPoolEntry>> {
+    let next_condition_ids = next_entries
+        .iter()
+        .map(|entry| entry.condition_id)
+        .collect::<BTreeSet<_>>();
+    let mut stmt = conn.prepare(
+        "
+        SELECT condition_id, token1, token2
+        FROM reward_market_pool_state
+        WHERE in_pool = 1
+          AND liquidity_reward_selected = 1
+        ORDER BY liquidity_reward_select_rank, condition_id
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(RemovedLiquidityRewardPoolEntry {
+            condition_id: row.get(0)?,
+            token1: row.get(1)?,
+            token2: row.get(2)?,
+        })
+    })?;
+    let selected_entries = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(selected_entries
+        .into_iter()
+        .filter(|entry| !next_condition_ids.contains(entry.condition_id.as_str()))
+        .collect())
+}
+
 fn mark_liquidity_reward_pool_selection_in_conn(
     conn: &Connection,
     entries: &[RewardMarketPoolStorageEntry<'_>],
@@ -1247,6 +1418,12 @@ fn active_reward_market_pool_entry_from_row(
     let liquidity_reward_select_rank = row
         .get::<_, Option<i64>>(15)?
         .and_then(|value| u32::try_from(value).ok());
+    let liquidity_reward_halted_at_ms = row
+        .get::<_, Option<i64>>(17)?
+        .and_then(|value| u64::try_from(value).ok());
+    let liquidity_reward_halted_pool_version = row
+        .get::<_, Option<i64>>(19)?
+        .and_then(|value| u64::try_from(value).ok());
     Ok(ActiveRewardMarketPoolEntry {
         condition_id: row.get(0)?,
         market_slug: row.get(1)?,
@@ -1264,6 +1441,10 @@ fn active_reward_market_pool_entry_from_row(
         liquidity_reward_selected_at_ms,
         liquidity_reward_select_reason: row.get(14)?,
         liquidity_reward_select_rank,
+        liquidity_reward_halted: row.get::<_, i64>(16)? != 0,
+        liquidity_reward_halted_at_ms,
+        liquidity_reward_halt_reason: row.get(18)?,
+        liquidity_reward_halted_pool_version,
     })
 }
 
@@ -1420,6 +1601,173 @@ mod tests {
         assert_eq!(state.kicked_at_ms, None);
         assert_eq!(state.kick_reason, None);
         assert_eq!(state.market_slug.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn replace_reward_market_pool_entries_reports_removed_selected_entries() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let first_entries = vec![
+            RewardMarketPoolStorageEntry {
+                condition_id: "0xkeep",
+                market_slug: Some("keep"),
+                question: Some("keep question"),
+                token1: "keep token1",
+                token2: "keep token2",
+                tokens_json: "[]",
+                market_competitiveness: Some("1"),
+                rewards_min_size: Some("100"),
+                rewards_max_spread: Some("4"),
+                market_daily_reward: Some("50"),
+            },
+            RewardMarketPoolStorageEntry {
+                condition_id: "0xremoved",
+                market_slug: Some("removed"),
+                question: Some("removed question"),
+                token1: "removed token1",
+                token2: "removed token2",
+                tokens_json: "[]",
+                market_competitiveness: Some("2"),
+                rewards_min_size: Some("100"),
+                rewards_max_spread: Some("4"),
+                market_daily_reward: Some("50"),
+            },
+        ];
+        store
+            .replace_reward_market_pool_entries(build_date, 1, &first_entries, 100, 2)
+            .expect("initial pool should replace");
+
+        let second_entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xkeep",
+            market_slug: Some("keep"),
+            question: Some("keep question"),
+            token1: "keep token1",
+            token2: "keep token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("1"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+        let result = store
+            .replace_reward_market_pool_entries(build_date, 2, &second_entries, 200, 1)
+            .expect("second pool should replace");
+
+        assert_eq!(result.selected_count, 1);
+        assert_eq!(result.removed_selected_entries.len(), 1);
+        assert_eq!(result.removed_selected_entries[0].condition_id, "0xremoved");
+        assert_eq!(result.removed_selected_entries[0].token1, "removed token1");
+        assert_eq!(result.removed_selected_entries[0].token2, "removed token2");
+    }
+
+    #[test]
+    fn load_latest_reward_market_pool_meta_returns_last_build() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let old_build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let new_build_date = NaiveDate::from_ymd_opt(2026, 5, 5).unwrap();
+        let entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xlatest",
+            market_slug: Some("latest"),
+            question: Some("latest question"),
+            token1: "latest token1",
+            token2: "latest token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("1"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+
+        assert!(
+            store
+                .load_latest_reward_market_pool_meta()
+                .expect("empty meta query should work")
+                .is_none()
+        );
+        store
+            .replace_reward_market_pool_entries(old_build_date, 100, &entries, 100, 1)
+            .expect("old pool should replace");
+        store
+            .replace_reward_market_pool_entries(new_build_date, 200, &entries, 200, 1)
+            .expect("new pool should replace");
+
+        let meta = store
+            .load_latest_reward_market_pool_meta()
+            .expect("latest meta query should work")
+            .expect("latest meta should exist");
+
+        assert_eq!(meta.build_date_utc, new_build_date);
+        assert_eq!(meta.version, 200);
+        assert_eq!(meta.built_at_ms, 200);
+    }
+
+    #[test]
+    fn load_liquidity_reward_pool_entries_skips_current_version_halted_entries() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xhalted",
+            market_slug: Some("halted"),
+            question: Some("halted question"),
+            token1: "halted token1",
+            token2: "halted token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("1"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+        store
+            .replace_reward_market_pool_entries(build_date, 100, &entries, 100, 1)
+            .expect("pool should replace");
+        store
+            .halt_liquidity_reward_pool_entry("0xhalted", 100, "filled", 200)
+            .expect("halt should persist");
+
+        let selected = store
+            .load_liquidity_reward_pool_entries()
+            .expect("selected entries should load");
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn load_liquidity_reward_pool_entries_allows_halted_entry_after_new_pool_version() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let old_build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let new_build_date = NaiveDate::from_ymd_opt(2026, 5, 5).unwrap();
+        let entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xhalted",
+            market_slug: Some("halted"),
+            question: Some("halted question"),
+            token1: "halted token1",
+            token2: "halted token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("1"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+        }];
+        store
+            .replace_reward_market_pool_entries(old_build_date, 100, &entries, 100, 1)
+            .expect("old pool should replace");
+        store
+            .halt_liquidity_reward_pool_entry("0xhalted", 100, "filled", 200)
+            .expect("halt should persist");
+        store
+            .replace_reward_market_pool_entries(new_build_date, 200, &entries, 300, 1)
+            .expect("new pool should replace");
+
+        let selected = store
+            .load_liquidity_reward_pool_entries()
+            .expect("selected entries should load");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].condition_id, "0xhalted");
     }
 
     #[test]

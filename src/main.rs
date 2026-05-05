@@ -186,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
             .with_balance_cooldown(std::time::Duration::from_secs(
                 app_config.liquidity_reward.balance_cooldown_secs,
             ))
+            .with_market_store(market_store.clone())
             .with_notifier(notifier.clone())
     });
 
@@ -208,36 +209,9 @@ async fn main() -> anyhow::Result<()> {
         proxy_ws::Proxy::from_env()
     };
 
-    if app_config.liquidity_reward.enabled
+    let reward_market_tasks_enabled = app_config.liquidity_reward.enabled
         && app_config.liquidity_reward.monitor_enabled
-        && !app_config.simulation.enabled
-    {
-        tokio::spawn(monitor::run_liquidity_reward_monitor(
-            app_config.auth.clone(),
-            app_config.app.monitor_interval_secs.max(1),
-            liquidity_reward_tokens.clone(),
-        ));
-        let reward_market_monitor_interval =
-            std::time::Duration::from_secs(app_config.app.monitor_interval_secs.max(60));
-        let reward_market_loader_retry_interval = reward_market_monitor_interval;
-        tokio::spawn(reward_market_cache::run_reward_market_loader(
-            app_config.auth.clone(),
-            market_store.clone(),
-            reward_market_loader_retry_interval,
-            app_config.liquidity_reward.pool_market_count,
-        ));
-        tokio::spawn(reward_market_pool_monitor::run_reward_market_pool_monitor(
-            market_store.clone(),
-            proxy.clone(),
-            reward_market_pool_monitor::RewardMarketPoolMonitorConfig {
-                refresh_interval: reward_market_monitor_interval,
-                token1_spread_threshold: 0.1,
-                token1_min_bid: 0.1,
-                token1_max_bid: 0.9,
-                max_tokens_per_connection: 200,
-            },
-        ));
-    }
+        && !app_config.simulation.enabled;
 
     let mut registrations = vec![pair_registration.clone()];
     if let Some(strategy) = &liquidity_reward {
@@ -259,6 +233,36 @@ async fn main() -> anyhow::Result<()> {
 
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * topic_tokens.len().max(1));
     let (strategy_tx, strategy_rx) = tokio::sync::mpsc::channel(1024);
+    if reward_market_tasks_enabled {
+        tokio::spawn(monitor::run_liquidity_reward_monitor(
+            app_config.auth.clone(),
+            app_config.app.monitor_interval_secs.max(1),
+            liquidity_reward_tokens.clone(),
+        ));
+        let reward_market_monitor_interval =
+            std::time::Duration::from_secs(app_config.app.monitor_interval_secs.max(60));
+        let reward_market_loader_retry_interval = reward_market_monitor_interval;
+        tokio::spawn(reward_market_cache::run_reward_market_loader(
+            app_config.auth.clone(),
+            market_store.clone(),
+            reward_market_loader_retry_interval,
+            app_config.liquidity_reward.pool_market_count,
+            strategy_tx.clone(),
+        ));
+        tokio::spawn(reward_market_pool_monitor::run_reward_market_pool_monitor(
+            market_store.clone(),
+            proxy.clone(),
+            reward_market_pool_monitor::RewardMarketPoolMonitorConfig {
+                refresh_interval: reward_market_monitor_interval,
+                token1_spread_threshold: 0.1,
+                token1_min_bid: 0.1,
+                token1_max_bid: 0.9,
+                max_tokens_per_connection: 200,
+                strategy_tx: strategy_tx.clone(),
+                notifier: notifier.clone(),
+            },
+        ));
+    }
     let (order_tx, order_rx) = tokio::sync::mpsc::channel::<OrderSignal>(64);
     let monitor_tx = if reward_monitor_configs.is_empty()
         || !app_config.liquidity_reward.reward_estimator_enabled
