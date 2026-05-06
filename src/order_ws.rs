@@ -166,13 +166,27 @@ async fn subscribe_orders(
                         fill_delta(previous_size_matched, current_size_matched)
                     {
                         let total_matched_size = current_size_matched.unwrap_or(Decimal::ZERO);
-                        let _ = strategy_tx.try_send(StrategyEvent::OrderFill(OrderFillEvent {
-                            token: local_meta.token.clone(),
-                            local_order_id: local_meta.local_order_id.clone(),
-                            side: local_meta.side,
-                            delta_size,
-                            total_matched_size,
-                        }));
+                        if let Err(error) =
+                            strategy_tx.try_send(StrategyEvent::OrderFill(OrderFillEvent {
+                                strategy: local_meta.strategy.clone(),
+                                topic: local_meta.topic.clone(),
+                                token: local_meta.token.clone(),
+                                local_order_id: local_meta.local_order_id.clone(),
+                                side: local_meta.side,
+                                delta_size,
+                                total_matched_size,
+                            }))
+                        {
+                            warn!(
+                                target: "order",
+                                strategy = %local_meta.strategy,
+                                token = %local_meta.token,
+                                local_order_id = %local_meta.local_order_id,
+                                delta_size = %delta_size,
+                                error = %error,
+                                "订单成交事件投递策略失败，可能无法触发风险处理"
+                            );
+                        }
                         if local_meta.strategy.as_ref() == "liquidity_reward" {
                             if let Some(notifier) = notifier {
                                 notifier.try_notify(NotificationEvent::LiquidityRewardFill(

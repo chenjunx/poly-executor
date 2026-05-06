@@ -94,6 +94,12 @@ struct TokenQuoteState {
     pending_replacement: Option<PendingReplacement>,
     /// 成交后风险回退卖单集合，按 local id 追踪每次 FAK/重试。
     pending_unwinds: HashMap<String, PendingUnwind>,
+    /// 池子剔除时可能还没拿到持仓或行情，先记住后续补卖意图。
+    pending_pool_removal_unwind: bool,
+    /// 已确认需要补卖但暂时缺行情的持仓数量。
+    pending_pool_removal_unwind_size: Option<Decimal>,
+    /// 池子剔除 unwind 已提交到 executor，positions 未确认清零前不能重复提交。
+    pool_removal_unwind_submitted: bool,
     /// 已经发送过撤单信号后置 true，防止重复 cancel 同一张 active 单。
     cancel_requested: bool,
     last_mid: Option<Decimal>,
@@ -134,14 +140,23 @@ pub struct LiquidityRewardRestoreState {
 }
 
 pub struct LiquidityRewardStrategy {
+    /// token -> rule 的双向索引；token1 和 token2 都会映射到同一条市场规则。
     rules: Arc<HashMap<String, LiquidityRewardRule>>,
+    /// Dispatcher 依赖 registration 做 topic/token 路由，策略内部不直接订阅 WS。
     registration: Arc<StrategyRegistration>,
+    /// 启动恢复阶段注入的内存状态初值；spawn 后会 move 到事件循环里。
     restored_states: HashMap<String, LiquidityRewardRestoreState>,
+    /// orders.db 用于持久化 active/pending 状态，保证重启后能继续撤旧单或恢复报价。
     order_store: Option<OrderStore>,
+    /// market.db 用于持久化 pool halt；只有 db_pool 来源的规则才有 condition_id/pool_version。
     market_store: Option<MarketStore>,
+    /// 全局模拟开关；为 true 时订单信号仍走 executor，但不会真实调用 CLOB。
     simulation_enabled: bool,
+    /// token -> tick size；公开 WS 的 TickSizeChange 会更新这个共享 map。
     tick_size_map: TickSizeMap,
+    /// 钉钉通知入口；成交、unwind 异常、池子剔除等风险事件都会尝试通知。
     notifier: Option<Notifier>,
+    /// 余额不足后暂停新买单的时间，避免短时间内反复提交必失败订单。
     balance_cooldown: Duration,
 }
 
@@ -157,6 +172,7 @@ impl LiquidityRewardStrategy {
         simulation_enabled: bool,
         tick_size_map: TickSizeMap,
     ) -> Self {
+        // 恢复状态必须按当前规则过滤：CSV/DB pool 变化后，旧 token 状态不能继续驱动下单。
         let restored_count = restored_states.len();
         self.restored_states = restored_states
             .into_iter()
@@ -254,6 +270,7 @@ impl LiquidityRewardStrategy {
     ) -> anyhow::Result<Option<Self>> {
         let mut rules = Vec::new();
         for entry in entries {
+            // 当前 pool version 已 halt 的市场不再恢复做市；下一次 UTC pool version 会自然解除。
             if entry.liquidity_reward_halted
                 && entry.liquidity_reward_halted_pool_version.is_some()
                 && entry.liquidity_reward_halted_pool_version == entry.pool_version
@@ -308,6 +325,7 @@ impl LiquidityRewardStrategy {
         let mut topic_tokens: HashMap<Arc<str>, Vec<String>> = HashMap::new();
 
         for rule in rules {
+            // 一条市场规则会注册两个 token；任一 token 的行情/成交都需要能路由回同一策略。
             topic_tokens
                 .entry(rule.topic.clone())
                 .or_default()
@@ -399,9 +417,12 @@ impl Strategy for LiquidityRewardStrategy {
         let balance_cooldown = self.balance_cooldown;
 
         tokio::spawn(async move {
+            // 余额不足时不 halt，只暂停新买单；已有 active 仍可继续等成交/撤单事件。
             let mut balance_cooldown_until: Option<Instant> = None;
             let mut balance_cooldown_resume_logged = false;
+            // 奖励池剔除时可能没有即时成交 size，需要用最近仓位快照决定 unwind 数量。
             let mut latest_positions: Option<Arc<crate::strategy::PositionSnapshot>> = None;
+            // states 是策略的内存状态机；orders.db 只是它的恢复/审计投影。
             let mut states: HashMap<String, TokenQuoteState> = restored_states
                 .into_iter()
                 .map(|(token, restored)| (token, state_from_restore(restored)))
@@ -410,6 +431,7 @@ impl Strategy for LiquidityRewardStrategy {
             while let Some(event) = rx.recv().await {
                 match event {
                     StrategyEvent::Market(event) => {
+                        // 行情事件是唯一会主动产生新买单/替换买单的入口。
                         let Some(rule) = rules.get(event.asset_id.as_ref()) else {
                             continue;
                         };
@@ -425,6 +447,7 @@ impl Strategy for LiquidityRewardStrategy {
                             let state = states
                                 .entry(token.clone())
                                 .or_insert_with(|| empty_state(rule));
+                            // 每次行情先更新快照字段，后续报价、unwind 和持久化都依赖这些最新值。
                             state.topic = rule.topic.clone();
                             state.last_mid = Some(mid);
                             state.last_best_bid = Some(bid);
@@ -443,6 +466,14 @@ impl Strategy for LiquidityRewardStrategy {
                             .expect("state exists after market update");
 
                         if state.halted {
+                            submit_pending_pool_removal_unwind_if_ready(
+                                &token,
+                                state,
+                                simulation_enabled,
+                                &order_tx,
+                                notifier.as_ref(),
+                                &tick_size_map,
+                            );
                             continue;
                         }
 
@@ -458,6 +489,7 @@ impl Strategy for LiquidityRewardStrategy {
                         }
 
                         if !balance_cooling_down {
+                            // 如果启动恢复或撤单确认后只剩 pending，下一次行情 tick 会尝试 promote。
                             promote_pending_if_unblocked(
                                 &token,
                                 state,
@@ -481,6 +513,7 @@ impl Strategy for LiquidityRewardStrategy {
                             .and_then(|c| Decimal::try_from(c / 100.0).ok())
                             .unwrap_or(Decimal::ZERO);
 
+                        // 报价决策只产出动作，不直接改状态；状态变更统一在 submit/cancel helper 中发生。
                         let decision = quote_decision(
                             rule,
                             &token,
@@ -576,6 +609,7 @@ impl Strategy for LiquidityRewardStrategy {
                         persist_state(order_store.as_ref(), &token, state);
                     }
                     StrategyEvent::OrderStatus(status_event) => {
+                        // OrderStatus 表示订单生命周期状态，主要用于撤单确认、下单失败和直接 Matched。
                         let Some(state) = states.get_mut(status_event.token.as_str()) else {
                             continue;
                         };
@@ -587,6 +621,7 @@ impl Strategy for LiquidityRewardStrategy {
                             .pending_unwinds
                             .contains_key(&status_event.local_order_id)
                         {
+                            // unwind 卖单和做市买单分开处理：它的状态只影响风险回退，不再触发 pair halt。
                             match status {
                                 "open" => {
                                     if let Some(unwind) =
@@ -683,6 +718,7 @@ impl Strategy for LiquidityRewardStrategy {
                             continue;
                         }
 
+                        // 普通买单状态只接受当前 active 或 pending replacement，避免历史订单状态污染当前报价。
                         let is_active = state
                             .active_order
                             .as_ref()
@@ -788,6 +824,7 @@ impl Strategy for LiquidityRewardStrategy {
                         }
 
                         if is_pending {
+                            // pending 自身失败/取消时只清掉 pending，不影响仍可能存在的 active。
                             state.pending_replacement = None;
                             state.cancel_requested = false;
                             persist_state(order_store.as_ref(), &token, state);
@@ -796,6 +833,7 @@ impl Strategy for LiquidityRewardStrategy {
 
                         state.cancel_requested = false;
                         let Some(pending) = state.pending_replacement.clone() else {
+                            // active 已终结且没有 replacement，状态回到无单等待下一次行情决策。
                             state.active_order = None;
                             persist_state(order_store.as_ref(), &token, state);
                             continue;
@@ -809,6 +847,7 @@ impl Strategy for LiquidityRewardStrategy {
                         }
 
                         let topic = state.topic.clone();
+                        // 旧 active 撤销确认后，pending 才真正提交，避免同 token 同时挂多张买单。
                         if let Err(err) = order_tx.try_send(OrderSignal::LiquidityRewardPlace {
                             strategy: Arc::from("liquidity_reward"),
                             topic,
@@ -833,27 +872,41 @@ impl Strategy for LiquidityRewardStrategy {
                         persist_state(order_store.as_ref(), &token, state);
                     }
                     StrategyEvent::OrderFill(fill_event) => {
+                        // OrderFill 表示 size_matched 增量，是部分成交和 WS 成交的主要风险入口。
                         if let Some(state) = states.get_mut(fill_event.token.as_str()) {
                             if let Some(unwind) =
                                 state.pending_unwinds.get_mut(&fill_event.local_order_id)
                             {
+                                // unwind 自身成交只更新已卖数量，不能再次触发 halt。
                                 unwind.matched_size = fill_event.total_matched_size;
                                 continue;
                             }
                         }
-                        let is_ours = states.get(fill_event.token.as_str()).is_some_and(|s| {
-                            s.active_order
-                                .as_ref()
-                                .is_some_and(|o| o.order_id == fill_event.local_order_id)
-                                || s.pending_replacement
-                                    .as_ref()
-                                    .is_some_and(|p| p.order_id == fill_event.local_order_id)
-                        });
-                        if !is_ours {
+                        // 买单成交归属以 order_ws 关联出的策略元数据为准，不能只看当前 active/pending。
+                        // 撤单竞态下，旧 active 可能已从内存状态清掉，但它仍然是 liquidity_reward 的历史买单。
+                        if fill_event.strategy.as_ref() != "liquidity_reward"
+                            || fill_event.side != QuoteSide::Buy
+                        {
+                            continue;
+                        }
+                        if states
+                            .get(fill_event.token.as_str())
+                            .is_some_and(|state| state.pending_pool_removal_unwind)
+                        {
+                            info!(
+                                target: "order",
+                                topic = ?fill_event.topic,
+                                token = %fill_event.token,
+                                order_id = %fill_event.local_order_id,
+                                delta_size = %fill_event.delta_size,
+                                total_matched = %fill_event.total_matched_size,
+                                "liquidity_reward 池子剔除清仓中收到买单成交，等待持仓快照统一清算"
+                            );
                             continue;
                         }
                         info!(
                             target: "order",
+                            topic = ?fill_event.topic,
                             token = %fill_event.token,
                             order_id = %fill_event.local_order_id,
                             delta_size = %fill_event.delta_size,
@@ -875,26 +928,28 @@ impl Strategy for LiquidityRewardStrategy {
                         );
                     }
                     StrategyEvent::Positions(positions_event) => {
+                        // positions 只缓存最新快照，供池子剔除这类非成交 halt 估算 unwind 数量。
                         latest_positions = Some(positions_event.snapshot);
+                        apply_pending_pool_removal_positions(
+                            latest_positions
+                                .as_ref()
+                                .expect("latest positions just set"),
+                            &mut states,
+                            simulation_enabled,
+                            &order_tx,
+                            notifier.as_ref(),
+                            &tick_size_map,
+                        );
                     }
                     StrategyEvent::RewardPoolRemoval(removal_event) => {
-                        let token = if rules.contains_key(removal_event.token1.as_str()) {
-                            removal_event.token1.as_str()
-                        } else if rules.contains_key(removal_event.token2.as_str()) {
-                            removal_event.token2.as_str()
-                        } else {
+                        // 池子剔除是外部风控事件：即使没有成交，也要停止整对做市。
+                        let Some(token) = removal_pair_tokens(
+                            &removal_event.token1,
+                            &removal_event.token2,
+                            &rules,
+                        ) else {
                             continue;
                         };
-                        let unwind_size = latest_positions.as_ref().and_then(|snapshot| {
-                            [&removal_event.token1, &removal_event.token2]
-                                .into_iter()
-                                .find_map(|token| {
-                                    snapshot
-                                        .by_asset
-                                        .get(token.as_str())
-                                        .map(|position| (token.as_str(), position.size))
-                                })
-                        });
                         info!(
                             target: "order",
                             condition_id = %removal_event.condition_id,
@@ -912,10 +967,26 @@ impl Strategy for LiquidityRewardStrategy {
                             notifier.as_ref(),
                             order_store.as_ref(),
                             market_store.as_ref(),
-                            unwind_size.map(|(_, size)| size),
+                            None,
                             None,
                             &tick_size_map,
                         );
+                        mark_pool_removal_unwind_intent(
+                            &removal_event.token1,
+                            &removal_event.token2,
+                            &rules,
+                            &mut states,
+                        );
+                        if let Some(snapshot) = latest_positions.as_ref() {
+                            apply_pending_pool_removal_positions(
+                                snapshot,
+                                &mut states,
+                                simulation_enabled,
+                                &order_tx,
+                                notifier.as_ref(),
+                                &tick_size_map,
+                            );
+                        }
                     }
                 }
             }
@@ -932,6 +1003,7 @@ fn schedule_unwind_retry_if_needed(
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     notifier: Option<&Notifier>,
 ) {
+    // 只有明确可恢复的失败才自动重试，其余情况通知人工，避免重复卖出扩大风险。
     let Some(mut unwind) = state.pending_unwinds.remove(local_order_id) else {
         return;
     };
@@ -960,6 +1032,7 @@ fn schedule_unwind_retry_if_needed(
             return;
         }
 
+        // CLOB 对 amount 小数位有约束，精度错误时向下规整到两位小数后只重试一次。
         let adjusted_size = snap_unwind_size_to_lot(unwind.order_size);
         if adjusted_size <= Decimal::ZERO {
             warn!(
@@ -1070,6 +1143,7 @@ fn schedule_unwind_retry(
     action: &'static str,
     delay: Duration,
 ) {
+    // 重试必须换 local id，否则 order_ws/correlation 无法区分每次卖单尝试。
     let retry_order_id = next_unwind_retry_order_id(token, unwind.attempts);
     let topic = state.topic.clone();
     let topic_for_notify = Some(topic.to_string());
@@ -1079,6 +1153,7 @@ fn schedule_unwind_retry(
     unwind.local_order_id = retry_order_id.clone();
     state.pending_unwinds.insert(retry_order_id.clone(), unwind);
 
+    // 带延迟的重试不能阻塞策略事件循环，因此放到独立 task 中发送。
     let order_tx = order_tx.clone();
     let notifier = notifier.cloned();
     let token = token.to_string();
@@ -1129,6 +1204,7 @@ fn schedule_unwind_retry(
     });
 }
 
+// unwind 动作通知覆盖首次卖出、重试、剩余量卖出和需要人工处理的终态。
 fn notify_unwind_action(
     notifier: Option<&Notifier>,
     topic: Option<String>,
@@ -1194,7 +1270,8 @@ fn next_unwind_retry_order_id(token: &str, attempts: u8) -> String {
 mod tests {
     use super::*;
     use crate::strategy::{
-        PositionSnapshot, PositionView, PositionsUpdateEvent, RewardPoolRemovalEvent,
+        OrderFillEvent, PositionSnapshot, PositionView, PositionsUpdateEvent,
+        RewardPoolRemovalEvent,
     };
 
     #[tokio::test]
@@ -1282,6 +1359,469 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reward_pool_removal_unwinds_late_position_with_late_market() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::from([(
+                        "token2".to_string(),
+                        position("token2", 7.5, 0.49),
+                    )])),
+                }),
+                changed_assets: Arc::from(["token2".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token2"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+
+        let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected late unwind signal")
+            .expect("order channel should remain open");
+        assert!(matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token2" && order_size == Decimal::try_from(7.5_f64).unwrap()
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "halted market must only submit pending unwind, not a new quote"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reward_pool_removal_unwinds_both_positive_positions() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        for token in ["token1", "token2"] {
+            event_tx
+                .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                    topic: Arc::from(DEFAULT_TOPIC),
+                    asset_id: Arc::from(token),
+                    book: quoteable_book(),
+                }))
+                .await
+                .expect("market event should send");
+            tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .expect("expected initial quote")
+                .expect("order channel should remain open");
+        }
+
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::from([
+                        ("token1".to_string(), position("token1", 3.0, 0.49)),
+                        ("token2".to_string(), position("token2", 4.0, 0.49)),
+                    ])),
+                }),
+                changed_assets: Arc::from(["token1".to_string(), "token2".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+
+        let mut signals = Vec::new();
+        for _ in 0..4 {
+            signals.push(
+                tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                    .await
+                    .expect("expected halt signal")
+                    .expect("order channel should remain open"),
+            );
+        }
+
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token1" && *order_size == Decimal::from(3)
+        )));
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token2" && *order_size == Decimal::from(4)
+        )));
+        assert!(!signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token1" && *order_size == Decimal::from(4)
+        )));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_reward_pool_removal_does_not_duplicate_unwind() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::from([(
+                        "token1".to_string(),
+                        position("token1", 3.0, 0.49),
+                    )])),
+                }),
+                changed_assets: Arc::from(["token1".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        for _ in 0..2 {
+            event_tx
+                .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                    condition_id: "0xabc".to_string(),
+                    token1: "token1".to_string(),
+                    token2: "token2".to_string(),
+                    reason: "token1_spread_gt_threshold".to_string(),
+                }))
+                .await
+                .expect("pool removal event should send");
+        }
+
+        let mut sell_count = 0;
+        for _ in 0..2 {
+            let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .expect("expected halt signal")
+                .expect("order channel should remain open");
+            if matches!(
+                signal,
+                OrderSignal::LiquidityRewardMarketSell { ref token, order_size, .. }
+                    if token == "token1" && order_size == Decimal::from(3)
+            ) {
+                sell_count += 1;
+            }
+        }
+        assert_eq!(sell_count, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "repeated removal must not submit duplicate unwind"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reward_pool_removal_refreshes_pending_unwind_size_before_market() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+        for size in [5.0, 7.0] {
+            event_tx
+                .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                    snapshot: Arc::new(PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token2".to_string(),
+                            position("token2", size, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token2".to_string()]),
+                }))
+                .await
+                .expect("positions event should send");
+        }
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token2"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+
+        let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected updated pending unwind")
+            .expect("order channel should remain open");
+        assert!(matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token2" && order_size == Decimal::from(7)
+        ));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reward_pool_removal_clears_pending_unwind_when_position_disappears() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::from([(
+                        "token2".to_string(),
+                        position("token2", 5.0, 0.49),
+                    )])),
+                }),
+                changed_assets: Arc::from(["token2".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::new()),
+                }),
+                changed_assets: Arc::from(["token2".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token2"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "cleared position must not submit stale unwind"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reward_pool_removal_pending_does_not_double_count_later_buy_fill() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(RewardPoolRemovalEvent {
+                condition_id: "0xabc".to_string(),
+                token1: "token1".to_string(),
+                token2: "token2".to_string(),
+                reason: "token1_spread_gt_threshold".to_string(),
+            }))
+            .await
+            .expect("pool removal event should send");
+        event_tx
+            .send(StrategyEvent::OrderFill(OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: "late-buy-fill".to_string(),
+                side: QuoteSide::Buy,
+                delta_size: Decimal::from(1),
+                total_matched_size: Decimal::from(1),
+            }))
+            .await
+            .expect("fill event should send");
+        event_tx
+            .send(StrategyEvent::Positions(PositionsUpdateEvent {
+                snapshot: Arc::new(PositionSnapshot {
+                    by_asset: Arc::new(HashMap::from([(
+                        "token1".to_string(),
+                        position("token1", 6.0, 0.49),
+                    )])),
+                }),
+                changed_assets: Arc::from(["token1".to_string()]),
+            }))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+
+        let mut sold_size = Decimal::ZERO;
+        while let Ok(Some(signal)) =
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv()).await
+        {
+            if let OrderSignal::LiquidityRewardMarketSell { order_size, .. } = signal {
+                sold_size += order_size;
+            }
+        }
+        assert_eq!(sold_size, Decimal::from(6));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn reward_pool_removal_persists_current_pool_version_halt() {
         let market_store = MarketStore::open(":memory:").expect("market store should open");
         market_store
@@ -1346,6 +1886,140 @@ mod tests {
             .load_liquidity_reward_pool_entries()
             .expect("selected entries should load");
         assert!(selected.is_empty());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn historical_liquidity_reward_buy_fill_halts_pair_and_unwinds() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: Some("token2".to_string()),
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: false,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let mut restored_states = HashMap::new();
+        restored_states.insert("token2".to_string(), restore_state("token2-active"));
+        let strategy = strategy.with_restore_state(
+            restored_states,
+            None,
+            false,
+            Arc::new(dashmap::DashMap::new()),
+        );
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        let initial_quote = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        assert!(matches!(
+            initial_quote,
+            OrderSignal::LiquidityRewardPlace { ref token, .. } if token == "token1"
+        ));
+        event_tx
+            .send(StrategyEvent::OrderFill(OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: "historical-buy".to_string(),
+                side: QuoteSide::Buy,
+                delta_size: Decimal::from(20),
+                total_matched_size: Decimal::from(20),
+            }))
+            .await
+            .expect("fill event should send");
+
+        let mut signals = Vec::new();
+        for _ in 0..3 {
+            signals.push(
+                tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                    .await
+                    .expect("expected order signal")
+                    .expect("order channel should remain open"),
+            );
+        }
+
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardCancel { token, active_local_order_id, .. }
+                if token == "token2" && active_local_order_id == "token2-active"
+        )));
+        assert!(signals.iter().any(|signal| matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token1" && *order_size == Decimal::from(20)
+        )));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn historical_liquidity_reward_buy_fill_without_state_prevents_future_quotes() {
+        let strategy = LiquidityRewardStrategy::from_rules(vec![LiquidityRewardRule {
+            topic: Arc::from(DEFAULT_TOPIC),
+            token1: "token1".to_string(),
+            token2: None,
+            reward_min_orders: None,
+            reward_max_spread_cents: Some(4.0),
+            reward_min_size: Some(100.0),
+            reward_daily_pool: Some(50.0),
+            fixed_price: true,
+            condition_id: None,
+            pool_version: None,
+        }])
+        .expect("strategy should build")
+        .expect("strategy should exist");
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::OrderFill(OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: "historical-buy".to_string(),
+                side: QuoteSide::Buy,
+                delta_size: Decimal::from(20),
+                total_matched_size: Decimal::from(20),
+            }))
+            .await
+            .expect("fill event should send");
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+
+        let signal = tokio::time::timeout(Duration::from_millis(100), order_rx.recv()).await;
+        assert!(
+            signal.is_err(),
+            "halted historical fill must not place new quotes"
+        );
 
         handle.abort();
     }
@@ -1505,6 +2179,18 @@ mod tests {
         assert!(!strategy.restored_states.contains_key("old-token"));
     }
 
+    fn quoteable_book() -> crate::strategy::CleanOrderbook {
+        crate::strategy::CleanOrderbook {
+            best_bid_price: 4900,
+            best_bid_size: 100,
+            best_ask_price: 5100,
+            best_ask_size: 100,
+            timestamp_ms: 1,
+            bids: Arc::new(BTreeMap::from([(4900, 100)])),
+            asks: Arc::new(BTreeMap::new()),
+        }
+    }
+
     fn position(asset_id: &str, size: f64, cur_price: f64) -> PositionView {
         PositionView {
             asset_id: asset_id.to_string(),
@@ -1568,19 +2254,30 @@ mod tests {
     }
 }
 
+// 将等待中的替换单提升为当前 active 单。
+//
+// 替换报价不是“先挂新单再撤旧单”，而是两阶段流程：
+// 1. `submit_quote` 发现已有 active 时，只把新目标价格/数量写入 `pending_replacement`，并请求撤旧 active。
+// 2. 只有旧 active 被确认取消、填充或恢复阶段发现已经不存在后，`active_order` 才会变成 None。
+// 3. 本函数在 active 已经空出来时，把 pending 作为真正的新买单发送给 order executor。
+//
+// 这样可以保证同一个 token 同一时间最多只有一张做市买单，避免替换报价时短暂双挂。
 fn promote_pending_if_unblocked(
     token: &str,
     state: &mut TokenQuoteState,
     simulated: bool,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
 ) {
+    // active 还存在时说明旧单尚未让出位置，pending 必须继续等待，不能提前下新单。
     if state.active_order.is_some() {
         return;
     }
+    // 没有 pending replacement 时没有可提升的目标单，直接保持空仓等待下一次报价决策。
     let Some(pending) = state.pending_replacement.clone() else {
         return;
     };
     let topic = state.topic.clone();
+    // 这里发送的是普通 place 信号；只有发送成功，内存状态才会把 pending 转成 active。
     if let Err(err) = order_tx.try_send(OrderSignal::LiquidityRewardPlace {
         strategy: Arc::from("liquidity_reward"),
         topic,
@@ -1595,6 +2292,7 @@ fn promote_pending_if_unblocked(
         warn!(token = %token, error = %err, "liquidity_reward 恢复 pending 时发送挂单失败");
         return;
     }
+    // 发送成功后，pending 才正式成为当前 active；如果发送失败，上面已经 return，pending 会保留下来。
     state.active_order = Some(ActiveOrder {
         order_id: pending.order_id,
         price: pending.price,
@@ -1637,6 +2335,7 @@ fn quote_decision(
     bids: &BTreeMap<u16, u32>,
     tick_size_map: &TickSizeMap,
 ) -> QuoteDecision {
+    // 决策目标：在奖励允许 spread 内挂非最优买价，避免抢第一档但保持奖励资格。
     let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
     let tick = tick_size_map.get(token).map(|v| *v).unwrap_or(default_tick);
     let competitor_best_bid = competitor_best_bid(bids, state);
@@ -1882,6 +2581,7 @@ fn paired_external_ask(
 }
 
 fn competitor_best_bid(bids: &BTreeMap<u16, u32>, state: &TokenQuoteState) -> Option<Decimal> {
+    // 盘口里包含自己的挂单数量，计算竞争对手 best bid 前必须扣除 active/pending 自己的 size。
     for (&price, &size) in bids.iter().rev() {
         let mut remaining = size as i64;
         if let Some(order) = state.active_order.as_ref() {
@@ -1923,6 +2623,7 @@ fn cancel_active_order(
     simulated: bool,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
 ) -> Result<(), tokio::sync::mpsc::error::TrySendError<OrderSignal>> {
+    // CancelOnly 会丢弃 pending replacement，只保留撤 active 的动作，然后等待后续行情重新决策。
     let Some(active) = state.active_order.as_ref() else {
         return Ok(());
     };
@@ -1957,6 +2658,7 @@ fn submit_quote(
     let topic = state.topic.clone();
 
     if let Some(active) = &state.active_order {
+        // 有 active 时不能直接再挂新单，只能先 stage replacement 并请求撤旧单。
         let request_cancel = !state.cancel_requested;
         state.pending_replacement = Some(PendingReplacement {
             order_id: order_id.clone(),
@@ -2002,9 +2704,11 @@ fn submit_quote(
 }
 
 fn state_from_restore(restored: LiquidityRewardRestoreState) -> TokenQuoteState {
+    // 恢复只还原买侧做市状态；卖侧只作为 unwind 动作即时提交，不参与常驻报价状态机。
     TokenQuoteState {
         topic: restored.topic,
         active_order: restored.buy.active_local_order_id.and_then(|order_id| {
+            // active 订单必须同时有价格和数量，缺任一字段就不能安全恢复撤单/替换。
             let price = restored.buy.active_price?;
             let order_size = restored.buy.active_order_size?;
             Some(ActiveOrder {
@@ -2030,6 +2734,10 @@ fn state_from_restore(restored: LiquidityRewardRestoreState) -> TokenQuoteState 
             _ => None,
         },
         pending_unwinds: HashMap::new(),
+        pending_pool_removal_unwind: false,
+        pending_pool_removal_unwind_size: None,
+        pool_removal_unwind_submitted: false,
+        // cancel_requested 说明旧单撤销已经发出，重启后不能再重复 stage，只等待远端状态或新行情推进。
         cancel_requested: restored.buy.cancel_requested,
         last_mid: restored.last_mid,
         last_best_bid: restored.last_best_bid,
@@ -2040,11 +2748,15 @@ fn state_from_restore(restored: LiquidityRewardRestoreState) -> TokenQuoteState 
 }
 
 fn empty_state(rule: &LiquidityRewardRule) -> TokenQuoteState {
+    // 首次看到 token 行情时创建空状态，后续由 Market/OrderStatus/OrderFill 事件驱动迁移。
     TokenQuoteState {
         topic: rule.topic.clone(),
         active_order: None,
         pending_replacement: None,
         pending_unwinds: HashMap::new(),
+        pending_pool_removal_unwind: false,
+        pending_pool_removal_unwind_size: None,
+        pool_removal_unwind_submitted: false,
         cancel_requested: false,
         last_mid: None,
         last_best_bid: None,
@@ -2059,6 +2771,7 @@ fn persist_state(order_store: Option<&OrderStore>, token: &str, state: &TokenQuo
         return;
     };
 
+    // shared 记录跨买/卖侧的行情上下文，side 记录买侧 active/pending/cancel_requested。
     if let Err(error) = store.upsert_liquidity_reward_shared_state(
         token,
         state.topic.as_ref(),
@@ -2105,10 +2818,12 @@ fn halt_pair(
 ) {
     let Some(rule) = rules.get(token) else { return };
     let paired = paired_token(token, rule);
+    // halt 同时写入 market.db，保证当前 pool version 内重启后不会再次选择该市场。
     persist_pool_halt(market_store, rule, "liquidity_reward_halt");
 
     cancel_and_halt(
         token,
+        rule,
         states,
         simulated,
         order_tx,
@@ -2118,6 +2833,7 @@ fn halt_pair(
     if let Some(p) = paired {
         cancel_and_halt(
             p,
+            rule,
             states,
             simulated,
             order_tx,
@@ -2127,23 +2843,143 @@ fn halt_pair(
     }
 
     let Some(size) = unwind_size else { return };
-    let state = states.get(token);
-    let topic = state
-        .map(|s| s.topic.clone())
-        .unwrap_or_else(|| Arc::from("liquidity_reward"));
-    let sell_ref_price = state
-        .and_then(|s| s.last_best_bid)
-        .or_else(|| state.and_then(|s| s.last_mid));
-    let Some(ref_price) = sell_ref_price else {
-        warn!(token = %token, "liquidity_reward 无法获取最新买价，跳过市价卖出");
+    let Some(state) = states.get_mut(token) else {
         return;
+    };
+    submit_unwind_for_token(
+        token,
+        state,
+        size,
+        simulated,
+        order_tx,
+        notifier,
+        tick_size_map,
+        "unwind",
+    );
+}
+
+fn removal_pair_tokens<'a>(
+    token1: &'a str,
+    token2: &'a str,
+    rules: &HashMap<String, LiquidityRewardRule>,
+) -> Option<&'a str> {
+    if rules.contains_key(token1) {
+        Some(token1)
+    } else if rules.contains_key(token2) {
+        Some(token2)
+    } else {
+        None
+    }
+}
+
+fn mark_pool_removal_unwind_intent(
+    token1: &str,
+    token2: &str,
+    rules: &HashMap<String, LiquidityRewardRule>,
+    states: &mut HashMap<String, TokenQuoteState>,
+) {
+    for token in [token1, token2] {
+        if let Some(rule) = rules.get(token) {
+            let state = states
+                .entry(token.to_string())
+                .or_insert_with(|| empty_state(rule));
+            if !state.pool_removal_unwind_submitted {
+                state.pending_pool_removal_unwind = true;
+            }
+        }
+    }
+}
+
+fn apply_pending_pool_removal_positions(
+    snapshot: &crate::strategy::PositionSnapshot,
+    states: &mut HashMap<String, TokenQuoteState>,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    notifier: Option<&Notifier>,
+    tick_size_map: &TickSizeMap,
+) {
+    let tokens = states.keys().cloned().collect::<Vec<_>>();
+    for token in tokens {
+        let Some(state) = states.get_mut(token.as_str()) else {
+            continue;
+        };
+        let Some(position) = snapshot.by_asset.get(token.as_str()) else {
+            clear_pool_removal_unwind_state(state);
+            continue;
+        };
+        if position.size <= Decimal::ZERO {
+            clear_pool_removal_unwind_state(state);
+            continue;
+        }
+        if state.pool_removal_unwind_submitted || !state.pending_pool_removal_unwind {
+            continue;
+        }
+        state.pending_pool_removal_unwind_size = Some(position.size);
+        submit_pending_pool_removal_unwind_if_ready(
+            &token,
+            state,
+            simulated,
+            order_tx,
+            notifier,
+            tick_size_map,
+        );
+    }
+}
+
+fn clear_pool_removal_unwind_state(state: &mut TokenQuoteState) {
+    state.pending_pool_removal_unwind = false;
+    state.pending_pool_removal_unwind_size = None;
+    state.pool_removal_unwind_submitted = false;
+}
+
+fn submit_pending_pool_removal_unwind_if_ready(
+    token: &str,
+    state: &mut TokenQuoteState,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    notifier: Option<&Notifier>,
+    tick_size_map: &TickSizeMap,
+) {
+    let Some(size) = state.pending_pool_removal_unwind_size else {
+        return;
+    };
+    if submit_unwind_for_token(
+        token,
+        state,
+        size,
+        simulated,
+        order_tx,
+        notifier,
+        tick_size_map,
+        "pool-removal-unwind",
+    ) {
+        state.pending_pool_removal_unwind = false;
+        state.pending_pool_removal_unwind_size = None;
+        state.pool_removal_unwind_submitted = true;
+    }
+}
+
+fn submit_unwind_for_token(
+    token: &str,
+    state: &mut TokenQuoteState,
+    size: Decimal,
+    simulated: bool,
+    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    notifier: Option<&Notifier>,
+    tick_size_map: &TickSizeMap,
+    action: &'static str,
+) -> bool {
+    let sell_ref_price = state.last_best_bid.or(state.last_mid);
+    let Some(ref_price) = sell_ref_price else {
+        warn!(token = %token, "liquidity_reward 无法获取最新买价，暂缓市价卖出");
+        return false;
     };
     let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
     let tick = tick_size_map.get(token).map(|v| *v).unwrap_or(default_tick);
     let sell_price = snap_price_to_tick(ref_price, tick, true);
     if sell_price <= Decimal::ZERO {
-        warn!(token = %token, sell_price = %sell_price, "liquidity_reward 市价卖出价格无效，跳过");
-        return;
+        warn!(token = %token, sell_price = %sell_price, "liquidity_reward 市价卖出价格无效，暂缓");
+        return false;
     }
     let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = std::time::SystemTime::now()
@@ -2151,6 +2987,7 @@ fn halt_pair(
         .unwrap_or_default()
         .as_millis() as u64;
     let order_id = format!("{}-{}-unwind-{}", token, ts, seq);
+    let topic = state.topic.clone();
     let topic_for_notify = Some(topic.to_string());
     info!(
         target: "order",
@@ -2158,7 +2995,8 @@ fn halt_pair(
         sell_price = %sell_price,
         size = %size,
         order_id = %order_id,
-        "liquidity_reward 成交后立即市价卖出持仓"
+        action,
+        "liquidity_reward 提交市价卖出持仓"
     );
     match order_tx.try_send(OrderSignal::LiquidityRewardMarketSell {
         strategy: Arc::from("liquidity_reward"),
@@ -2170,19 +3008,17 @@ fn halt_pair(
         simulated,
     }) {
         Ok(()) => {
-            if let Some(state) = states.get_mut(token) {
-                state.pending_unwinds.insert(
-                    order_id.clone(),
-                    PendingUnwind {
-                        local_order_id: order_id.clone(),
-                        price: sell_price,
-                        order_size: size,
-                        matched_size: Decimal::ZERO,
-                        attempts: 0,
-                        size_adjusted: false,
-                    },
-                );
-            }
+            state.pending_unwinds.insert(
+                order_id.clone(),
+                PendingUnwind {
+                    local_order_id: order_id.clone(),
+                    price: sell_price,
+                    order_size: size,
+                    matched_size: Decimal::ZERO,
+                    attempts: 0,
+                    size_adjusted: false,
+                },
+            );
             notify_unwind_action(
                 notifier,
                 topic_for_notify,
@@ -2191,18 +3027,21 @@ fn halt_pair(
                 sell_price,
                 size,
                 0,
-                "unwind",
+                action,
                 simulated,
             );
+            true
         }
         Err(e) => {
             warn!(token = %token, error = %e, "liquidity_reward 发送市价卖出失败");
+            false
         }
     }
 }
 
 fn persist_pool_halt(market_store: Option<&MarketStore>, rule: &LiquidityRewardRule, reason: &str) {
     let Some(store) = market_store else { return };
+    // CSV 规则没有 condition_id/pool_version，只能内存 halt；DB pool 规则才需要持久化。
     let (Some(condition_id), Some(pool_version)) = (&rule.condition_id, rule.pool_version) else {
         return;
     };
@@ -2224,24 +3063,28 @@ fn persist_pool_halt(market_store: Option<&MarketStore>, rule: &LiquidityRewardR
 /// 撤销单个 token 的挂单并置 halted = true。
 fn cancel_and_halt(
     token: &str,
+    rule: &LiquidityRewardRule,
     states: &mut std::collections::HashMap<String, TokenQuoteState>,
     simulated: bool,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     order_store: Option<&OrderStore>,
     filled_local_order_id: Option<&str>,
 ) {
-    let Some(state) = states.get_mut(token) else {
-        return;
-    };
+    let state = states.entry(token.to_string()).or_insert_with(|| {
+        // 历史成交可能早于该 token 的首个行情事件到达，也必须先落地 halted，防止后续行情重新报价。
+        empty_state(rule)
+    });
     if state.halted {
         return;
     }
     state.halted = true;
+    // halt 后不再允许 pending replacement 继续 promote，只保留必要的 active 撤单动作。
     state.pending_replacement = None;
     state.cancel_requested = false;
 
     if let Some(active) = state.active_order.take() {
         if filled_local_order_id != Some(active.order_id.as_str()) {
+            // 触发 halt 的成交单本身已经终结，不再对它发送撤单；另一侧/其他 active 才需要撤。
             let topic = state.topic.clone();
             if let Err(e) = order_tx.try_send(OrderSignal::LiquidityRewardCancel {
                 strategy: Arc::from("liquidity_reward"),
@@ -2258,6 +3101,7 @@ fn cancel_and_halt(
     persist_state(order_store, token, state);
 }
 
+// FAK 卖单部分取消时，只对未成交剩余量重新提交一次新的 unwind 订单。
 fn submit_remaining_unwind(
     token: &str,
     state: &mut TokenQuoteState,
@@ -2267,6 +3111,7 @@ fn submit_remaining_unwind(
     notifier: Option<&Notifier>,
     tick_size_map: &TickSizeMap,
 ) {
+    // 剩余 unwind 仍使用最新 bid/mid 贴 tick 卖出，避免沿用已经过期的旧卖价。
     let sell_ref_price = state.last_best_bid.or(state.last_mid);
     let Some(ref_price) = sell_ref_price else {
         warn!(target: "order", token = %token, "liquidity_reward unwind 部分取消后无法获取买价，跳过剩余卖出");

@@ -284,6 +284,8 @@ pub struct OrderStatusEvent {
 
 #[derive(Debug, Clone)]
 pub struct OrderFillEvent {
+    pub strategy: Arc<str>,
+    pub topic: Option<Arc<str>>,
     pub token: String,
     pub local_order_id: String,
     pub side: QuoteSide,
