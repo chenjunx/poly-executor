@@ -4,6 +4,9 @@ config.local.toml
 orders.db
 orders.db-shm
 orders.db-wal
+market.db
+market.db-shm
+market.db-wal
 *.log
 orders_backup_attempt.db
 .worktrees

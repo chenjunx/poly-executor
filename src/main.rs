@@ -34,9 +34,8 @@ use monitor::{FullBookSnapshot, RewardMonitorConfig};
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
 use recovery::{RecoveryArtifacts, RecoveryCoordinator};
 use storage::{MarketStore, OrderStore};
-use strategies::liquidity_reward::{
-    LiquidityRewardRestoreState, LiquidityRewardRule, LiquidityRewardStrategy,
-};
+use strategies::liquidity_reward::{LiquidityRewardRestoreState, LiquidityRewardRule};
+use strategies::liquidity_reward_fsm::LiquidityRewardFsmStrategy as LiquidityRewardStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
     CleanOrderbook, Filters, OrderCorrelationMap, OrderSignal, Strategy, StrategyEvent,
