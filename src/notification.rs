@@ -24,6 +24,7 @@ pub(crate) enum NotificationEvent {
     LiquidityRewardFill(LiquidityRewardFillNotification),
     LiquidityRewardUnwindAction(LiquidityRewardUnwindActionNotification),
     LiquidityRewardPoolRemoval(LiquidityRewardPoolRemovalNotification),
+    LiquidityRewardManualAttention(LiquidityRewardManualAttentionNotification),
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,20 @@ pub(crate) struct LiquidityRewardPoolRemovalNotification {
     pub(crate) token1_best_bid: Option<String>,
     pub(crate) token1_best_ask: Option<String>,
     pub(crate) token1_spread: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiquidityRewardManualAttentionNotification {
+    pub(crate) strategy: String,
+    pub(crate) topic: Option<String>,
+    pub(crate) token: String,
+    pub(crate) trigger_local_order_id: String,
+    pub(crate) trigger_remote_order_id: Option<String>,
+    pub(crate) remaining_size: Decimal,
+    pub(crate) visible_position_size: Option<Decimal>,
+    pub(crate) attempts: u8,
+    pub(crate) last_error: String,
+    pub(crate) waited_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +189,14 @@ async fn send_dingtalk_message(
                 "钉钉 liquidity_reward 奖励池剔除通知发送成功"
             );
         }
+        NotificationEvent::LiquidityRewardManualAttention(attention) => {
+            info!(
+                target: "notification",
+                token = %attention.token,
+                attempts = attention.attempts,
+                "钉钉 liquidity_reward 人工处理通知发送成功"
+            );
+        }
     }
     Ok(())
 }
@@ -212,6 +235,19 @@ fn build_dingtalk_payload(event: &NotificationEvent) -> serde_json::Value {
                 "msgtype": "markdown",
                 "markdown": {
                     "title": "liquidity_reward 奖励池剔除",
+                    "text": text,
+                },
+                "at": {
+                    "isAtAll": false,
+                },
+            })
+        }
+        NotificationEvent::LiquidityRewardManualAttention(attention) => {
+            let text = build_liquidity_reward_manual_attention_markdown(attention);
+            json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "liquidity_reward 止损需人工处理",
                     "text": text,
                 },
                 "at": {
@@ -331,6 +367,40 @@ fn build_liquidity_reward_pool_removal_markdown(
     )
 }
 
+fn build_liquidity_reward_manual_attention_markdown(
+    attention: &LiquidityRewardManualAttentionNotification,
+) -> String {
+    let notify_time = chrono::Utc::now().to_rfc3339();
+    format!(
+        "### liquidity_reward 止损需人工处理\n\n\
+        - 策略：{}\n\
+        - Topic：{}\n\
+        - Token：{}\n\
+        - Trigger Local Order ID：{}\n\
+        - Trigger Remote Order ID：{}\n\
+        - 待止损数量：{}\n\
+        - 可见仓位：{}\n\
+        - 已尝试次数：{}\n\
+        - 已等待秒数：{}\n\
+        - 最后错误：{}\n\
+        - 通知时间：{}",
+        attention.strategy,
+        attention.topic.as_deref().unwrap_or("-"),
+        attention.token,
+        attention.trigger_local_order_id,
+        attention.trigger_remote_order_id.as_deref().unwrap_or("-"),
+        attention.remaining_size,
+        attention
+            .visible_position_size
+            .map(|size| size.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        attention.attempts,
+        attention.waited_secs,
+        attention.last_error,
+        notify_time,
+    )
+}
+
 fn signed_webhook_url(webhook: &str, secret: &str, timestamp_ms: i64) -> anyhow::Result<String> {
     if secret.is_empty() {
         return Ok(webhook.to_string());
@@ -412,6 +482,21 @@ mod tests {
         }
     }
 
+    fn sample_manual_attention() -> LiquidityRewardManualAttentionNotification {
+        LiquidityRewardManualAttentionNotification {
+            strategy: "liquidity_reward".to_string(),
+            topic: Some("liquidity_reward".to_string()),
+            token: "token-1".to_string(),
+            trigger_local_order_id: "buy-local-1".to_string(),
+            trigger_remote_order_id: Some("buy-remote-1".to_string()),
+            remaining_size: Decimal::try_from(2.5_f64).unwrap(),
+            visible_position_size: Some(Decimal::try_from(2.0_f64).unwrap()),
+            attempts: 5,
+            last_error: "not enough balance / allowance".to_string(),
+            waited_secs: 60,
+        }
+    }
+
     #[test]
     fn unsigned_webhook_url_returns_original_url() {
         let url = "https://example.com/robot/send?access_token=abc";
@@ -484,5 +569,26 @@ mod tests {
         assert!(text.contains("1.5"));
         assert!(text.contains("重试次数：1"));
         assert!(text.contains("模拟模式：false"));
+    }
+
+    #[test]
+    fn dingtalk_payload_contains_manual_attention_fields() {
+        let payload = build_dingtalk_payload(&NotificationEvent::LiquidityRewardManualAttention(
+            sample_manual_attention(),
+        ));
+        assert_eq!(payload["msgtype"], "markdown");
+        assert_eq!(
+            payload["markdown"]["title"].as_str().unwrap(),
+            "liquidity_reward 止损需人工处理"
+        );
+        let text = payload["markdown"]["text"].as_str().unwrap();
+        assert!(text.contains("liquidity_reward"));
+        assert!(text.contains("token-1"));
+        assert!(text.contains("buy-local-1"));
+        assert!(text.contains("buy-remote-1"));
+        assert!(text.contains("2.5"));
+        assert!(text.contains("2"));
+        assert!(text.contains("已尝试次数：5"));
+        assert!(text.contains("not enough balance / allowance"));
     }
 }

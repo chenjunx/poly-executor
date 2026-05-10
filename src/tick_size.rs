@@ -28,6 +28,11 @@ pub fn snap_price_to_tick(price: Decimal, tick: Decimal, is_buy: bool) -> Decima
     snapped * tick
 }
 
+pub fn snap_unwind_size_to_lot(size: Decimal) -> Decimal {
+    let scale = Decimal::from(100);
+    (size * scale).floor() / scale
+}
+
 /// 启动时批量查询所有 token 的 tick_size，写入共享 map。
 /// 若 CLOB 客户端构建失败或单个 token 查询失败，回退到默认值 0.01。
 pub async fn load_for_tokens(tokens: &[String], auth: &AuthConfig, map: &TickSizeMap) {

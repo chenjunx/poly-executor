@@ -8,16 +8,17 @@ use polymarket_client_sdk_v2::types::Decimal;
 use tracing::warn;
 
 use crate::{
-    notification::Notifier,
+    notification::{LiquidityRewardManualAttentionNotification, NotificationEvent, Notifier},
     storage::{ActiveRewardMarketPoolEntry, MarketStore, OrderStore},
     strategies::liquidity_reward::{LiquidityRewardRestoreState, LiquidityRewardRule},
     strategy::{OrderSignal, Strategy, StrategyEvent, StrategyRegistration, TopicRegistration},
-    tick_size::{TickSizeMap, snap_price_to_tick},
+    tick_size::{TickSizeMap, snap_price_to_tick, snap_unwind_size_to_lot},
 };
 
 const DEFAULT_TOPIC: &str = "liquidity_reward";
 const PRICE_SCALE: u32 = 10_000;
 const SIZE_SCALE: u32 = 10_000;
+const FILL_UNWIND_MAX_ATTEMPTS: u8 = 5;
 static ORDER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,8 +50,21 @@ struct PendingUnwind {
     order_size: Decimal,
     matched_size: Decimal,
     attempts: u8,
-    size_adjusted: bool,
     kind: UnwindKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FillUnwindIntent {
+    trigger_local_order_id: String,
+    trigger_remote_order_id: Option<String>,
+    remaining_size: Decimal,
+    trade_confirmed: bool,
+    position_visible_size: Option<Decimal>,
+    attempts: u8,
+    created_at_ms: u64,
+    next_retry_after_ms: Option<u64>,
+    last_error: Option<String>,
+    manual_notified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,8 +82,13 @@ enum HaltReason {
 #[derive(Debug, Clone, PartialEq)]
 enum QuoteState {
     Idle,
-    Active { order: ActiveOrder },
-    Canceling { order: ActiveOrder, next: CancelNext },
+    Active {
+        order: ActiveOrder,
+    },
+    Canceling {
+        order: ActiveOrder,
+        next: CancelNext,
+    },
     Halted {
         active: Option<ActiveOrder>,
         cancel_requested: bool,
@@ -102,6 +121,7 @@ struct TokenFsm {
     risk: RiskState,
     market: MarketSnapshot,
     pending_unwinds: HashMap<String, PendingUnwind>,
+    pending_fill_unwind: Option<FillUnwindIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,7 +164,148 @@ impl TokenFsm {
             risk: RiskState::Normal,
             market: MarketSnapshot::default(),
             pending_unwinds: HashMap::new(),
+            pending_fill_unwind: None,
         }
+    }
+
+    fn mark_fill_unwind_intent(
+        &mut self,
+        trigger_local_order_id: &str,
+        trigger_remote_order_id: Option<&str>,
+        remaining_size: Decimal,
+    ) {
+        if remaining_size <= Decimal::ZERO {
+            return;
+        }
+        if let Some(intent) = self.pending_fill_unwind.as_mut() {
+            if remaining_size > intent.remaining_size {
+                intent.remaining_size = remaining_size;
+            }
+            if intent.trigger_remote_order_id.is_none() {
+                intent.trigger_remote_order_id = trigger_remote_order_id.map(str::to_string);
+            }
+            return;
+        }
+        let created_at_ms = now_ms();
+        self.pending_fill_unwind = Some(FillUnwindIntent {
+            trigger_local_order_id: trigger_local_order_id.to_string(),
+            trigger_remote_order_id: trigger_remote_order_id.map(str::to_string),
+            remaining_size,
+            trade_confirmed: false,
+            position_visible_size: None,
+            attempts: 0,
+            created_at_ms,
+            next_retry_after_ms: None,
+            last_error: None,
+            manual_notified: false,
+        });
+    }
+
+    fn mark_fill_trade_confirmed(&mut self, trade: &crate::strategy::TradeConfirmedEvent) -> bool {
+        let Some(intent) = self.pending_fill_unwind.as_mut() else {
+            return false;
+        };
+        if trade.token != self.token {
+            return false;
+        }
+        let order_id = intent
+            .trigger_remote_order_id
+            .as_deref()
+            .unwrap_or(intent.trigger_local_order_id.as_str());
+        let matched = trade.taker_order_id.as_deref() == Some(order_id)
+            || trade
+                .maker_order_ids
+                .iter()
+                .any(|maker_order_id| maker_order_id == order_id);
+        if matched {
+            intent.trade_confirmed = true;
+        }
+        matched
+    }
+
+    fn update_fill_unwind_position(&mut self, size: Decimal) {
+        let Some(intent) = self.pending_fill_unwind.as_mut() else {
+            return;
+        };
+        intent.position_visible_size = (size > Decimal::ZERO).then_some(size);
+    }
+
+    fn retain_fill_unwind_after_balance_failure(&mut self, reason: &str, retry_after: Duration) {
+        let Some(intent) = self.pending_fill_unwind.as_mut() else {
+            return;
+        };
+        intent.last_error = Some(reason.to_string());
+        intent.next_retry_after_ms = Some(now_ms().saturating_add(retry_after.as_millis() as u64));
+    }
+
+    fn clear_fill_unwind_intent(&mut self) {
+        self.pending_fill_unwind = None;
+    }
+
+    fn manual_attention_notification(
+        &mut self,
+        reason: &str,
+    ) -> Option<LiquidityRewardManualAttentionNotification> {
+        let intent = self.pending_fill_unwind.as_mut()?;
+        if intent.manual_notified {
+            return None;
+        }
+        intent.manual_notified = true;
+        intent.last_error = Some(reason.to_string());
+        Some(LiquidityRewardManualAttentionNotification {
+            strategy: "liquidity_reward".to_string(),
+            topic: Some(self.topic.to_string()),
+            token: self.token.clone(),
+            trigger_local_order_id: intent.trigger_local_order_id.clone(),
+            trigger_remote_order_id: intent.trigger_remote_order_id.clone(),
+            remaining_size: intent.remaining_size,
+            visible_position_size: intent.position_visible_size,
+            attempts: intent.attempts,
+            last_error: reason.to_string(),
+            waited_secs: now_ms().saturating_sub(intent.created_at_ms) / 1000,
+        })
+    }
+
+    fn submit_fill_unwind_if_ready(&mut self, tick_size_map: &TickSizeMap) -> Vec<Effect> {
+        let Some(intent) = self.pending_fill_unwind.clone() else {
+            return Vec::new();
+        };
+        if !intent.trade_confirmed || intent.attempts >= FILL_UNWIND_MAX_ATTEMPTS {
+            return Vec::new();
+        }
+        if self
+            .pending_unwinds
+            .values()
+            .any(|unwind| unwind.kind == UnwindKind::Fill)
+        {
+            return Vec::new();
+        }
+        if intent
+            .next_retry_after_ms
+            .is_some_and(|next_retry_after_ms| now_ms() < next_retry_after_ms)
+        {
+            return Vec::new();
+        }
+        let Some(visible_size) = intent
+            .position_visible_size
+            .filter(|size| *size > Decimal::ZERO)
+        else {
+            return Vec::new();
+        };
+        let size = if visible_size < intent.remaining_size {
+            visible_size
+        } else {
+            intent.remaining_size
+        };
+        let effects = self.submit_unwind(size, tick_size_map, "unwind", UnwindKind::Fill);
+        if !effects.is_empty() {
+            if let Some(intent) = self.pending_fill_unwind.as_mut() {
+                intent.attempts = intent.attempts.saturating_add(1);
+                intent.position_visible_size = Some(visible_size);
+                intent.next_retry_after_ms = None;
+            }
+        }
+        effects
     }
 
     // 初次或替换后挂买单：状态进入 Active，并返回 PlaceBuy effect 交给外层执行。
@@ -214,9 +375,12 @@ impl TokenFsm {
                 self.quote = QuoteState::Idle;
                 Vec::new()
             }
-            CancelNext::Replace(pending) => {
-                self.place_buy(pending.order_id, pending.mid, pending.price, pending.order_size)
-            }
+            CancelNext::Replace(pending) => self.place_buy(
+                pending.order_id,
+                pending.mid,
+                pending.price,
+                pending.order_size,
+            ),
         }
     }
 
@@ -316,7 +480,10 @@ impl TokenFsm {
             self.risk = RiskState::Normal;
             return;
         }
-        if let RiskState::PoolRemovalPending { unwind_in_flight, .. } = self.risk.clone() {
+        if let RiskState::PoolRemovalPending {
+            unwind_in_flight, ..
+        } = self.risk.clone()
+        {
             self.risk = RiskState::PoolRemovalPending {
                 position_size: Some(size),
                 unwind_in_flight,
@@ -342,8 +509,9 @@ impl TokenFsm {
             .map(|value| *value)
             .unwrap_or(default_tick);
         let price = snap_price_to_tick(ref_price, tick, true);
-        if price <= Decimal::ZERO || size <= Decimal::ZERO {
-            warn!(token = %self.token, price = %price, size = %size, "liquidity_reward_fsm 清仓卖单价格或数量无效，暂缓");
+        let order_size = snap_unwind_size_to_lot(size);
+        if price <= Decimal::ZERO || order_size <= Decimal::ZERO {
+            warn!(token = %self.token, price = %price, size = %size, order_size = %order_size, "liquidity_reward_fsm 清仓卖单价格或数量无效，暂缓");
             return Vec::new();
         }
         let seq = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -357,10 +525,9 @@ impl TokenFsm {
             PendingUnwind {
                 local_order_id: local_order_id.clone(),
                 price,
-                order_size: size,
+                order_size,
                 matched_size: Decimal::ZERO,
                 attempts: 0,
-                size_adjusted: false,
                 kind,
             },
         );
@@ -369,7 +536,7 @@ impl TokenFsm {
             topic: self.topic.clone(),
             local_order_id,
             price,
-            order_size: size,
+            order_size,
         }]
     }
 
@@ -383,7 +550,7 @@ impl TokenFsm {
     }
 
     // unwind 终态会清理 pending；pool removal 来源的卖单终态会释放 in-flight，让后续 Positions 可继续补卖。
-    fn on_unwind_terminal(&mut self, local_order_id: &str) -> Option<Decimal> {
+    fn on_unwind_terminal(&mut self, local_order_id: &str) -> Option<PendingUnwind> {
         let unwind = self.pending_unwinds.remove(local_order_id)?;
         if unwind.kind == UnwindKind::PoolRemoval {
             if let RiskState::PoolRemovalPending { position_size, .. } = self.risk.clone() {
@@ -393,8 +560,7 @@ impl TokenFsm {
                 };
             }
         }
-        let remaining = unwind.order_size - unwind.matched_size;
-        (remaining > Decimal::ZERO).then_some(remaining)
+        Some(unwind)
     }
 
     // 池子剔除清仓有在途卖单时不重复提交；终态后由 Positions 再确认是否继续补卖。
@@ -406,7 +572,8 @@ impl TokenFsm {
         else {
             return Vec::new();
         };
-        let effects = self.submit_unwind(size, tick_size_map, "pool-unwind", UnwindKind::PoolRemoval);
+        let effects =
+            self.submit_unwind(size, tick_size_map, "pool-unwind", UnwindKind::PoolRemoval);
         if !effects.is_empty() {
             self.risk = RiskState::PoolRemovalPending {
                 position_size: None,
@@ -636,7 +803,10 @@ fn quote_decision(
     tick_size_map: &TickSizeMap,
 ) -> QuoteDecision {
     let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
-    let tick = tick_size_map.get(token).map(|value| *value).unwrap_or(default_tick);
+    let tick = tick_size_map
+        .get(token)
+        .map(|value| *value)
+        .unwrap_or(default_tick);
     let competitor_best_bid = competitor_best_bid(bids, fsm);
     let fixed_mid = if rule.fixed_price {
         match (competitor_best_bid, fixed_external_ask) {
@@ -702,7 +872,8 @@ fn quote_decision(
             },
             Some(active) => {
                 if active.price != target_price {
-                    if pending_replacement(fsm).is_some_and(|pending| pending.price == target_price) {
+                    if pending_replacement(fsm).is_some_and(|pending| pending.price == target_price)
+                    {
                         QuoteAction::Wait {
                             reason: "pending_replacement_same_price",
                         }
@@ -873,9 +1044,9 @@ fn halt_pair_fsm(
     rules: &HashMap<String, LiquidityRewardRule>,
     fsms: &mut HashMap<String, TokenFsm>,
     reason: HaltReason,
-    unwind_size: Option<Decimal>,
+    fill_unwind_size: Option<Decimal>,
     filled_local_order_id: Option<&str>,
-    tick_size_map: &TickSizeMap,
+    filled_remote_order_id: Option<&str>,
 ) -> Vec<Effect> {
     let Some(rule) = rules.get(trigger_token) else {
         return Vec::new();
@@ -904,9 +1075,9 @@ fn halt_pair_fsm(
         effects.extend(fsm.halt(reason.clone(), filled_local_order_id));
     }
 
-    if let Some(size) = unwind_size {
+    if let (Some(size), Some(local_order_id)) = (fill_unwind_size, filled_local_order_id) {
         if let Some(fsm) = fsms.get_mut(trigger_token) {
-            effects.extend(fsm.submit_unwind(size, tick_size_map, "unwind", UnwindKind::Fill));
+            fsm.mark_fill_unwind_intent(local_order_id, filled_remote_order_id, size);
         }
     }
 
@@ -934,6 +1105,31 @@ fn apply_pool_removal_positions(
             .unwrap_or(Decimal::ZERO);
         fsm.update_pool_removal_position(size);
         effects.extend(fsm.submit_pool_removal_unwind_if_ready(tick_size_map));
+    }
+    effects
+}
+
+fn apply_fill_unwind_positions(
+    snapshot: &crate::strategy::PositionSnapshot,
+    fsms: &mut HashMap<String, TokenFsm>,
+    tick_size_map: &TickSizeMap,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let tokens = fsms.keys().cloned().collect::<Vec<_>>();
+    for token in tokens {
+        let Some(fsm) = fsms.get_mut(token.as_str()) else {
+            continue;
+        };
+        if fsm.pending_fill_unwind.is_none() {
+            continue;
+        }
+        let size = snapshot
+            .by_asset
+            .get(token.as_str())
+            .map(|position| position.size)
+            .unwrap_or(Decimal::ZERO);
+        fsm.update_fill_unwind_position(size);
+        effects.extend(fsm.submit_fill_unwind_if_ready(tick_size_map));
     }
     effects
 }
@@ -992,6 +1188,21 @@ fn next_buy_order_id(token: &str, ts: u64) -> String {
     format!("{}-{}-buy-{}", token, ts, seq)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn is_not_enough_balance_error(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        reason
+            .to_ascii_lowercase()
+            .contains("not enough balance / allowance")
+    })
+}
+
 fn fsm_from_restore(token: String, restored: LiquidityRewardRestoreState) -> TokenFsm {
     let quote = if let Some(order_id) = restored.buy.active_local_order_id.clone() {
         let order = ActiveOrder {
@@ -1033,6 +1244,7 @@ fn fsm_from_restore(token: String, restored: LiquidityRewardRestoreState) -> Tok
             bids: None,
         },
         pending_unwinds: HashMap::new(),
+        pending_fill_unwind: None,
     }
 }
 
@@ -1303,6 +1515,8 @@ impl Strategy for LiquidityRewardFsmStrategy {
         let restored_states = self.restored_states;
         let simulation_enabled = self.simulation_enabled;
         let tick_size_map = self.tick_size_map.clone();
+        let notifier = self.notifier.clone();
+        let balance_cooldown = self.balance_cooldown;
 
         tokio::spawn(async move {
             let mut fsms: HashMap<String, TokenFsm> = restored_states
@@ -1340,6 +1554,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
 
                         let mut effects = fsm.retry_halted_cancel();
                         effects.extend(fsm.submit_pool_removal_unwind_if_ready(&tick_size_map));
+                        effects.extend(fsm.submit_fill_unwind_if_ready(&tick_size_map));
                         if matches!(fsm.quote, QuoteState::Halted { .. }) {
                             execute_effects(
                                 effects,
@@ -1380,15 +1595,17 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             QuoteAction::PlaceOrReplace { price, .. } => {
                                 let order_id = next_buy_order_id(&token, event.book.timestamp_ms);
                                 effects.extend(match &fsm.quote {
-                                    QuoteState::Active { .. } => fsm.stage_replacement(
-                                        PendingReplacement {
+                                    QuoteState::Active { .. } => {
+                                        fsm.stage_replacement(PendingReplacement {
                                             order_id,
                                             price,
                                             order_size,
                                             mid,
-                                        },
-                                    ),
-                                    QuoteState::Idle => fsm.place_buy(order_id, mid, price, order_size),
+                                        })
+                                    }
+                                    QuoteState::Idle => {
+                                        fsm.place_buy(order_id, mid, price, order_size)
+                                    }
                                     _ => Vec::new(),
                                 });
                             }
@@ -1411,11 +1628,18 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             continue;
                         };
                         let status = status_event.status.as_ref();
-                        if fsm.pending_unwinds.contains_key(&status_event.local_order_id) {
+                        if fsm
+                            .pending_unwinds
+                            .contains_key(&status_event.local_order_id)
+                        {
                             let effects = match status {
                                 "canceled" | "rejected" => fsm
                                     .on_unwind_terminal(&status_event.local_order_id)
                                     .into_iter()
+                                    .filter_map(|unwind| {
+                                        let remaining = unwind.order_size - unwind.matched_size;
+                                        (remaining > Decimal::ZERO).then_some(remaining)
+                                    })
                                     .flat_map(|remaining| {
                                         fsm.submit_unwind(
                                             remaining,
@@ -1425,8 +1649,44 @@ impl Strategy for LiquidityRewardFsmStrategy {
                                         )
                                     })
                                     .collect(),
-                                "filled" | "open" | "failed" => {
-                                    fsm.on_unwind_terminal(&status_event.local_order_id);
+                                "open" => Vec::new(),
+                                "filled" => {
+                                    if let Some(unwind) =
+                                        fsm.on_unwind_terminal(&status_event.local_order_id)
+                                    {
+                                        if unwind.kind == UnwindKind::Fill {
+                                            fsm.clear_fill_unwind_intent();
+                                        }
+                                    }
+                                    Vec::new()
+                                }
+                                "failed" => {
+                                    let unwind =
+                                        fsm.on_unwind_terminal(&status_event.local_order_id);
+                                    if unwind.is_some_and(|unwind| unwind.kind == UnwindKind::Fill)
+                                    {
+                                        let reason = status_event.reason.as_deref().unwrap_or("-");
+                                        if is_not_enough_balance_error(
+                                            status_event.reason.as_deref(),
+                                        ) && fsm.pending_fill_unwind.as_ref().is_some_and(
+                                            |intent| intent.attempts < FILL_UNWIND_MAX_ATTEMPTS,
+                                        ) {
+                                            fsm.retain_fill_unwind_after_balance_failure(
+                                                reason,
+                                                balance_cooldown,
+                                            );
+                                        } else if let Some(notification) =
+                                            fsm.manual_attention_notification(reason)
+                                        {
+                                            if let Some(notifier) = notifier.as_ref() {
+                                                notifier.try_notify(
+                                                    NotificationEvent::LiquidityRewardManualAttention(
+                                                        notification,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
                                     Vec::new()
                                 }
                                 _ => Vec::new(),
@@ -1458,7 +1718,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                                     HaltReason::Fill,
                                     Some(size),
                                     Some(local_order_id.as_str()),
-                                    &tick_size_map,
+                                    None,
                                 );
                                 execute_effects(
                                     effects,
@@ -1515,9 +1775,9 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             &rules,
                             &mut fsms,
                             HaltReason::Fill,
-                            Some(fill_event.delta_size),
+                            Some(fill_event.total_matched_size),
                             Some(fill_event.local_order_id.as_str()),
-                            &tick_size_map,
+                            fill_event.remote_order_id.as_deref(),
                         );
                         execute_effects(
                             effects,
@@ -1528,6 +1788,30 @@ impl Strategy for LiquidityRewardFsmStrategy {
                         if let Some(fsm) = fsms.get(fill_event.token.as_str()) {
                             persist_token_state(order_store.as_ref(), fsm);
                         }
+                    }
+                    StrategyEvent::TradeConfirmed(trade_event) => {
+                        let Some(fsm) = fsms.get_mut(trade_event.token.as_str()) else {
+                            continue;
+                        };
+                        if !fsm.mark_fill_trade_confirmed(&trade_event) {
+                            continue;
+                        }
+                        if let Some(snapshot) = latest_positions.as_ref() {
+                            let size = snapshot
+                                .by_asset
+                                .get(trade_event.token.as_str())
+                                .map(|position| position.size)
+                                .unwrap_or(Decimal::ZERO);
+                            fsm.update_fill_unwind_position(size);
+                        }
+                        let effects = fsm.submit_fill_unwind_if_ready(&tick_size_map);
+                        execute_effects(
+                            effects,
+                            simulation_enabled,
+                            &order_tx,
+                            market_store.as_ref(),
+                        );
+                        persist_token_state(order_store.as_ref(), fsm);
                     }
                     StrategyEvent::RewardPoolRemoval(removal_event) => {
                         let Some(token) = removal_pair_token(
@@ -1544,15 +1828,13 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             HaltReason::PoolRemoval,
                             None,
                             None,
-                            &tick_size_map,
+                            None,
                         );
                         for pool_token in [&removal_event.token1, &removal_event.token2] {
                             if let Some(rule) = rules.get(pool_token.as_str()) {
-                                let fsm = fsms
-                                    .entry(pool_token.clone())
-                                    .or_insert_with(|| {
-                                        TokenFsm::empty(pool_token.clone(), rule.topic.clone())
-                                    });
+                                let fsm = fsms.entry(pool_token.clone()).or_insert_with(|| {
+                                    TokenFsm::empty(pool_token.clone(), rule.topic.clone())
+                                });
                                 fsm.mark_pool_removal_unwind();
                             }
                         }
@@ -1575,11 +1857,13 @@ impl Strategy for LiquidityRewardFsmStrategy {
                         let snapshot = latest_positions
                             .as_ref()
                             .expect("latest positions just set");
-                        let effects = apply_pool_removal_positions(
+                        let mut effects =
+                            apply_pool_removal_positions(snapshot, &mut fsms, &tick_size_map);
+                        effects.extend(apply_fill_unwind_positions(
                             snapshot,
                             &mut fsms,
                             &tick_size_map,
-                        );
+                        ));
                         execute_effects(
                             effects,
                             simulation_enabled,
@@ -1640,7 +1924,10 @@ mod tests {
 
         assert!(matches!(
             fsm.quote,
-            QuoteState::Canceling { next: CancelNext::Wait, .. }
+            QuoteState::Canceling {
+                next: CancelNext::Wait,
+                ..
+            }
         ));
         assert!(matches!(
             &effects[0],
@@ -1713,7 +2000,11 @@ mod tests {
         ));
         assert!(matches!(
             fsm.quote,
-            QuoteState::Halted { active: Some(_), cancel_requested: true, reason: HaltReason::PoolRemoval }
+            QuoteState::Halted {
+                active: Some(_),
+                cancel_requested: true,
+                reason: HaltReason::PoolRemoval
+            }
         ));
     }
 
@@ -1727,8 +2018,108 @@ mod tests {
         assert!(effects.is_empty());
         assert!(matches!(
             fsm.quote,
-            QuoteState::Halted { active: None, cancel_requested: false, reason: HaltReason::Fill }
+            QuoteState::Halted {
+                active: None,
+                cancel_requested: false,
+                reason: HaltReason::Fill
+            }
         ));
+    }
+
+    #[test]
+    fn fill_unwind_intent_records_trigger_order_and_size() {
+        let mut fsm = token_fsm();
+
+        fsm.mark_fill_unwind_intent("buy-1", Some("remote-buy-1"), dec(20.0));
+        fsm.mark_fill_unwind_intent("buy-1", None, dec(10.0));
+
+        let created_at_ms = fsm
+            .pending_fill_unwind
+            .as_ref()
+            .expect("intent should be recorded")
+            .created_at_ms;
+        assert_eq!(
+            fsm.pending_fill_unwind,
+            Some(FillUnwindIntent {
+                trigger_local_order_id: "buy-1".to_string(),
+                trigger_remote_order_id: Some("remote-buy-1".to_string()),
+                remaining_size: dec(20.0),
+                trade_confirmed: false,
+                position_visible_size: None,
+                attempts: 0,
+                created_at_ms,
+                next_retry_after_ms: None,
+                last_error: None,
+                manual_notified: false,
+            })
+        );
+    }
+
+    #[test]
+    fn fill_unwind_balance_failure_keeps_intent_for_retry() {
+        let mut fsm = token_fsm();
+        fsm.market.best_bid = Some(dec(0.49));
+        fsm.mark_fill_unwind_intent("buy-1", Some("remote-buy-1"), dec(20.0));
+        fsm.mark_fill_trade_confirmed(&confirmed_trade("token1", "remote-buy-1"));
+        fsm.update_fill_unwind_position(dec(20.0));
+
+        let first = fsm.submit_fill_unwind_if_ready(&Arc::new(dashmap::DashMap::new()));
+        assert_eq!(first.len(), 1);
+        let first_id = match &first[0] {
+            Effect::MarketSell { local_order_id, .. } => local_order_id.clone(),
+            other => panic!("expected market sell, got {other:?}"),
+        };
+        let unwind = fsm
+            .on_unwind_terminal(&first_id)
+            .expect("pending unwind should exist");
+        assert_eq!(unwind.kind, UnwindKind::Fill);
+        fsm.retain_fill_unwind_after_balance_failure(
+            "not enough balance / allowance",
+            Duration::ZERO,
+        );
+
+        let retry = fsm.submit_fill_unwind_if_ready(&Arc::new(dashmap::DashMap::new()));
+        assert_eq!(retry.len(), 1);
+        assert!(matches!(
+            &retry[0],
+            Effect::MarketSell { order_size, .. } if *order_size == Decimal::from(20)
+        ));
+        assert_eq!(
+            fsm.pending_fill_unwind
+                .as_ref()
+                .expect("intent should remain")
+                .attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn fill_unwind_manual_attention_notifies_once() {
+        let mut fsm = token_fsm();
+        fsm.mark_fill_unwind_intent("buy-1", Some("remote-buy-1"), dec(20.0));
+        let intent = fsm
+            .pending_fill_unwind
+            .as_mut()
+            .expect("intent should be recorded");
+        intent.position_visible_size = Some(dec(15.0));
+        intent.attempts = FILL_UNWIND_MAX_ATTEMPTS;
+
+        let notification = fsm
+            .manual_attention_notification("not enough balance / allowance")
+            .expect("first manual attention should notify");
+        assert_eq!(notification.token, "token1");
+        assert_eq!(notification.trigger_local_order_id, "buy-1");
+        assert_eq!(
+            notification.trigger_remote_order_id.as_deref(),
+            Some("remote-buy-1")
+        );
+        assert_eq!(notification.remaining_size, dec(20.0));
+        assert_eq!(notification.visible_position_size, Some(dec(15.0)));
+        assert_eq!(notification.attempts, FILL_UNWIND_MAX_ATTEMPTS);
+        assert!(
+            fsm.manual_attention_notification("not enough balance / allowance")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1760,6 +2151,40 @@ mod tests {
                 unwind_in_flight: false,
             }
         );
+    }
+
+    #[test]
+    fn snaps_unwind_size_to_two_decimal_places() {
+        assert_eq!(
+            snap_unwind_size_to_lot("140.836205".parse::<Decimal>().unwrap()),
+            "140.83".parse::<Decimal>().unwrap()
+        );
+    }
+
+    #[test]
+    fn submit_unwind_uses_lot_adjusted_size() {
+        let mut fsm = token_fsm();
+        fsm.market.best_bid = Some(dec(0.71));
+
+        let effects = fsm.submit_unwind(
+            "140.836205".parse::<Decimal>().unwrap(),
+            &Arc::new(dashmap::DashMap::new()),
+            "unwind",
+            UnwindKind::Fill,
+        );
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::MarketSell { order_size, .. }
+                if *order_size == "140.83".parse::<Decimal>().unwrap()
+        ));
+        let pending = fsm
+            .pending_unwinds
+            .values()
+            .next()
+            .expect("pending unwind should be recorded");
+        assert_eq!(pending.order_size, "140.83".parse::<Decimal>().unwrap());
     }
 
     #[tokio::test]
@@ -1811,18 +2236,22 @@ mod tests {
         let handle = strategy.spawn(event_rx, order_tx);
 
         event_tx
-            .send(StrategyEvent::OrderStatus(crate::strategy::OrderStatusEvent {
-                token: "token1".to_string(),
-                local_order_id: "buy-1".to_string(),
-                status: Arc::from("filled"),
-                reason: None,
-            }))
+            .send(StrategyEvent::OrderStatus(
+                crate::strategy::OrderStatusEvent {
+                    token: "token1".to_string(),
+                    local_order_id: "buy-1".to_string(),
+                    status: Arc::from("filled"),
+                    reason: None,
+                },
+            ))
             .await
             .expect("filled status should send");
-        tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
-            .await
-            .expect("expected unwind after direct filled status")
-            .expect("order channel should remain open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "filled status must not submit unwind before confirmation"
+        );
         event_tx
             .send(StrategyEvent::Market(crate::strategy::MarketEvent {
                 topic: Arc::from(DEFAULT_TOPIC),
@@ -1838,6 +2267,119 @@ mod tests {
                 .is_err(),
             "halted fsm must not submit new quote"
         );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_unwind_open_status_keeps_remaining_retry_available() {
+        let strategy = LiquidityRewardFsmStrategy::from_rules(vec![test_rule()])
+            .expect("strategy should build")
+            .expect("strategy should exist");
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        event_tx
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 100.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::RewardPoolRemoval(
+                crate::strategy::RewardPoolRemovalEvent {
+                    condition_id: "0xabc".to_string(),
+                    token1: "token1".to_string(),
+                    token2: "token2".to_string(),
+                    reason: "token1_spread_gt_threshold".to_string(),
+                },
+            ))
+            .await
+            .expect("pool removal event should send");
+
+        let mut unwind_id = None;
+        for _ in 0..2 {
+            let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .expect("expected pool removal signal")
+                .expect("order channel should remain open");
+            if let OrderSignal::LiquidityRewardMarketSell {
+                local_order_id,
+                order_size,
+                ..
+            } = signal
+            {
+                assert_eq!(order_size, dec(100.0));
+                unwind_id = Some(local_order_id);
+            }
+        }
+        let unwind_id = unwind_id.expect("pool removal unwind should submit");
+
+        event_tx
+            .send(StrategyEvent::OrderStatus(
+                crate::strategy::OrderStatusEvent {
+                    token: "token1".to_string(),
+                    local_order_id: unwind_id.clone(),
+                    status: Arc::from("open"),
+                    reason: None,
+                },
+            ))
+            .await
+            .expect("open status should send");
+        event_tx
+            .send(StrategyEvent::OrderFill(crate::strategy::OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: unwind_id.clone(),
+                remote_order_id: None,
+                side: crate::strategy::QuoteSide::Sell,
+                delta_size: dec(40.0),
+                total_matched_size: dec(40.0),
+            }))
+            .await
+            .expect("unwind fill should send");
+        event_tx
+            .send(StrategyEvent::OrderStatus(
+                crate::strategy::OrderStatusEvent {
+                    token: "token1".to_string(),
+                    local_order_id: unwind_id,
+                    status: Arc::from("canceled"),
+                    reason: None,
+                },
+            ))
+            .await
+            .expect("canceled status should send");
+
+        let retry = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected retry for remaining unwind")
+            .expect("order channel should remain open");
+        assert!(matches!(
+            retry,
+            OrderSignal::LiquidityRewardMarketSell { order_size, .. } if order_size == dec(60.0)
+        ));
 
         handle.abort();
     }
@@ -1861,15 +2403,17 @@ mod tests {
         let handle = strategy.spawn(event_rx, order_tx);
 
         event_tx
-            .send(StrategyEvent::Positions(crate::strategy::PositionsUpdateEvent {
-                snapshot: Arc::new(crate::strategy::PositionSnapshot {
-                    by_asset: Arc::new(HashMap::from([(
-                        "token1".to_string(),
-                        position("token1", 12.5, 0.44),
-                    )])),
-                }),
-                changed_assets: Arc::from(["token1".to_string()]),
-            }))
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 12.5, 0.44),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
             .await
             .expect("positions event should send");
         event_tx
@@ -1933,15 +2477,17 @@ mod tests {
             .await
             .expect("pool removal event should send");
         event_tx
-            .send(StrategyEvent::Positions(crate::strategy::PositionsUpdateEvent {
-                snapshot: Arc::new(crate::strategy::PositionSnapshot {
-                    by_asset: Arc::new(HashMap::from([(
-                        "token2".to_string(),
-                        position("token2", 7.5, 0.49),
-                    )])),
-                }),
-                changed_assets: Arc::from(["token2".to_string()]),
-            }))
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token2".to_string(),
+                            position("token2", 7.5, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token2".to_string()]),
+                },
+            ))
             .await
             .expect("positions event should send");
         event_tx
@@ -1996,15 +2542,17 @@ mod tests {
                 .expect("order channel should remain open");
         }
         event_tx
-            .send(StrategyEvent::Positions(crate::strategy::PositionsUpdateEvent {
-                snapshot: Arc::new(crate::strategy::PositionSnapshot {
-                    by_asset: Arc::new(HashMap::from([
-                        ("token1".to_string(), position("token1", 3.0, 0.49)),
-                        ("token2".to_string(), position("token2", 4.0, 0.49)),
-                    ])),
-                }),
-                changed_assets: Arc::from(["token1".to_string(), "token2".to_string()]),
-            }))
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([
+                            ("token1".to_string(), position("token1", 3.0, 0.49)),
+                            ("token2".to_string(), position("token2", 4.0, 0.49)),
+                        ])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string(), "token2".to_string()]),
+                },
+            ))
             .await
             .expect("positions event should send");
         event_tx
@@ -2064,15 +2612,17 @@ mod tests {
             .expect("expected initial quote")
             .expect("order channel should remain open");
         event_tx
-            .send(StrategyEvent::Positions(crate::strategy::PositionsUpdateEvent {
-                snapshot: Arc::new(crate::strategy::PositionSnapshot {
-                    by_asset: Arc::new(HashMap::from([(
-                        "token1".to_string(),
-                        position("token1", 3.0, 0.49),
-                    )])),
-                }),
-                changed_assets: Arc::from(["token1".to_string()]),
-            }))
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 3.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
             .await
             .expect("positions event should send");
         for _ in 0..2 {
@@ -2136,15 +2686,17 @@ mod tests {
             .expect("expected initial quote")
             .expect("order channel should remain open");
         event_tx
-            .send(StrategyEvent::Positions(crate::strategy::PositionsUpdateEvent {
-                snapshot: Arc::new(crate::strategy::PositionSnapshot {
-                    by_asset: Arc::new(HashMap::from([(
-                        "token1".to_string(),
-                        position("token1", 5.0, 0.49),
-                    )])),
-                }),
-                changed_assets: Arc::from(["token1".to_string()]),
-            }))
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 5.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
             .await
             .expect("positions event should send");
         event_tx
@@ -2177,24 +2729,28 @@ mod tests {
         }
         let first_unwind_id = first_unwind_id.expect("pool removal unwind should submit");
         event_tx
-            .send(StrategyEvent::OrderStatus(crate::strategy::OrderStatusEvent {
-                token: "token1".to_string(),
-                local_order_id: first_unwind_id,
-                status: Arc::from("filled"),
-                reason: None,
-            }))
+            .send(StrategyEvent::OrderStatus(
+                crate::strategy::OrderStatusEvent {
+                    token: "token1".to_string(),
+                    local_order_id: first_unwind_id,
+                    status: Arc::from("filled"),
+                    reason: None,
+                },
+            ))
             .await
             .expect("unwind status should send");
         event_tx
-            .send(StrategyEvent::Positions(crate::strategy::PositionsUpdateEvent {
-                snapshot: Arc::new(crate::strategy::PositionSnapshot {
-                    by_asset: Arc::new(HashMap::from([(
-                        "token1".to_string(),
-                        position("token1", 3.0, 0.49),
-                    )])),
-                }),
-                changed_assets: Arc::from(["token1".to_string()]),
-            }))
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 3.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
             .await
             .expect("positions event should send");
 
@@ -2246,6 +2802,7 @@ mod tests {
                 topic: Some(Arc::from(DEFAULT_TOPIC)),
                 token: "token1".to_string(),
                 local_order_id: "historical-buy".to_string(),
+                remote_order_id: Some("remote-buy".to_string()),
                 side: crate::strategy::QuoteSide::Buy,
                 delta_size: Decimal::from(20),
                 total_matched_size: Decimal::from(20),
@@ -2254,11 +2811,11 @@ mod tests {
             .expect("fill event should send");
 
         let mut signals = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             signals.push(
                 tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
                     .await
-                    .expect("expected order signal")
+                    .expect("expected cancel signal")
                     .expect("order channel should remain open"),
             );
         }
@@ -2267,11 +2824,251 @@ mod tests {
             OrderSignal::LiquidityRewardCancel { token, active_local_order_id, .. }
                 if token == "token2" && active_local_order_id == "token2-active"
         )));
-        assert!(signals.iter().any(|signal| matches!(
+        assert!(
+            !signals
+                .iter()
+                .any(|signal| matches!(signal, OrderSignal::LiquidityRewardMarketSell { .. }))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "buy fill must not submit unwind before confirmation"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fill_unwind_waits_for_trade_and_position() {
+        let strategy = LiquidityRewardFsmStrategy::from_rules(vec![test_rule()])
+            .expect("strategy should build")
+            .expect("strategy should exist");
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        let quote = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        let buy_id = match quote {
+            OrderSignal::LiquidityRewardPlace { local_order_id, .. } => local_order_id,
+            other => panic!("expected buy quote, got {other:?}"),
+        };
+        event_tx
+            .send(StrategyEvent::OrderFill(crate::strategy::OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: buy_id.clone(),
+                remote_order_id: Some("remote-buy".to_string()),
+                side: crate::strategy::QuoteSide::Buy,
+                delta_size: Decimal::from(20),
+                total_matched_size: Decimal::from(20),
+            }))
+            .await
+            .expect("fill event should send");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err()
+        );
+
+        event_tx
+            .send(StrategyEvent::TradeConfirmed(confirmed_trade(
+                "token1",
+                "remote-buy",
+            )))
+            .await
+            .expect("trade event should send");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err()
+        );
+
+        event_tx
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 15.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
+            .await
+            .expect("positions event should send");
+
+        let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected fill unwind")
+            .expect("order channel should remain open");
+        assert!(matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, price, order_size, .. }
+                if token == "token1" && price == dec(0.49) && order_size == Decimal::from(15)
+        ));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fill_unwind_uses_cached_position_after_trade_confirmed() {
+        let strategy = LiquidityRewardFsmStrategy::from_rules(vec![test_rule()])
+            .expect("strategy should build")
+            .expect("strategy should exist");
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        let quote = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        let buy_id = match quote {
+            OrderSignal::LiquidityRewardPlace { local_order_id, .. } => local_order_id,
+            other => panic!("expected buy quote, got {other:?}"),
+        };
+        event_tx
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 30.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::OrderFill(crate::strategy::OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: buy_id.clone(),
+                remote_order_id: Some("remote-buy".to_string()),
+                side: crate::strategy::QuoteSide::Buy,
+                delta_size: Decimal::from(20),
+                total_matched_size: Decimal::from(20),
+            }))
+            .await
+            .expect("fill event should send");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err()
+        );
+
+        event_tx
+            .send(StrategyEvent::TradeConfirmed(confirmed_trade(
+                "token1",
+                "remote-buy",
+            )))
+            .await
+            .expect("trade event should send");
+
+        let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected fill unwind")
+            .expect("order channel should remain open");
+        assert!(matches!(
             signal,
             OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
-                if token == "token1" && *order_size == Decimal::from(20)
-        )));
+                if token == "token1" && order_size == Decimal::from(20)
+        ));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fill_unwind_ignores_unrelated_trade_confirmation() {
+        let strategy = LiquidityRewardFsmStrategy::from_rules(vec![test_rule()])
+            .expect("strategy should build")
+            .expect("strategy should exist");
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(16);
+        let handle = strategy.spawn(event_rx, order_tx);
+
+        event_tx
+            .send(StrategyEvent::Market(crate::strategy::MarketEvent {
+                topic: Arc::from(DEFAULT_TOPIC),
+                asset_id: Arc::from("token1"),
+                book: quoteable_book(),
+            }))
+            .await
+            .expect("market event should send");
+        let quote = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+            .await
+            .expect("expected initial quote")
+            .expect("order channel should remain open");
+        let buy_id = match quote {
+            OrderSignal::LiquidityRewardPlace { local_order_id, .. } => local_order_id,
+            other => panic!("expected buy quote, got {other:?}"),
+        };
+        event_tx
+            .send(StrategyEvent::OrderFill(crate::strategy::OrderFillEvent {
+                strategy: Arc::from("liquidity_reward"),
+                topic: Some(Arc::from(DEFAULT_TOPIC)),
+                token: "token1".to_string(),
+                local_order_id: buy_id.clone(),
+                remote_order_id: Some("remote-buy".to_string()),
+                side: crate::strategy::QuoteSide::Buy,
+                delta_size: Decimal::from(20),
+                total_matched_size: Decimal::from(20),
+            }))
+            .await
+            .expect("fill event should send");
+        event_tx
+            .send(StrategyEvent::Positions(
+                crate::strategy::PositionsUpdateEvent {
+                    snapshot: Arc::new(crate::strategy::PositionSnapshot {
+                        by_asset: Arc::new(HashMap::from([(
+                            "token1".to_string(),
+                            position("token1", 20.0, 0.49),
+                        )])),
+                    }),
+                    changed_assets: Arc::from(["token1".to_string()]),
+                },
+            ))
+            .await
+            .expect("positions event should send");
+        event_tx
+            .send(StrategyEvent::TradeConfirmed(confirmed_trade(
+                "token1",
+                "other-order",
+            )))
+            .await
+            .expect("trade event should send");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "unrelated trade must not submit fill unwind"
+        );
 
         handle.abort();
     }
@@ -2304,6 +3101,20 @@ mod tests {
             timestamp_ms: 1,
             bids: Arc::new(BTreeMap::from([(4900, 100)])),
             asks: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    fn confirmed_trade(token: &str, order_id: &str) -> crate::strategy::TradeConfirmedEvent {
+        crate::strategy::TradeConfirmedEvent {
+            token: token.to_string(),
+            market: "market".to_string(),
+            trade_id: "trade".to_string(),
+            size: Decimal::from(1),
+            price: dec(0.49),
+            side: crate::strategy::QuoteSide::Buy,
+            taker_order_id: Some(order_id.to_string()),
+            maker_order_ids: Arc::from(Vec::<String>::new()),
+            timestamp_ms: None,
         }
     }
 

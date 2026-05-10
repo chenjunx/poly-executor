@@ -100,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 读取 config.toml + config.local.toml，后续所有路径和开关都以这里为准。
     let app_config = load_app_config()?;
-    let (log_path, order_log_path) = init_log_paths(&app_config);
-    let _log_guards = logging::init_logging(&log_path, &order_log_path)?;
+    let log_path = init_log_path(&app_config);
+    let _log_guards = logging::init_logging(&log_path)?;
     let (order_store, market_store) = init_stores(&app_config)?;
 
     let recovery = recover_orders(&app_config, order_store.clone()).await?;
@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         proxy.clone(),
         strategy_tx.clone(),
         notifier.clone(),
-    );
+    )?;
 
     // order_tx 是所有策略向订单执行器提交下单/撤单信号的唯一入口。
     let (order_tx, order_rx) = tokio::sync::mpsc::channel::<OrderSignal>(64);
@@ -395,13 +395,24 @@ fn spawn_reward_market_tasks(
     proxy: Option<proxy_ws::Proxy>,
     strategy_tx: StrategySender,
     notifier: Option<Notifier>,
-) {
+) -> anyhow::Result<()> {
     let reward_market_tasks_enabled = app_config.liquidity_reward.enabled
         && app_config.liquidity_reward.monitor_enabled
         && !app_config.simulation.enabled;
     if !reward_market_tasks_enabled {
-        return;
+        return Ok(());
     }
+
+    let pool_max_rewards_min_size = app_config
+        .liquidity_reward
+        .pool_max_rewards_min_size
+        .map(|value| {
+            if !value.is_finite() || value <= 0.0 {
+                anyhow::bail!("liquidity_reward.pool_max_rewards_min_size 必须是正数");
+            }
+            Decimal::try_from(value).map_err(Into::into)
+        })
+        .transpose()?;
 
     // 三个后台任务分别负责奖励估算监控、每日池构建、池内市场健康检查。
     tokio::spawn(monitor::run_liquidity_reward_monitor(
@@ -416,6 +427,7 @@ fn spawn_reward_market_tasks(
         market_store.clone(),
         reward_market_monitor_interval,
         app_config.liquidity_reward.pool_market_count,
+        pool_max_rewards_min_size,
         strategy_tx.clone(),
     ));
     tokio::spawn(reward_market_pool_monitor::run_reward_market_pool_monitor(
@@ -431,6 +443,8 @@ fn spawn_reward_market_tasks(
             notifier,
         },
     ));
+
+    Ok(())
 }
 
 fn spawn_reward_estimator(
@@ -609,18 +623,13 @@ fn spawn_order_tasks(
     }
 }
 
-fn init_log_paths(app_config: &AppConfig) -> (String, String) {
+fn init_log_path(app_config: &AppConfig) -> String {
     let log_filename = if !app_config.app.log_file.is_empty() {
         app_config.app.log_file.as_str()
     } else {
         "alerts.log"
     };
-    let order_log_filename = if !app_config.app.order_log_file.is_empty() {
-        app_config.app.order_log_file.as_str()
-    } else {
-        "orders.log"
-    };
-    (resolve_path(log_filename), resolve_path(order_log_filename))
+    resolve_path(log_filename)
 }
 
 fn init_stores(app_config: &AppConfig) -> anyhow::Result<(OrderStore, MarketStore)> {

@@ -22,7 +22,7 @@ use crate::{
     strategy::{
         OrderSignal, QuoteSide, Strategy, StrategyEvent, StrategyRegistration, TopicRegistration,
     },
-    tick_size::{TickSizeMap, snap_price_to_tick},
+    tick_size::{TickSizeMap, snap_price_to_tick, snap_unwind_size_to_lot},
 };
 
 const DEFAULT_TOPIC: &str = "liquidity_reward";
@@ -941,6 +941,7 @@ impl Strategy for LiquidityRewardStrategy {
                             &tick_size_map,
                         );
                     }
+                    StrategyEvent::TradeConfirmed(_trade_event) => {}
                     StrategyEvent::RewardPoolRemoval(removal_event) => {
                         // 池子剔除是外部风控事件：即使没有成交，也要停止整对做市。
                         let Some(token) = removal_pair_tokens(
@@ -1250,11 +1251,6 @@ fn is_size_precision_error(reason: Option<&str>) -> bool {
                 && reason.contains("decimal points")
                 && reason.contains("must be <= 2"))
     })
-}
-
-fn snap_unwind_size_to_lot(size: Decimal) -> Decimal {
-    let scale = Decimal::from(100);
-    (size * scale).floor() / scale
 }
 
 fn next_unwind_retry_order_id(token: &str, attempts: u8) -> String {
@@ -1781,6 +1777,7 @@ mod tests {
                 topic: Some(Arc::from(DEFAULT_TOPIC)),
                 token: "token1".to_string(),
                 local_order_id: "late-buy-fill".to_string(),
+                remote_order_id: None,
                 side: QuoteSide::Buy,
                 delta_size: Decimal::from(1),
                 total_matched_size: Decimal::from(1),
@@ -1942,6 +1939,7 @@ mod tests {
                 topic: Some(Arc::from(DEFAULT_TOPIC)),
                 token: "token1".to_string(),
                 local_order_id: "historical-buy".to_string(),
+                remote_order_id: None,
                 side: QuoteSide::Buy,
                 delta_size: Decimal::from(20),
                 total_matched_size: Decimal::from(20),
@@ -2000,6 +1998,7 @@ mod tests {
                 topic: Some(Arc::from(DEFAULT_TOPIC)),
                 token: "token1".to_string(),
                 local_order_id: "historical-buy".to_string(),
+                remote_order_id: None,
                 side: QuoteSide::Buy,
                 delta_size: Decimal::from(20),
                 total_matched_size: Decimal::from(20),

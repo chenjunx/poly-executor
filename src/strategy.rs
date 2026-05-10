@@ -288,6 +288,7 @@ pub struct OrderFillEvent {
     pub topic: Option<Arc<str>>,
     pub token: String,
     pub local_order_id: String,
+    pub remote_order_id: Option<String>,
     pub side: QuoteSide,
     pub delta_size: Decimal,
     pub total_matched_size: Decimal,
@@ -302,11 +303,25 @@ pub struct RewardPoolRemovalEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct TradeConfirmedEvent {
+    pub token: String,
+    pub market: String,
+    pub trade_id: String,
+    pub size: Decimal,
+    pub price: Decimal,
+    pub side: QuoteSide,
+    pub taker_order_id: Option<String>,
+    pub maker_order_ids: Arc<[String]>,
+    pub timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
     Positions(PositionsUpdateEvent),
     OrderStatus(OrderStatusEvent),
     OrderFill(OrderFillEvent),
+    TradeConfirmed(TradeConfirmedEvent),
     RewardPoolRemoval(RewardPoolRemovalEvent),
 }
 

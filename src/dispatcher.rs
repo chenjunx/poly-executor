@@ -101,6 +101,21 @@ impl Dispatcher {
                         }
                     }
                 }
+                StrategyEvent::TradeConfirmed(trade_event) => {
+                    if let Some(strategies) = self.position_routes.get(&trade_event.token) {
+                        for strategy in strategies {
+                            if let Err(err) = strategy.tx.try_send(event.clone()) {
+                                warn!(
+                                    strategy = %strategy.name,
+                                    asset_id = %trade_event.token,
+                                    trade_id = %trade_event.trade_id,
+                                    error = %err,
+                                    "dispatcher 投递成交确认事件失败"
+                                );
+                            }
+                        }
+                    }
+                }
                 StrategyEvent::RewardPoolRemoval(removal_event) => {
                     let mut notified: std::collections::HashSet<Arc<str>> =
                         std::collections::HashSet::new();

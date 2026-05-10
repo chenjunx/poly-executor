@@ -718,11 +718,7 @@ async fn place_liquidity_reward_market_sell(
     meta.remote_order_id = Some(response.order_id.clone());
     correlations.insert(local_order_id.to_string(), meta.clone());
     correlations.insert(response.order_id.clone(), meta.clone());
-    let status = if response.success && response.status == OrderStatusType::Matched {
-        "filled"
-    } else {
-        "failed"
-    };
+    let status = market_sell_local_status(response.success, &response.status);
     let _ = order_store.update_order_remote_and_status(
         local_order_id,
         &response.order_id,
@@ -732,11 +728,7 @@ async fn place_liquidity_reward_market_sell(
     let _ = order_store.append_order_event(
         Some(local_order_id),
         Some(&response.order_id),
-        if status == "filled" {
-            "submit_succeeded"
-        } else {
-            "submit_failed"
-        },
+        submit_event_type(response.success),
         json!({
             "execution": "market_fak",
             "strategy": strategy.as_ref(),
@@ -766,20 +758,49 @@ async fn place_liquidity_reward_market_sell(
         "liquidity_reward FAK 市价卖单完成，已写入本地与远端订单关联"
     );
 
-    if response.success && response.status == OrderStatusType::Matched {
-        Ok(PlaceOrderOutcome::Matched)
+    Ok(market_sell_outcome(
+        response.success,
+        &response.status,
+        response.error_msg,
+    ))
+}
+
+fn market_sell_local_status(success: bool, status: &OrderStatusType) -> &'static str {
+    if !success {
+        "failed"
+    } else if matches!(status, OrderStatusType::Matched) {
+        "filled"
     } else {
-        Ok(PlaceOrderOutcome::Rejected {
-            reason: response
-                .error_msg
-                .filter(|msg| !msg.is_empty())
-                .or_else(|| {
-                    Some(format!(
-                        "FAK market sell did not match immediately: status={:?}, success={}",
-                        response.status, response.success
-                    ))
-                }),
-        })
+        "open"
+    }
+}
+
+fn submit_event_type(success: bool) -> &'static str {
+    if success {
+        "submit_succeeded"
+    } else {
+        "submit_failed"
+    }
+}
+
+fn market_sell_outcome(
+    success: bool,
+    status: &OrderStatusType,
+    error_msg: Option<String>,
+) -> PlaceOrderOutcome {
+    if !success {
+        PlaceOrderOutcome::Rejected {
+            reason: error_msg.filter(|msg| !msg.is_empty()).or_else(|| {
+                Some(format!(
+                    "FAK market sell was rejected: status={:?}, success={}",
+                    status, success
+                ))
+            }),
+        }
+    } else if matches!(status, OrderStatusType::Matched) {
+        PlaceOrderOutcome::Matched
+    } else {
+        PlaceOrderOutcome::Placed
     }
 }
 
@@ -840,6 +861,58 @@ fn to_sdk_side(side: QuoteSide) -> Side {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_delayed_market_sell_is_placed_open_submit_succeeded() {
+        assert_eq!(
+            market_sell_local_status(true, &OrderStatusType::Delayed),
+            "open"
+        );
+        assert_eq!(submit_event_type(true), "submit_succeeded");
+        assert!(matches!(
+            market_sell_outcome(true, &OrderStatusType::Delayed, None),
+            PlaceOrderOutcome::Placed
+        ));
+    }
+
+    #[test]
+    fn successful_unmatched_market_sell_is_placed_open_submit_succeeded() {
+        assert_eq!(
+            market_sell_local_status(true, &OrderStatusType::Unmatched),
+            "open"
+        );
+        assert_eq!(submit_event_type(true), "submit_succeeded");
+        assert!(matches!(
+            market_sell_outcome(true, &OrderStatusType::Unmatched, None),
+            PlaceOrderOutcome::Placed
+        ));
+    }
+
+    #[test]
+    fn matched_market_sell_is_filled_matched_submit_succeeded() {
+        assert_eq!(
+            market_sell_local_status(true, &OrderStatusType::Matched),
+            "filled"
+        );
+        assert_eq!(submit_event_type(true), "submit_succeeded");
+        assert!(matches!(
+            market_sell_outcome(true, &OrderStatusType::Matched, None),
+            PlaceOrderOutcome::Matched
+        ));
+    }
+
+    #[test]
+    fn failed_market_sell_is_rejected_failed_submit_failed() {
+        assert_eq!(
+            market_sell_local_status(false, &OrderStatusType::Delayed),
+            "failed"
+        );
+        assert_eq!(submit_event_type(false), "submit_failed");
+        assert!(matches!(
+            market_sell_outcome(false, &OrderStatusType::Delayed, Some("rejected".to_string())),
+            PlaceOrderOutcome::Rejected { reason } if reason.as_deref() == Some("rejected")
+        ));
+    }
 
     #[test]
     fn detects_not_enough_balance_error() {

@@ -58,6 +58,7 @@ pub struct RewardMarketPoolRules {
 pub enum RewardMarketRule {
     MinDailyReward(Decimal),
     MinHoursBeforeEnd(i64),
+    MaxRewardsMinSize(Decimal),
     ExcludeCompetitivenessTails {
         lower_percent: u32,
         upper_percent: u32,
@@ -71,15 +72,19 @@ impl RewardMarketPoolRules {
         }
     }
 
-    pub fn default_active_pool() -> Self {
-        Self::new([
+    pub fn default_active_pool(max_rewards_min_size: Option<Decimal>) -> Self {
+        let mut rules = vec![
             RewardMarketRule::MinDailyReward(Decimal::from(50u32)),
             RewardMarketRule::MinHoursBeforeEnd(48),
-            RewardMarketRule::ExcludeCompetitivenessTails {
-                lower_percent: 20,
-                upper_percent: 20,
-            },
-        ])
+        ];
+        if let Some(max_rewards_min_size) = max_rewards_min_size {
+            rules.push(RewardMarketRule::MaxRewardsMinSize(max_rewards_min_size));
+        }
+        rules.push(RewardMarketRule::ExcludeCompetitivenessTails {
+            lower_percent: 20,
+            upper_percent: 20,
+        });
+        Self::new(rules)
     }
 
     fn basic_matches(&self, market: &CurrentRewardResponse, now: NaiveDateTime) -> bool {
@@ -106,6 +111,9 @@ impl RewardMarketRule {
                     end_time - now > ChronoDuration::hours(*min_hours_before_end)
                 })
             }
+            Self::MaxRewardsMinSize(max_rewards_min_size) => {
+                market.rewards_min_size <= *max_rewards_min_size
+            }
             Self::ExcludeCompetitivenessTails { .. } => true,
         }
     }
@@ -126,9 +134,10 @@ pub async fn run_reward_market_loader(
     store: MarketStore,
     refresh_interval: Duration,
     liquidity_reward_market_count: usize,
+    max_rewards_min_size: Option<Decimal>,
     strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
 ) {
-    let pool_rules = RewardMarketPoolRules::default_active_pool();
+    let pool_rules = RewardMarketPoolRules::default_active_pool(max_rewards_min_size);
     let retry_interval = refresh_interval.max(Duration::from_secs(60));
     let mut last_success_meta = match load_initial_reward_market_pool_meta(&store) {
         Ok(meta) => meta,
@@ -465,6 +474,15 @@ mod tests {
     }
 
     fn market(condition_id: B256, rate_per_day: &str, end_date: &str) -> CurrentRewardResponse {
+        market_with_min_size(condition_id, rate_per_day, end_date, "1")
+    }
+
+    fn market_with_min_size(
+        condition_id: B256,
+        rate_per_day: &str,
+        end_date: &str,
+        rewards_min_size: &str,
+    ) -> CurrentRewardResponse {
         serde_json::from_value(json!({
             "condition_id": condition_id.to_string(),
             "rewards_config": [{
@@ -475,7 +493,7 @@ mod tests {
                 "total_rewards": "1000"
             }],
             "rewards_max_spread": "1",
-            "rewards_min_size": "1",
+            "rewards_min_size": rewards_min_size,
         }))
         .expect("test market should deserialize")
     }
@@ -521,15 +539,27 @@ mod tests {
     }
 
     #[test]
-    fn applies_daily_reward_and_end_time_basic_rules() {
-        let rules = RewardMarketPoolRules::default_active_pool();
+    fn applies_daily_reward_end_time_and_min_size_basic_rules() {
+        let rules = RewardMarketPoolRules::default_active_pool(Some(Decimal::from(100u32)));
         let eligible = market(condition_id(4), "51", "2026-05-10");
         let low_reward = market(condition_id(5), "50", "2026-05-10");
         let ending_soon = market(condition_id(6), "51", "2026-05-03");
+        let oversized = market_with_min_size(condition_id(7), "51", "2026-05-10", "1000");
+        let capped = market_with_min_size(condition_id(8), "51", "2026-05-10", "100");
 
         assert!(rules.basic_matches(&eligible, test_now()));
         assert!(!rules.basic_matches(&low_reward, test_now()));
         assert!(!rules.basic_matches(&ending_soon, test_now()));
+        assert!(!rules.basic_matches(&oversized, test_now()));
+        assert!(rules.basic_matches(&capped, test_now()));
+    }
+
+    #[test]
+    fn default_active_pool_allows_any_min_size_without_cap() {
+        let rules = RewardMarketPoolRules::default_active_pool(None);
+        let oversized = market_with_min_size(condition_id(9), "51", "2026-05-10", "1000");
+
+        assert!(rules.basic_matches(&oversized, test_now()));
     }
 
     #[test]

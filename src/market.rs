@@ -7,7 +7,7 @@ use polymarket_client_sdk_v2::clob::ws::types::response::{
     BookUpdate, PriceChangeBatchEntry, WsMessage,
 };
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::monitor::FullBookSnapshot;
 use crate::proxy_ws;
@@ -442,7 +442,7 @@ fn log_liquidity_reward_orderbook_diagnostics(
                 if change.asset_id.to_string().as_str() != asset_id.as_ref() {
                     continue;
                 }
-                info!(
+                debug!(
                     target: "order",
                     asset_id = %asset_id,
                     event_type = "price_change",

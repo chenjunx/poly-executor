@@ -5,7 +5,11 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
+use polymarket_client_sdk_v2::clob::types::Side;
 use polymarket_client_sdk_v2::clob::ws::Client;
+use polymarket_client_sdk_v2::clob::ws::types::response::{
+    TradeMessage, TradeMessageStatus, WsMessage,
+};
 use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
 use tracing::{info, warn};
@@ -15,7 +19,10 @@ use crate::{
     notification::{LiquidityRewardFillNotification, NotificationEvent, Notifier},
     positions::PositionRefreshTrigger,
     storage::OrderStore,
-    strategy::{OrderCorrelationMap, OrderFillEvent, OrderStatusEvent, StrategyEvent},
+    strategy::{
+        OrderCorrelationMap, OrderFillEvent, OrderStatusEvent, QuoteSide, StrategyEvent,
+        TradeConfirmedEvent,
+    },
 };
 
 pub async fn run(
@@ -65,13 +72,13 @@ async fn subscribe_orders(
     let credentials = rest_client.create_or_derive_api_key(&signer, None).await?;
 
     let client = Client::default().authenticate(credentials, address)?;
-    let mut stream = Box::pin(client.subscribe_orders(Vec::new())?);
+    let mut stream = Box::pin(client.subscribe_user_events(Vec::new())?);
 
     info!(target: "order", funder = %auth.funder, "已连接订单 websocket 并开始监听订单变化");
 
     while let Some(message) = stream.next().await {
         match message {
-            Ok(order) => {
+            Ok(WsMessage::Order(order)) => {
                 let local_meta = correlations.get(&order.id).map(|entry| entry.clone());
                 let local_meta = match local_meta {
                     Some(meta) => Some(meta),
@@ -172,6 +179,7 @@ async fn subscribe_orders(
                                 topic: local_meta.topic.clone(),
                                 token: local_meta.token.clone(),
                                 local_order_id: local_meta.local_order_id.clone(),
+                                remote_order_id: local_meta.remote_order_id.clone(),
                                 side: local_meta.side,
                                 delta_size,
                                 total_matched_size,
@@ -275,6 +283,14 @@ async fn subscribe_orders(
                     });
                 }
             }
+            Ok(WsMessage::Trade(trade)) => {
+                if let Some(event) = trade_confirmed_event(&trade) {
+                    if let Err(error) = strategy_tx.try_send(StrategyEvent::TradeConfirmed(event)) {
+                        warn!(target: "order", trade_id = %trade.id, error = %error, "trade CONFIRMED 事件投递策略失败");
+                    }
+                }
+            }
+            Ok(_) => {}
             Err(error) => {
                 return Err(error.into());
             }
@@ -282,6 +298,34 @@ async fn subscribe_orders(
     }
 
     Ok(())
+}
+
+fn trade_confirmed_event(trade: &TradeMessage) -> Option<TradeConfirmedEvent> {
+    if trade.status != TradeMessageStatus::Confirmed {
+        return None;
+    }
+    let side = match trade.side {
+        Side::Buy => QuoteSide::Buy,
+        Side::Sell => QuoteSide::Sell,
+        Side::Unknown => return None,
+        _ => return None,
+    };
+    Some(TradeConfirmedEvent {
+        token: trade.asset_id.to_string(),
+        market: trade.market.to_string(),
+        trade_id: trade.id.clone(),
+        size: trade.size,
+        price: trade.price,
+        side,
+        taker_order_id: trade.taker_order_id.clone(),
+        maker_order_ids: trade
+            .maker_orders
+            .iter()
+            .map(|maker| maker.order_id.clone())
+            .collect::<Vec<_>>()
+            .into(),
+        timestamp_ms: trade.timestamp.or(trade.last_update).or(trade.matchtime),
+    })
 }
 
 fn fill_delta(

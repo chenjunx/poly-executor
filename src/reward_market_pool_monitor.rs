@@ -29,6 +29,7 @@ struct RewardMarketPoolPair {
     question: Option<String>,
     token1: String,
     token2: String,
+    used_by_liquidity_reward: bool,
 }
 
 pub async fn run_reward_market_pool_monitor(
@@ -122,6 +123,10 @@ fn pool_pairs_from_active_entries(
             question: entry.question,
             token1: entry.token1,
             token2: entry.token2,
+            used_by_liquidity_reward: entry.liquidity_reward_selected
+                && (!entry.liquidity_reward_halted
+                    || entry.liquidity_reward_halted_pool_version.is_none()
+                    || entry.liquidity_reward_halted_pool_version != entry.pool_version),
         })
         .collect()
 }
@@ -226,7 +231,7 @@ fn notify_pool_removal(
         warn!(target: "order", condition_id = %pair.condition_id, error = %error, "reward_market_pool_monitor 投递奖励池剔除事件失败");
     }
 
-    if let Some(notifier) = config.notifier.as_ref() {
+    if let (true, Some(notifier)) = (pair.used_by_liquidity_reward, config.notifier.as_ref()) {
         notifier.try_notify(NotificationEvent::LiquidityRewardPoolRemoval(
             LiquidityRewardPoolRemovalNotification {
                 strategy: "liquidity_reward".to_string(),
@@ -330,5 +335,57 @@ mod tests {
             conditions_by_token.get("token2").unwrap(),
             &vec!["0xabc".to_string()]
         );
+        assert!(!pairs_by_condition["0xabc"].used_by_liquidity_reward);
+    }
+
+    #[test]
+    fn pool_pair_marks_only_current_strategy_entries_as_used() {
+        let selected = ActiveRewardMarketPoolEntry {
+            condition_id: "selected".to_string(),
+            market_slug: None,
+            question: None,
+            token1: "token1".to_string(),
+            token2: "token2".to_string(),
+            tokens_json: "[]".to_string(),
+            market_competitiveness: None,
+            rewards_min_size: None,
+            rewards_max_spread: None,
+            market_daily_reward: None,
+            build_date_utc: Some("2026-05-09".to_string()),
+            pool_version: Some(123),
+            liquidity_reward_selected: true,
+            liquidity_reward_selected_at_ms: Some(1),
+            liquidity_reward_select_reason: Some("test".to_string()),
+            liquidity_reward_select_rank: Some(1),
+            liquidity_reward_halted: false,
+            liquidity_reward_halted_at_ms: None,
+            liquidity_reward_halt_reason: None,
+            liquidity_reward_halted_pool_version: None,
+        };
+        let current_version_halted = ActiveRewardMarketPoolEntry {
+            condition_id: "halted".to_string(),
+            liquidity_reward_halted: true,
+            liquidity_reward_halted_pool_version: Some(123),
+            ..selected.clone()
+        };
+        let old_version_halted = ActiveRewardMarketPoolEntry {
+            condition_id: "old-halted".to_string(),
+            liquidity_reward_halted: true,
+            liquidity_reward_halted_pool_version: Some(122),
+            ..selected.clone()
+        };
+
+        let pairs = pool_pairs_from_active_entries(vec![
+            selected,
+            current_version_halted,
+            old_version_halted,
+        ])
+        .into_iter()
+        .map(|pair| (pair.condition_id.clone(), pair.used_by_liquidity_reward))
+        .collect::<HashMap<_, _>>();
+
+        assert_eq!(pairs["0xselected"], true);
+        assert_eq!(pairs["0xhalted"], false);
+        assert_eq!(pairs["0xold-halted"], true);
     }
 }

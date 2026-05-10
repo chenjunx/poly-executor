@@ -27,7 +27,6 @@ pub(crate) struct ProxySettings {
 #[derive(Debug, Deserialize)]
 pub(crate) struct AppSettings {
     pub(crate) log_file: String,
-    pub(crate) order_log_file: String,
     pub(crate) assets_file: String,
     #[serde(default)]
     pub(crate) sqlite_path: String,
@@ -77,6 +76,8 @@ pub(crate) struct LiquidityRewardConfig {
     #[serde(default = "default_liquidity_reward_pool_market_count")]
     pub(crate) pool_market_count: usize,
     #[serde(default)]
+    pub(crate) pool_max_rewards_min_size: Option<f64>,
+    #[serde(default)]
     pub(crate) monitor_enabled: bool,
     #[serde(default)]
     pub(crate) simulation: bool,
@@ -93,6 +94,7 @@ impl Default for LiquidityRewardConfig {
             file: String::new(),
             source: default_liquidity_reward_source(),
             pool_market_count: default_liquidity_reward_pool_market_count(),
+            pool_max_rewards_min_size: None,
             monitor_enabled: false,
             simulation: false,
             reward_estimator_enabled: default_true(),
