@@ -86,9 +86,10 @@ stateDiagram-v2
 节点含义：
 
 - `StrategyEvent::Market`：公开行情事件，驱动正常报价、停机撤单重试、池子剔除延迟清仓。
-- `StrategyEvent::OrderFill`：订单成交增量事件，买单成交会触发整对停机，unwind 卖单成交只更新已卖数量。
+- `StrategyEvent::OrderFill`：订单成交增量事件，买单成交会触发整对停机并标记 fill unwind 意图，unwind 卖单成交只更新已卖数量。
+- `StrategyEvent::TradeConfirmed`：trade WS confirmed 事件，仅补充 fill unwind 诊断状态；成交后清仓不再等待该事件。
 - `StrategyEvent::RewardPoolRemoval`：奖励池剔除事件，触发整对停机并标记等待 positions 清仓。
-- `StrategyEvent::Positions`：持仓快照事件，用于池子剔除后确认实际仓位并提交清仓卖单。
+- `StrategyEvent::Positions`：持仓快照事件，用于池子剔除和成交后 fill unwind 的实际仓位确认；仓位为正即可尝试提交清仓卖单。
 - `execute_effects`：把 FSM 产生的 effect 转成 `OrderSignal` 或 DB 写入。
 - `persist_token_state`：把当前 quote FSM 投影写入 orders.db，供重启恢复。
 
@@ -113,8 +114,14 @@ flowchart TD
     IsUnwindFill -->|no 否| IsBuy{liquidity_reward buy?<br/>是否本策略买单成交}
     IsBuy -->|yes 是| PoolPending{PoolRemovalPending?<br/>是否已在池子剔除清仓流程}
     PoolPending -->|yes 是| WaitPositions[等待 Positions 统一清仓<br/>避免按 delta_size 重复卖]
-    PoolPending -->|no 否| HaltPair[halt_pair_fsm + unwind delta_size<br/>整对停机并按成交增量清仓]
-    HaltPair --> Execute
+    PoolPending -->|no 否| HaltPair[halt_pair_fsm + mark_fill_unwind_intent<br/>整对停机并等待持仓可见]
+    HaltPair --> FillHasPositions{latest_positions?<br/>是否已有最近持仓快照}
+    FillHasPositions -->|yes 是| ApplyFillPositions[apply_fill_unwind_positions<br/>正持仓即可提交 fill 清仓]
+    FillHasPositions -->|no 否| Execute
+    ApplyFillPositions --> Execute
+
+    TradeConfirmed[StrategyEvent::TradeConfirmed<br/>trade WS confirmed 事件] --> MarkConfirmed[mark_fill_trade_confirmed<br/>记录确认状态用于诊断]
+    MarkConfirmed --> FillHasPositions
 
     RewardRemoval[StrategyEvent::RewardPoolRemoval<br/>奖励池剔除事件] --> HaltPoolPair[halt_pair_fsm PoolRemoval<br/>整对停机并撤 active 买单]
     HaltPoolPair --> MarkRisk[mark_pool_removal_unwind<br/>标记等待持仓快照清仓]
@@ -125,4 +132,5 @@ flowchart TD
 
     Positions[StrategyEvent::Positions<br/>持仓快照事件] --> CacheSnapshot[缓存 latest_positions<br/>更新最近持仓快照]
     CacheSnapshot --> ApplyPositions
+    CacheSnapshot --> ApplyFillPositions
 ```

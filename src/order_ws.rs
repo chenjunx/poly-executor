@@ -276,14 +276,32 @@ async fn subscribe_orders(
                 if matches!(status, "partially_filled" | "filled") {
                     let positions_refresh_tx = positions_refresh_tx.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
-                        tokio::time::sleep(Duration::from_secs(12)).await;
-                        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+                        for delay in post_fill_position_refresh_delays() {
+                            tokio::time::sleep(*delay).await;
+                            let _ =
+                                positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
+                        }
                     });
                 }
             }
             Ok(WsMessage::Trade(trade)) => {
+                let maker_order_ids = trade_maker_order_ids(&trade);
+                info!(
+                    target: "order",
+                    trade_id = %trade.id,
+                    market = %trade.market,
+                    asset_id = %trade.asset_id,
+                    side = ?trade.side,
+                    status = ?trade.status,
+                    size = %trade.size,
+                    price = %trade.price,
+                    taker_order_id = ?trade.taker_order_id,
+                    maker_order_ids = ?maker_order_ids,
+                    timestamp = ?trade.timestamp,
+                    last_update = ?trade.last_update,
+                    matchtime = ?trade.matchtime,
+                    "收到 trade websocket 更新"
+                );
                 if let Some(event) = trade_confirmed_event(&trade) {
                     if let Err(error) = strategy_tx.try_send(StrategyEvent::TradeConfirmed(event)) {
                         warn!(target: "order", trade_id = %trade.id, error = %error, "trade CONFIRMED 事件投递策略失败");
@@ -328,6 +346,25 @@ fn trade_confirmed_event(trade: &TradeMessage) -> Option<TradeConfirmedEvent> {
     })
 }
 
+const POST_FILL_POSITION_REFRESH_DELAYS: [Duration; 4] = [
+    Duration::from_secs(3),
+    Duration::from_secs(12),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+fn post_fill_position_refresh_delays() -> &'static [Duration] {
+    &POST_FILL_POSITION_REFRESH_DELAYS
+}
+
+fn trade_maker_order_ids(trade: &TradeMessage) -> Vec<String> {
+    trade
+        .maker_orders
+        .iter()
+        .map(|maker| maker.order_id.clone())
+        .collect()
+}
+
 fn fill_delta(
     previous_size_matched: Option<Decimal>,
     current_size_matched: Option<Decimal>,
@@ -367,6 +404,65 @@ mod tests {
 
     fn dec(value: f64) -> Decimal {
         Decimal::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn post_fill_position_refreshes_extend_to_one_minute() {
+        let cumulative = post_fill_position_refresh_delays()
+            .iter()
+            .scan(Duration::ZERO, |elapsed, delay| {
+                *elapsed += *delay;
+                Some(*elapsed)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            cumulative,
+            vec![
+                Duration::from_secs(3),
+                Duration::from_secs(15),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            ]
+        );
+    }
+
+    #[test]
+    fn trade_maker_order_ids_extracts_order_ids() {
+        let trade = TradeMessage::builder()
+            .id("trade-1".to_string())
+            .market(
+                "0xfbc0c760359fe3f73b833535186c9592deda90f373d79b10c0af6ea6a1f947f1"
+                    .parse()
+                    .unwrap(),
+            )
+            .asset_id(
+                "31266632690440281732493182712982317452788219157475457369452413915821186184190"
+                    .parse()
+                    .unwrap(),
+            )
+            .side(polymarket_client_sdk_v2::clob::types::Side::Buy)
+            .size(dec(1.0))
+            .price(dec(0.56))
+            .status(TradeMessageStatus::Matched)
+            .taker_order_id("taker-1".to_string())
+            .maker_orders(vec![
+                polymarket_client_sdk_v2::clob::ws::types::response::MakerOrder::builder()
+                    .asset_id(
+                        "31266632690440281732493182712982317452788219157475457369452413915821186184190"
+                            .parse()
+                            .unwrap(),
+                    )
+                    .matched_amount(dec(1.0))
+                    .order_id("maker-1".to_string())
+                    .outcome("YES".to_string())
+                    .owner("00000000-0000-0000-0000-000000000001".parse().unwrap())
+                    .price(dec(0.56))
+                    .build(),
+            ])
+            .build();
+
+        assert_eq!(trade_maker_order_ids(&trade), vec!["maker-1".to_string()]);
     }
 
     #[test]

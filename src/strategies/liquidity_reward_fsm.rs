@@ -270,7 +270,7 @@ impl TokenFsm {
         let Some(intent) = self.pending_fill_unwind.clone() else {
             return Vec::new();
         };
-        if !intent.trade_confirmed || intent.attempts >= FILL_UNWIND_MAX_ATTEMPTS {
+        if intent.attempts >= FILL_UNWIND_MAX_ATTEMPTS {
             return Vec::new();
         }
         if self
@@ -2056,6 +2056,46 @@ mod tests {
     }
 
     #[test]
+    fn fill_unwind_submits_when_position_visible_before_trade_confirmed() {
+        let mut fsm = token_fsm();
+        fsm.market.best_bid = Some(dec(0.57));
+        fsm.mark_fill_unwind_intent("buy-1", Some("remote-buy-1"), dec(20.0));
+        fsm.update_fill_unwind_position(dec(1.090908));
+
+        let effects = fsm.submit_fill_unwind_if_ready(&Arc::new(dashmap::DashMap::new()));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::MarketSell { token, price, order_size, .. }
+                if token == "token1" && *price == dec(0.57) && *order_size == dec(1.09)
+        ));
+        let intent = fsm
+            .pending_fill_unwind
+            .as_ref()
+            .expect("intent should remain until unwind fills");
+        assert!(!intent.trade_confirmed);
+        assert_eq!(intent.attempts, 1);
+    }
+
+    #[test]
+    fn fill_unwind_waits_when_position_not_visible() {
+        let mut fsm = token_fsm();
+        fsm.market.best_bid = Some(dec(0.57));
+        fsm.mark_fill_unwind_intent("buy-1", Some("remote-buy-1"), dec(20.0));
+        fsm.update_fill_unwind_position(Decimal::ZERO);
+
+        let effects = fsm.submit_fill_unwind_if_ready(&Arc::new(dashmap::DashMap::new()));
+
+        assert!(effects.is_empty());
+        let intent = fsm
+            .pending_fill_unwind
+            .as_ref()
+            .expect("intent should keep waiting for visible position");
+        assert_eq!(intent.attempts, 0);
+    }
+
+    #[test]
     fn fill_unwind_balance_failure_keeps_intent_for_retry() {
         let mut fsm = token_fsm();
         fsm.market.best_bid = Some(dec(0.49));
@@ -3042,6 +3082,21 @@ mod tests {
             .await
             .expect("fill event should send");
         event_tx
+            .send(StrategyEvent::TradeConfirmed(confirmed_trade(
+                "token1",
+                "other-order",
+            )))
+            .await
+            .expect("trade event should send");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+                .await
+                .is_err(),
+            "unrelated trade must not submit fill unwind without visible position"
+        );
+
+        event_tx
             .send(StrategyEvent::Positions(
                 crate::strategy::PositionsUpdateEvent {
                     snapshot: Arc::new(crate::strategy::PositionSnapshot {
@@ -3055,20 +3110,15 @@ mod tests {
             ))
             .await
             .expect("positions event should send");
-        event_tx
-            .send(StrategyEvent::TradeConfirmed(confirmed_trade(
-                "token1",
-                "other-order",
-            )))
+        let signal = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
             .await
-            .expect("trade event should send");
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
-                .await
-                .is_err(),
-            "unrelated trade must not submit fill unwind"
-        );
+            .expect("expected position-driven fill unwind")
+            .expect("order channel should remain open");
+        assert!(matches!(
+            signal,
+            OrderSignal::LiquidityRewardMarketSell { token, order_size, .. }
+                if token == "token1" && order_size == Decimal::from(20)
+        ));
 
         handle.abort();
     }

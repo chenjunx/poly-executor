@@ -181,6 +181,7 @@ fn evaluate_token1_book(
     let bid = scaled_price_to_f64(book.best_bid_price);
     let ask = scaled_price_to_f64(book.best_ask_price);
     let spread = token1_spread(book);
+    let mid = token1_mid(book);
     let now = now_ms()?;
 
     store.update_reward_market_pool_token1_check(&pair.condition_id, bid, ask, spread, now)?;
@@ -197,13 +198,13 @@ fn evaluate_token1_book(
         return Ok(());
     }
 
-    if bid < config.token1_min_bid || bid > config.token1_max_bid {
+    if mid <= config.token1_min_bid || mid >= config.token1_max_bid {
         let reason = format!(
-            "token1_bid_out_of_range: bid={bid} min={} max={}",
+            "token1_mid_out_of_range: mid={mid} min={} max={}",
             config.token1_min_bid, config.token1_max_bid
         );
         if store.kick_reward_market_pool_entry(&pair.condition_id, &reason, now)? {
-            info!(target: "order", condition_id = %pair.condition_id, token1 = %pair.token1, bid, "reward_market_pool_monitor 奖励市场踢出");
+            info!(target: "order", condition_id = %pair.condition_id, token1 = %pair.token1, mid, "reward_market_pool_monitor 奖励市场踢出");
             notify_pool_removal(pair, &reason, bid, ask, spread, config);
         }
     }
@@ -255,6 +256,10 @@ fn scaled_price_to_f64(price: u16) -> f64 {
 
 fn token1_spread(book: &CleanOrderbook) -> f64 {
     scaled_price_to_f64(book.best_ask_price) - scaled_price_to_f64(book.best_bid_price)
+}
+
+fn token1_mid(book: &CleanOrderbook) -> f64 {
+    (scaled_price_to_f64(book.best_bid_price) + scaled_price_to_f64(book.best_ask_price)) / 2.0
 }
 
 fn normalize_condition_id(condition_id: &str) -> String {
@@ -336,6 +341,117 @@ mod tests {
             &vec!["0xabc".to_string()]
         );
         assert!(!pairs_by_condition["0xabc"].used_by_liquidity_reward);
+    }
+
+    fn monitor_config() -> RewardMarketPoolMonitorConfig {
+        let (strategy_tx, _strategy_rx) = tokio::sync::mpsc::channel(16);
+        RewardMarketPoolMonitorConfig {
+            refresh_interval: Duration::from_secs(60),
+            token1_spread_threshold: 0.1,
+            token1_min_bid: 0.1,
+            token1_max_bid: 0.9,
+            max_tokens_per_connection: 100,
+            strategy_tx,
+            notifier: None,
+        }
+    }
+
+    fn pool_pair() -> RewardMarketPoolPair {
+        RewardMarketPoolPair {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            question: None,
+            token1: "token1".to_string(),
+            token2: "token2".to_string(),
+            used_by_liquidity_reward: false,
+        }
+    }
+
+    fn store_with_pool_entry() -> MarketStore {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        store
+            .upsert_reward_market_pool_entry(
+                "0xabc",
+                None,
+                None,
+                "token1",
+                "token2",
+                "[]",
+                Some("1.23"),
+                100,
+            )
+            .expect("pool entry should insert");
+        store
+    }
+
+    #[test]
+    fn token1_bid_below_range_stays_in_pool_when_mid_is_in_range() {
+        let store = store_with_pool_entry();
+
+        evaluate_token1_book(&store, &pool_pair(), &book(900, 1300), &monitor_config())
+            .expect("book should evaluate");
+
+        let state = store
+            .get_reward_market_pool_state("0xabc")
+            .expect("state should load")
+            .expect("state should exist");
+        assert!(state.in_pool);
+        assert_eq!(state.kick_reason, None);
+    }
+
+    #[test]
+    fn token1_mid_above_range_kicks_pool_entry() {
+        let store = store_with_pool_entry();
+
+        evaluate_token1_book(&store, &pool_pair(), &book(8900, 9200), &monitor_config())
+            .expect("book should evaluate");
+
+        let state = store
+            .get_reward_market_pool_state("0xabc")
+            .expect("state should load")
+            .expect("state should exist");
+        assert!(!state.in_pool);
+        assert_eq!(
+            state.kick_reason,
+            Some("token1_mid_out_of_range: mid=0.905 min=0.1 max=0.9".to_string())
+        );
+    }
+
+    #[test]
+    fn token1_mid_on_upper_boundary_kicks_pool_entry() {
+        let store = store_with_pool_entry();
+
+        evaluate_token1_book(&store, &pool_pair(), &book(8800, 9200), &monitor_config())
+            .expect("book should evaluate");
+
+        let state = store
+            .get_reward_market_pool_state("0xabc")
+            .expect("state should load")
+            .expect("state should exist");
+        assert!(!state.in_pool);
+        assert_eq!(
+            state.kick_reason,
+            Some("token1_mid_out_of_range: mid=0.9 min=0.1 max=0.9".to_string())
+        );
+    }
+
+    #[test]
+    fn token1_mid_on_lower_boundary_kicks_pool_entry() {
+        let store = store_with_pool_entry();
+
+        evaluate_token1_book(&store, &pool_pair(), &book(800, 1200), &monitor_config())
+            .expect("book should evaluate");
+
+        let state = store
+            .get_reward_market_pool_state("0xabc")
+            .expect("state should load")
+            .expect("state should exist");
+        assert!(!state.in_pool);
+        assert_eq!(
+            state.kick_reason,
+            Some("token1_mid_out_of_range: mid=0.1 min=0.1 max=0.9".to_string())
+        );
     }
 
     #[test]
