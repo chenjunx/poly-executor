@@ -186,7 +186,8 @@ impl RecoveryCoordinator {
         remote_order_id: &str,
         order: &OpenOrderResponse,
     ) -> anyhow::Result<Option<StoredOrder>> {
-        let status = map_single_order_status(order);
+        let remote_status = map_single_order_status(order);
+        let status = reconciled_status(&stored_order.status, remote_status);
         self.order_store
             .update_order_status_by_remote(remote_order_id, status)?;
         self.order_store.append_order_event(
@@ -196,6 +197,7 @@ impl RecoveryCoordinator {
             serde_json::json!({
                 "result": "resolved_by_order_lookup",
                 "status": status,
+                "remote_status": remote_status,
                 "original_size": order.original_size.to_string(),
                 "size_matched": order.size_matched.to_string(),
                 "price": order.price.to_string(),
@@ -217,16 +219,18 @@ impl RecoveryCoordinator {
         stored_order: &StoredOrder,
         remote_order_id: &str,
     ) -> anyhow::Result<()> {
-        let terminal_status = infer_missing_remote_terminal_status(client, stored_order).await?;
+        let inferred_status = infer_missing_remote_terminal_status(client, stored_order).await?;
+        let status = reconciled_status(&stored_order.status, inferred_status);
         self.order_store
-            .update_order_status_by_local(&stored_order.local_order_id, terminal_status)?;
+            .update_order_status_by_local(&stored_order.local_order_id, status)?;
         self.order_store.append_order_event(
             Some(&stored_order.local_order_id),
             Some(remote_order_id),
             "startup_reconciled",
             serde_json::json!({
                 "result": "missing_from_remote",
-                "status": terminal_status,
+                "status": status,
+                "inferred_status": inferred_status,
             }),
         )?;
         Ok(())
@@ -464,6 +468,14 @@ fn is_terminal_or_unrecoverable_status(status: &str) -> bool {
     )
 }
 
+fn reconciled_status<'a>(current_status: &'a str, remote_status: &'a str) -> &'a str {
+    if is_terminal_or_unrecoverable_status(current_status) && remote_status == "unknown" {
+        current_status
+    } else {
+        remote_status
+    }
+}
+
 async fn infer_missing_remote_terminal_status(
     client: &AuthenticatedClobClient,
     stored_order: &StoredOrder,
@@ -506,4 +518,17 @@ fn is_not_found_status(error: &polymarket_client_sdk_v2::error::Error) -> bool {
 fn is_empty_decimal_decode_error(error: &polymarket_client_sdk_v2::error::Error) -> bool {
     let message = error.to_string();
     message.contains("invalid value: string \"\"") && message.contains("Decimal")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconciled_status_preserves_terminal_status_when_remote_is_unknown() {
+        assert_eq!(reconciled_status("filled", "unknown"), "filled");
+        assert_eq!(reconciled_status("canceled", "unknown"), "canceled");
+        assert_eq!(reconciled_status("rejected", "unknown"), "rejected");
+        assert_eq!(reconciled_status("failed", "unknown"), "failed");
+    }
 }

@@ -108,6 +108,11 @@ pub(crate) fn spawn_dingtalk_notifier(config: DingtalkConfig) -> Option<Notifier
 }
 
 impl Notifier {
+    #[cfg(test)]
+    pub(crate) fn from_sender(tx: mpsc::Sender<NotificationEvent>) -> Self {
+        Self { tx }
+    }
+
     pub(crate) fn try_notify(&self, event: NotificationEvent) {
         if let Err(error) = self.tx.try_send(event) {
             warn!(target: "notification", error = %error, "通知队列已满或已关闭，丢弃通知事件");

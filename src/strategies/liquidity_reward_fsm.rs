@@ -8,7 +8,10 @@ use polymarket_client_sdk_v2::types::Decimal;
 use tracing::warn;
 
 use crate::{
-    notification::{LiquidityRewardManualAttentionNotification, NotificationEvent, Notifier},
+    notification::{
+        LiquidityRewardManualAttentionNotification, LiquidityRewardUnwindActionNotification,
+        NotificationEvent, Notifier,
+    },
     storage::{ActiveRewardMarketPoolEntry, MarketStore, OrderStore},
     strategies::liquidity_reward::{LiquidityRewardRestoreState, LiquidityRewardRule},
     strategy::{OrderSignal, Strategy, StrategyEvent, StrategyRegistration, TopicRegistration},
@@ -1270,6 +1273,7 @@ fn execute_effects(
     simulated: bool,
     order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
     market_store: Option<&MarketStore>,
+    notifier: Option<&Notifier>,
 ) {
     for effect in effects {
         match effect {
@@ -1318,6 +1322,9 @@ fn execute_effects(
                 price,
                 order_size,
             } => {
+                let topic_for_notify = Some(topic.to_string());
+                let token_for_notify = token.clone();
+                let local_order_id_for_notify = local_order_id.clone();
                 if let Err(error) = order_tx.try_send(OrderSignal::LiquidityRewardMarketSell {
                     strategy: Arc::from("liquidity_reward"),
                     topic,
@@ -1328,6 +1335,21 @@ fn execute_effects(
                     simulated,
                 }) {
                     warn!(error = %error, "liquidity_reward_fsm 发送清仓卖单信号失败");
+                } else if let Some(notifier) = notifier {
+                    notifier.try_notify(NotificationEvent::LiquidityRewardUnwindAction(
+                        LiquidityRewardUnwindActionNotification {
+                            strategy: "liquidity_reward".to_string(),
+                            topic: topic_for_notify,
+                            token: token_for_notify,
+                            local_order_id: local_order_id_for_notify,
+                            side: crate::strategy::QuoteSide::Sell,
+                            price,
+                            order_size,
+                            attempts: 1,
+                            action: "unwind".to_string(),
+                            simulated,
+                        },
+                    ));
                 }
             }
             Effect::PersistPoolHalt {
@@ -1561,6 +1583,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                                 simulation_enabled,
                                 &order_tx,
                                 market_store.as_ref(),
+                                notifier.as_ref(),
                             );
                             persist_token_state(order_store.as_ref(), fsm);
                             continue;
@@ -1620,6 +1643,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             simulation_enabled,
                             &order_tx,
                             market_store.as_ref(),
+                            notifier.as_ref(),
                         );
                         persist_token_state(order_store.as_ref(), fsm);
                     }
@@ -1696,6 +1720,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                                 simulation_enabled,
                                 &order_tx,
                                 market_store.as_ref(),
+                                notifier.as_ref(),
                             );
                             persist_token_state(order_store.as_ref(), fsm);
                             continue;
@@ -1725,6 +1750,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                                     simulation_enabled,
                                     &order_tx,
                                     market_store.as_ref(),
+                                    notifier.as_ref(),
                                 );
                                 if let Some(fsm) = fsms.get(token.as_str()) {
                                     persist_token_state(order_store.as_ref(), fsm);
@@ -1737,6 +1763,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                                     simulation_enabled,
                                     &order_tx,
                                     market_store.as_ref(),
+                                    notifier.as_ref(),
                                 );
                                 persist_token_state(order_store.as_ref(), fsm);
                             }
@@ -1784,6 +1811,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             simulation_enabled,
                             &order_tx,
                             market_store.as_ref(),
+                            notifier.as_ref(),
                         );
                         if let Some(fsm) = fsms.get(fill_event.token.as_str()) {
                             persist_token_state(order_store.as_ref(), fsm);
@@ -1810,6 +1838,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             simulation_enabled,
                             &order_tx,
                             market_store.as_ref(),
+                            notifier.as_ref(),
                         );
                         persist_token_state(order_store.as_ref(), fsm);
                     }
@@ -1850,6 +1879,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             simulation_enabled,
                             &order_tx,
                             market_store.as_ref(),
+                            notifier.as_ref(),
                         );
                     }
                     StrategyEvent::Positions(positions_event) => {
@@ -1869,6 +1899,7 @@ impl Strategy for LiquidityRewardFsmStrategy {
                             simulation_enabled,
                             &order_tx,
                             market_store.as_ref(),
+                            notifier.as_ref(),
                         );
                     }
                 }
@@ -2225,6 +2256,44 @@ mod tests {
             .next()
             .expect("pending unwind should be recorded");
         assert_eq!(pending.order_size, "140.83".parse::<Decimal>().unwrap());
+    }
+
+    #[test]
+    fn execute_market_sell_effect_sends_unwind_action_notification() {
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(1);
+        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel(1);
+        let notifier = Notifier::from_sender(notification_tx);
+
+        execute_effects(
+            vec![Effect::MarketSell {
+                token: "token1".to_string(),
+                topic: Arc::from(DEFAULT_TOPIC),
+                local_order_id: "unwind-1".to_string(),
+                price: dec(0.46),
+                order_size: dec(50.0),
+            }],
+            false,
+            &order_tx,
+            None,
+            Some(&notifier),
+        );
+
+        assert!(matches!(
+            order_rx.try_recv().expect("market sell signal should send"),
+            OrderSignal::LiquidityRewardMarketSell { local_order_id, price, order_size, .. }
+                if local_order_id == "unwind-1" && price == dec(0.46) && order_size == dec(50.0)
+        ));
+        assert!(matches!(
+            notification_rx
+                .try_recv()
+                .expect("unwind notification should send"),
+            NotificationEvent::LiquidityRewardUnwindAction(notification)
+                if notification.local_order_id == "unwind-1"
+                    && notification.token == "token1"
+                    && notification.price == dec(0.46)
+                    && notification.order_size == dec(50.0)
+                    && notification.action == "unwind"
+        ));
     }
 
     #[tokio::test]
