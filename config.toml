@@ -45,7 +45,7 @@ max_price = 0.98
 default_threads = 3
 # 监控报告打印间隔（秒）
 monitor_interval_secs = 30
-sqlite_path = "/root/orders.db"
+sqlite_path = "/home/admin/orders.db"
 # 行情/模拟/奖励估算库；留空时默认使用 orders.db 同目录下的 market.db
 market_sqlite_path = ""
 # 是否将 WS 行情 tick 写入 SQLite（best_bid/ask 变化时落盘）

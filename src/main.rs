@@ -1,3 +1,4 @@
+mod account;
 mod clob_client;
 mod config;
 mod dispatcher;
@@ -28,7 +29,7 @@ use notification::Notifier;
 use polymarket_client_sdk_v2::types::Decimal;
 use tracing::info;
 
-use config::{AppConfig, load_app_config};
+use config::{AccountConfig, AppConfig, load_app_config};
 use dispatcher::Dispatcher;
 use monitor::{FullBookSnapshot, RewardMonitorConfig};
 use positions::{PositionRefreshTrigger, SimulatedFillEvent};
@@ -36,6 +37,7 @@ use recovery::{RecoveryArtifacts, RecoveryCoordinator};
 use storage::{MarketStore, OrderStore};
 use strategies::liquidity_reward::{LiquidityRewardRestoreState, LiquidityRewardRule};
 use strategies::liquidity_reward_fsm::LiquidityRewardFsmStrategy as LiquidityRewardStrategy;
+use strategies::market_maker::MarketMakerStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
     CleanOrderbook, Filters, OrderCorrelationMap, OrderSignal, Strategy, StrategyEvent,
@@ -63,6 +65,7 @@ struct StrategyBootstrap {
     pair_strategy: PairArbitrageStrategy,
     pair_registration: StrategyRegistration,
     liquidity_reward: Option<LiquidityRewardStrategy>,
+    market_maker: Option<MarketMakerStrategy>,
     liquidity_reward_tokens: Arc<HashSet<String>>,
     reward_monitor_configs: HashMap<String, RewardMonitorConfig>,
     tick_size_map: tick_size::TickSizeMap,
@@ -107,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let recovery = recover_orders(&app_config, order_store.clone()).await?;
     let order_correlations = recovery.order_correlations;
     let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
+    spawn_account_monitor(&app_config, market_store.clone());
     let strategy_bootstrap = build_strategies(
         &app_config,
         order_store.clone(),
@@ -119,13 +123,18 @@ async fn main() -> anyhow::Result<()> {
         pair_strategy,
         pair_registration,
         liquidity_reward,
+        market_maker,
         liquidity_reward_tokens,
         reward_monitor_configs,
         tick_size_map,
     } = strategy_bootstrap;
 
     let proxy = init_proxy(&app_config);
-    let registrations = build_strategy_registrations(&pair_registration, liquidity_reward.as_ref());
+    let registrations = build_strategy_registrations(
+        &pair_registration,
+        liquidity_reward.as_ref(),
+        market_maker.as_ref(),
+    );
     let routing = build_routing(&registrations);
 
     info!("正在连接 Polymarket WebSocket...");
@@ -158,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         pair_strategy,
         pair_registration,
         liquidity_reward,
+        market_maker,
         order_tx.clone(),
         strategy_rx,
     );
@@ -219,6 +229,7 @@ async fn build_strategies(
     let pair_strategy = build_pair_strategy(app_config)?;
     let pair_registration = pair_strategy.registration().clone();
     let liquidity_reward_strategy_opt = build_liquidity_reward_strategy(app_config, &market_store)?;
+    let market_maker = build_market_maker_strategy(&market_store)?;
     let reward_monitor_configs = build_reward_monitor_configs(
         liquidity_reward_strategy_opt.as_ref(),
         app_config.liquidity_reward.simulation,
@@ -265,6 +276,7 @@ async fn build_strategies(
         pair_strategy,
         pair_registration,
         liquidity_reward,
+        market_maker,
         liquidity_reward_tokens,
         reward_monitor_configs,
         tick_size_map,
@@ -287,11 +299,22 @@ fn build_pair_strategy(app_config: &AppConfig) -> anyhow::Result<PairArbitrageSt
     PairArbitrageStrategy::from_config(filters, assets_file)
 }
 
+fn build_market_maker_strategy(
+    market_store: &MarketStore,
+) -> anyhow::Result<Option<MarketMakerStrategy>> {
+    let entries = market_store.load_liquidity_reward_pool_entries()?;
+    MarketMakerStrategy::from_pool_entries(entries)
+}
+
+fn liquidity_reward_runtime_enabled(_app_config: &AppConfig) -> bool {
+    false
+}
+
 fn build_liquidity_reward_strategy(
     app_config: &AppConfig,
     market_store: &MarketStore,
 ) -> anyhow::Result<Option<LiquidityRewardStrategy>> {
-    if !app_config.liquidity_reward.enabled {
+    if !liquidity_reward_runtime_enabled(app_config) {
         return Ok(None);
     }
 
@@ -363,9 +386,13 @@ fn init_proxy(app_config: &AppConfig) -> Option<proxy_ws::Proxy> {
 fn build_strategy_registrations(
     pair_registration: &StrategyRegistration,
     liquidity_reward: Option<&LiquidityRewardStrategy>,
+    market_maker: Option<&MarketMakerStrategy>,
 ) -> Vec<StrategyRegistration> {
     let mut registrations = vec![pair_registration.clone()];
     if let Some(strategy) = liquidity_reward {
+        registrations.push(strategy.registration().clone());
+    }
+    if let Some(strategy) = market_maker {
         registrations.push(strategy.registration().clone());
     }
     registrations
@@ -388,6 +415,22 @@ fn build_routing(registrations: &[StrategyRegistration]) -> RoutingBootstrap {
     }
 }
 
+fn account_monitor_enabled(config: &AccountConfig) -> bool {
+    config.enabled
+}
+
+fn spawn_account_monitor(app_config: &AppConfig, market_store: MarketStore) {
+    if !account_monitor_enabled(&app_config.account) {
+        return;
+    }
+
+    tokio::spawn(account::run(
+        app_config.auth.clone(),
+        app_config.account.clone(),
+        market_store,
+    ));
+}
+
 fn spawn_reward_market_tasks(
     app_config: &AppConfig,
     market_store: MarketStore,
@@ -396,7 +439,7 @@ fn spawn_reward_market_tasks(
     strategy_tx: StrategySender,
     notifier: Option<Notifier>,
 ) -> anyhow::Result<()> {
-    let reward_market_tasks_enabled = app_config.liquidity_reward.enabled
+    let reward_market_tasks_enabled = liquidity_reward_runtime_enabled(app_config)
         && app_config.liquidity_reward.monitor_enabled
         && !app_config.simulation.enabled;
     if !reward_market_tasks_enabled {
@@ -467,10 +510,27 @@ fn spawn_reward_estimator(
     Some(tx)
 }
 
+fn market_maker_strategy_handle(
+    market_maker: &MarketMakerStrategy,
+) -> Option<(StrategyHandle, tokio::sync::mpsc::Receiver<StrategyEvent>)> {
+    let registration = market_maker.registration().clone();
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    Some((
+        StrategyHandle {
+            name: registration.name.clone(),
+            topics: registration.topics.clone(),
+            related_tokens: registration.related_tokens.clone(),
+            tx,
+        },
+        rx,
+    ))
+}
+
 fn spawn_strategy_tasks(
     pair_strategy: PairArbitrageStrategy,
     pair_registration: StrategyRegistration,
     liquidity_reward: Option<LiquidityRewardStrategy>,
+    market_maker: Option<MarketMakerStrategy>,
     order_tx: OrderSender,
     strategy_rx: StrategyReceiver,
 ) {
@@ -494,7 +554,16 @@ fn spawn_strategy_tasks(
             related_tokens: liquidity_reward_registration.related_tokens.clone(),
             tx: liquidity_reward_tx,
         });
-        liquidity_reward_strategy.spawn(liquidity_reward_rx, order_tx);
+        liquidity_reward_strategy.spawn(liquidity_reward_rx, order_tx.clone());
+    }
+
+    if let Some(market_maker_strategy) = market_maker {
+        if let Some((handle, market_maker_rx)) =
+            market_maker_strategy_handle(&market_maker_strategy)
+        {
+            strategy_handles.push(handle);
+            market_maker_strategy.spawn(market_maker_rx, order_tx.clone());
+        }
     }
     tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
 }
@@ -656,6 +725,216 @@ fn init_stores(app_config: &AppConfig) -> anyhow::Result<(OrderStore, MarketStor
 }
 
 // 相对路径按可执行文件目录解析，避免服务方式启动时落到意外工作目录。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AppSettings, AuthConfig, LiquidityRewardConfig, NotificationConfig, OrderConfig,
+        ProxySettings, SimulationConfig,
+    };
+    use crate::storage::ActiveRewardMarketPoolEntry;
+    use crate::strategy::TopicRegistration;
+
+    fn active_pool_entry(
+        condition_id: &str,
+        token1: &str,
+        token2: &str,
+    ) -> ActiveRewardMarketPoolEntry {
+        ActiveRewardMarketPoolEntry {
+            condition_id: condition_id.to_string(),
+            market_slug: Some(format!("slug-{condition_id}")),
+            question: None,
+            token1: token1.to_string(),
+            token2: token2.to_string(),
+            tokens_json: "[]".to_string(),
+            market_competitiveness: None,
+            rewards_min_size: None,
+            rewards_max_spread: None,
+            market_daily_reward: None,
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: None,
+            build_date_utc: None,
+            pool_version: Some(1),
+            liquidity_reward_selected: true,
+            liquidity_reward_selected_at_ms: Some(100),
+            liquidity_reward_select_reason: Some("roi_descending_top_n".to_string()),
+            liquidity_reward_select_rank: Some(1),
+            liquidity_reward_halted: false,
+            liquidity_reward_halted_at_ms: None,
+            liquidity_reward_halt_reason: None,
+            liquidity_reward_halted_pool_version: None,
+        }
+    }
+
+    #[test]
+    fn account_monitor_enabled_respects_account_config() {
+        let mut config = AccountConfig::default();
+        assert!(!account_monitor_enabled(&config));
+
+        config.enabled = true;
+        assert!(account_monitor_enabled(&config));
+    }
+
+    #[test]
+    fn build_strategy_registrations_includes_market_maker_when_present() {
+        let pair_registration = StrategyRegistration {
+            name: Arc::from("pair_arbitrage"),
+            topics: Arc::<[Arc<str>]>::from(vec![Arc::from("pair")]),
+            topic_tokens: Arc::<[TopicRegistration]>::from(vec![TopicRegistration {
+                topic: Arc::from("pair"),
+                tokens: Arc::<[String]>::from(vec!["pair-token".to_string()]),
+            }]),
+            related_tokens: Arc::<[String]>::from(vec!["pair-token".to_string()]),
+        };
+        let market_maker = MarketMakerStrategy::from_pool_entries(vec![active_pool_entry(
+            "0xabc",
+            "maker-token-1",
+            "maker-token-2",
+        )])
+        .expect("market maker should build")
+        .expect("non-empty pool should create market maker");
+
+        let registrations =
+            build_strategy_registrations(&pair_registration, None, Some(&market_maker));
+
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[0].name.as_ref(), "pair_arbitrage");
+        assert_eq!(registrations[1].name.as_ref(), "market_maker");
+    }
+
+    fn app_config_with_liquidity_reward_enabled() -> AppConfig {
+        AppConfig {
+            proxy: ProxySettings { url: String::new() },
+            app: AppSettings {
+                log_file: "alerts.log".to_string(),
+                assets_file: "assets.csv".to_string(),
+                sqlite_path: String::new(),
+                market_sqlite_path: String::new(),
+                min_diff: 0.0,
+                max_spread: 0.0,
+                min_price: 0.0,
+                max_price: 1.0,
+                default_threads: 1,
+                monitor_interval_secs: 30,
+                tick_store_enabled: false,
+                raw_store_enabled: false,
+            },
+            auth: AuthConfig {
+                api_key: String::new(),
+                api_secret: String::new(),
+                passphrase: String::new(),
+                private_key: String::new(),
+                funder: String::new(),
+            },
+            order: OrderConfig { size_usdc: 1.0 },
+            simulation: SimulationConfig { enabled: false },
+            liquidity_reward: LiquidityRewardConfig {
+                enabled: true,
+                source: "db_pool".to_string(),
+                monitor_enabled: true,
+                ..LiquidityRewardConfig::default()
+            },
+            account: AccountConfig::default(),
+            notification: NotificationConfig::default(),
+            topic_threads: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn liquidity_reward_runtime_is_forced_disabled_even_when_config_enabled() {
+        let config = app_config_with_liquidity_reward_enabled();
+
+        assert!(!liquidity_reward_runtime_enabled(&config));
+    }
+
+    #[test]
+    fn build_liquidity_reward_strategy_is_forced_disabled_even_when_config_enabled() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let entries = vec![storage::RewardMarketPoolStorageEntry {
+            condition_id: "0xlr",
+            market_slug: Some("lr-market"),
+            question: Some("LR market?"),
+            token1: "lr-token-1",
+            token2: "lr-token-2",
+            tokens_json: "[]",
+            market_competitiveness: None,
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+            volume_24hr_clob: Some("60000"),
+            volume_24hr: Some("65000"),
+            liquidity_reward_roi: Some("0.5"),
+        }];
+        store
+            .replace_reward_market_pool_entries(build_date, 1, &entries, 100, 1)
+            .expect("pool entries should save");
+        let config = app_config_with_liquidity_reward_enabled();
+
+        let strategy = build_liquidity_reward_strategy(&config, &store)
+            .expect("forced disabled liquidity reward should not error");
+
+        assert!(strategy.is_none());
+    }
+
+    #[test]
+    fn build_market_maker_strategy_uses_selected_pool_entries() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let entries = vec![storage::RewardMarketPoolStorageEntry {
+            condition_id: "0xmaker",
+            market_slug: Some("maker-market"),
+            question: Some("Maker market?"),
+            token1: "maker-token-1",
+            token2: "maker-token-2",
+            tokens_json: "[]",
+            market_competitiveness: None,
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+            volume_24hr_clob: Some("60000"),
+            volume_24hr: Some("65000"),
+            liquidity_reward_roi: Some("0.5"),
+        }];
+        store
+            .replace_reward_market_pool_entries(build_date, 1, &entries, 100, 1)
+            .expect("pool entries should save");
+
+        let market_maker = build_market_maker_strategy(&store)
+            .expect("market maker build should not error")
+            .expect("selected pool should create market maker");
+
+        assert_eq!(market_maker.registration().name.as_ref(), "market_maker");
+        assert_eq!(
+            market_maker.registration().related_tokens.as_ref(),
+            &["maker-token-1".to_string(), "maker-token-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn market_maker_strategy_handle_is_created_when_strategy_exists() {
+        let market_maker = MarketMakerStrategy::from_pool_entries(vec![active_pool_entry(
+            "0xabc",
+            "maker-token-1",
+            "maker-token-2",
+        )])
+        .expect("market maker should build")
+        .expect("non-empty pool should create market maker");
+
+        let (handle, _rx) =
+            market_maker_strategy_handle(&market_maker).expect("market maker handle should exist");
+
+        assert_eq!(handle.name.as_ref(), "market_maker");
+        assert_eq!(
+            handle.related_tokens.as_ref(),
+            &["maker-token-1".to_string(), "maker-token-2".to_string()]
+        );
+    }
+}
+
 fn resolve_path(filename: &str) -> String {
     let path_obj = Path::new(filename);
     if path_obj.is_absolute() {

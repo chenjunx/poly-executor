@@ -77,6 +77,13 @@ pub struct RemovedLiquidityRewardPoolEntry {
     pub token2: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAccountFundSnapshot {
+    pub checked_at_ms: u64,
+    pub balance: String,
+    pub allowances_json: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RewardMarketPoolReplaceResult {
     pub selected_count: usize,
@@ -101,6 +108,9 @@ pub struct RewardMarketPoolStorageEntry<'a> {
     pub rewards_min_size: Option<&'a str>,
     pub rewards_max_spread: Option<&'a str>,
     pub market_daily_reward: Option<&'a str>,
+    pub volume_24hr_clob: Option<&'a str>,
+    pub volume_24hr: Option<&'a str>,
+    pub liquidity_reward_roi: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +125,9 @@ pub struct ActiveRewardMarketPoolEntry {
     pub rewards_min_size: Option<String>,
     pub rewards_max_spread: Option<String>,
     pub market_daily_reward: Option<String>,
+    pub volume_24hr_clob: Option<String>,
+    pub volume_24hr: Option<String>,
+    pub liquidity_reward_roi: Option<String>,
     pub build_date_utc: Option<String>,
     pub pool_version: Option<u64>,
     pub liquidity_reward_selected: bool,
@@ -740,6 +753,16 @@ impl MarketStore {
                 CREATE INDEX IF NOT EXISTS idx_trade_events_token_ts
                     ON trade_events (token, ts_ms DESC);
 
+                CREATE TABLE IF NOT EXISTS account_fund_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checked_at_ms INTEGER NOT NULL,
+                    balance TEXT NOT NULL,
+                    allowances_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_account_fund_snapshots_checked_at
+                    ON account_fund_snapshots (checked_at_ms DESC);
+
                 CREATE TABLE IF NOT EXISTS reward_market_pool_state (
                     condition_id TEXT PRIMARY KEY,
                     market_slug TEXT,
@@ -751,6 +774,9 @@ impl MarketStore {
                     rewards_min_size TEXT,
                     rewards_max_spread TEXT,
                     market_daily_reward TEXT,
+                    volume_24hr_clob TEXT,
+                    volume_24hr TEXT,
+                    liquidity_reward_roi TEXT,
                     build_date_utc TEXT,
                     pool_version INTEGER,
                     liquidity_reward_selected INTEGER NOT NULL DEFAULT 0,
@@ -792,6 +818,14 @@ impl MarketStore {
                 conn,
                 "reward_market_pool_state",
                 "market_daily_reward",
+                "TEXT",
+            )?;
+            ensure_column(conn, "reward_market_pool_state", "volume_24hr_clob", "TEXT")?;
+            ensure_column(conn, "reward_market_pool_state", "volume_24hr", "TEXT")?;
+            ensure_column(
+                conn,
+                "reward_market_pool_state",
+                "liquidity_reward_roi",
                 "TEXT",
             )?;
             ensure_column(
@@ -843,6 +877,49 @@ impl MarketStore {
                 "INTEGER",
             )?;
             Ok(())
+        })
+    }
+
+    pub fn insert_account_fund_snapshot(
+        &self,
+        checked_at_ms: u64,
+        balance: &str,
+        allowances_json: &str,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO account_fund_snapshots (checked_at_ms, balance, allowances_json)
+                VALUES (?1, ?2, ?3)
+                ",
+                params![checked_at_ms as i64, balance, allowances_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_latest_account_fund_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<StoredAccountFundSnapshot>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "
+                SELECT checked_at_ms, balance, allowances_json
+                FROM account_fund_snapshots
+                ORDER BY checked_at_ms DESC, id DESC
+                LIMIT 1
+                ",
+                [],
+                |row| {
+                    Ok(StoredAccountFundSnapshot {
+                        checked_at_ms: row.get::<_, i64>(0)? as u64,
+                        balance: row.get(1)?,
+                        allowances_json: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 
@@ -974,10 +1051,11 @@ impl MarketStore {
                     INSERT INTO reward_market_pool_state (
                         condition_id, market_slug, question, token1, token2, tokens_json,
                         market_competitiveness, rewards_min_size, rewards_max_spread,
-                        market_daily_reward, build_date_utc, pool_version, in_pool,
+                        market_daily_reward, volume_24hr_clob, volume_24hr,
+                        liquidity_reward_roi, build_date_utc, pool_version, in_pool,
                         first_seen_at_ms, last_seen_at_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?13)
-                    ",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1, ?16, ?16)
+",
                 )?;
                 let build_date_utc = build_date_utc.to_string();
                 for entry in entries {
@@ -992,6 +1070,9 @@ impl MarketStore {
                         entry.rewards_min_size,
                         entry.rewards_max_spread,
                         entry.market_daily_reward,
+                        entry.volume_24hr_clob,
+                        entry.volume_24hr,
+                        entry.liquidity_reward_roi,
                         build_date_utc,
                         pool_version as i64,
                         now_ms as i64,
@@ -1113,7 +1194,8 @@ impl MarketStore {
                 "
                 SELECT condition_id, market_slug, question, token1, token2, tokens_json,
                        market_competitiveness, rewards_min_size, rewards_max_spread,
-                       market_daily_reward, build_date_utc, pool_version,
+                       market_daily_reward, volume_24hr_clob, volume_24hr,
+                       liquidity_reward_roi, build_date_utc, pool_version,
                        liquidity_reward_selected, liquidity_reward_selected_at_ms,
                        liquidity_reward_select_reason, liquidity_reward_select_rank,
                        liquidity_reward_halted, liquidity_reward_halted_at_ms,
@@ -1136,7 +1218,8 @@ impl MarketStore {
                 "
                 SELECT condition_id, market_slug, question, token1, token2, tokens_json,
                        market_competitiveness, rewards_min_size, rewards_max_spread,
-                       market_daily_reward, build_date_utc, pool_version,
+                       market_daily_reward, volume_24hr_clob, volume_24hr,
+                       liquidity_reward_roi, build_date_utc, pool_version,
                        liquidity_reward_selected, liquidity_reward_selected_at_ms,
                        liquidity_reward_select_reason, liquidity_reward_select_rank,
                        liquidity_reward_halted, liquidity_reward_halted_at_ms,
@@ -1368,61 +1451,48 @@ fn select_liquidity_reward_pool_entries<'a>(
         .iter()
         .filter_map(|entry| {
             entry
-                .market_competitiveness
+                .liquidity_reward_roi
                 .and_then(|value| value.parse::<f64>().ok())
-                .map(|competitiveness| (entry, competitiveness))
+                .map(|roi| (entry, roi))
         })
         .collect::<Vec<_>>();
     sorted.sort_by(|left, right| {
-        left.1
-            .partial_cmp(&right.1)
+        right
+            .1
+            .partial_cmp(&left.1)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.condition_id.cmp(right.0.condition_id))
     });
 
-    let head_count = market_count / 2;
-    let tail_count = market_count.saturating_sub(head_count);
-    let mut selected = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for (entry, _) in sorted.iter().take(head_count) {
-        if seen.insert(entry.condition_id) {
-            selected.push(LiquidityRewardPoolSelection {
-                condition_id: entry.condition_id,
-                reason: "competitiveness_low_tail",
-                rank: selected.len() as u32 + 1,
-            });
-        }
-    }
-    for (entry, _) in sorted.iter().rev().take(tail_count).rev() {
-        if seen.insert(entry.condition_id) {
-            selected.push(LiquidityRewardPoolSelection {
-                condition_id: entry.condition_id,
-                reason: "competitiveness_high_tail",
-                rank: selected.len() as u32 + 1,
-            });
-        }
-    }
-
-    selected
+    sorted
+        .into_iter()
+        .take(market_count)
+        .enumerate()
+        .map(|(index, (entry, _))| LiquidityRewardPoolSelection {
+            condition_id: entry.condition_id,
+            reason: "roi_descending_top_n",
+            rank: index as u32 + 1,
+        })
+        .collect()
 }
 
 fn active_reward_market_pool_entry_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ActiveRewardMarketPoolEntry> {
     let pool_version = row
-        .get::<_, Option<i64>>(11)?
+        .get::<_, Option<i64>>(14)?
         .and_then(|value| u64::try_from(value).ok());
     let liquidity_reward_selected_at_ms = row
-        .get::<_, Option<i64>>(13)?
+        .get::<_, Option<i64>>(16)?
         .and_then(|value| u64::try_from(value).ok());
     let liquidity_reward_select_rank = row
-        .get::<_, Option<i64>>(15)?
+        .get::<_, Option<i64>>(18)?
         .and_then(|value| u32::try_from(value).ok());
     let liquidity_reward_halted_at_ms = row
-        .get::<_, Option<i64>>(17)?
+        .get::<_, Option<i64>>(20)?
         .and_then(|value| u64::try_from(value).ok());
     let liquidity_reward_halted_pool_version = row
-        .get::<_, Option<i64>>(19)?
+        .get::<_, Option<i64>>(22)?
         .and_then(|value| u64::try_from(value).ok());
     Ok(ActiveRewardMarketPoolEntry {
         condition_id: row.get(0)?,
@@ -1435,15 +1505,18 @@ fn active_reward_market_pool_entry_from_row(
         rewards_min_size: row.get(7)?,
         rewards_max_spread: row.get(8)?,
         market_daily_reward: row.get(9)?,
-        build_date_utc: row.get(10)?,
+        volume_24hr_clob: row.get(10)?,
+        volume_24hr: row.get(11)?,
+        liquidity_reward_roi: row.get(12)?,
+        build_date_utc: row.get(13)?,
         pool_version,
-        liquidity_reward_selected: row.get::<_, i64>(12)? != 0,
+        liquidity_reward_selected: row.get::<_, i64>(15)? != 0,
         liquidity_reward_selected_at_ms,
-        liquidity_reward_select_reason: row.get(14)?,
+        liquidity_reward_select_reason: row.get(17)?,
         liquidity_reward_select_rank,
-        liquidity_reward_halted: row.get::<_, i64>(16)? != 0,
+        liquidity_reward_halted: row.get::<_, i64>(19)? != 0,
         liquidity_reward_halted_at_ms,
-        liquidity_reward_halt_reason: row.get(18)?,
+        liquidity_reward_halt_reason: row.get(21)?,
         liquidity_reward_halted_pool_version,
     })
 }
@@ -1484,6 +1557,28 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_fund_snapshot_round_trips_latest_snapshot() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        store
+            .insert_account_fund_snapshot(100, "12.34", r#"{"0xabc":"999"}"#)
+            .expect("first snapshot should insert");
+        store
+            .insert_account_fund_snapshot(200, "56.78", r#"{"0xdef":"888"}"#)
+            .expect("second snapshot should insert");
+
+        let snapshot = store
+            .load_latest_account_fund_snapshot()
+            .expect("latest snapshot query should work")
+            .expect("latest snapshot should exist");
+
+        assert_eq!(snapshot.checked_at_ms, 200);
+        assert_eq!(snapshot.balance, "56.78");
+        assert_eq!(snapshot.allowances_json, r#"{"0xdef":"888"}"#);
+    }
 
     #[test]
     fn reward_market_pool_state_kick_is_persistent() {
@@ -1550,6 +1645,46 @@ mod tests {
     }
 
     #[test]
+    fn reward_market_pool_persists_volume_and_roi_fields() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        let entries = vec![RewardMarketPoolStorageEntry {
+            condition_id: "0xabc",
+            market_slug: Some("test-market"),
+            question: Some("Test market?"),
+            token1: "token1",
+            token2: "token2",
+            tokens_json: "[]",
+            market_competitiveness: Some("12.5"),
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("25"),
+            volume_24hr_clob: Some("60000"),
+            volume_24hr: Some("65000"),
+            liquidity_reward_roi: Some("0.25"),
+        }];
+
+        store
+            .replace_reward_market_pool_entries(
+                NaiveDate::from_ymd_opt(2026, 5, 13).unwrap(),
+                123,
+                &entries,
+                456,
+                1,
+            )
+            .expect("pool entries should replace");
+
+        let loaded = store
+            .load_active_reward_market_pool_entries()
+            .expect("active pool entries should load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].volume_24hr_clob.as_deref(), Some("60000"));
+        assert_eq!(loaded[0].volume_24hr.as_deref(), Some("65000"));
+        assert_eq!(loaded[0].liquidity_reward_roi.as_deref(), Some("0.25"));
+    }
+
+    #[test]
     fn replace_reward_market_pool_entries_deletes_old_pool_and_resets_kick() {
         let store = MarketStore::open(":memory:").expect("store should open");
         store.init_schema().expect("schema should initialize");
@@ -1582,6 +1717,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: None,
         }];
         store
             .replace_reward_market_pool_entries(build_date, 2, &entries, 200, 0)
@@ -1620,6 +1758,9 @@ mod tests {
                 rewards_min_size: Some("100"),
                 rewards_max_spread: Some("4"),
                 market_daily_reward: Some("50"),
+                volume_24hr_clob: None,
+                volume_24hr: None,
+                liquidity_reward_roi: Some("0.5"),
             },
             RewardMarketPoolStorageEntry {
                 condition_id: "0xremoved",
@@ -1632,6 +1773,9 @@ mod tests {
                 rewards_min_size: Some("100"),
                 rewards_max_spread: Some("4"),
                 market_daily_reward: Some("50"),
+                volume_24hr_clob: None,
+                volume_24hr: None,
+                liquidity_reward_roi: Some("0.4"),
             },
         ];
         store
@@ -1649,6 +1793,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: Some("0.5"),
         }];
         let result = store
             .replace_reward_market_pool_entries(build_date, 2, &second_entries, 200, 1)
@@ -1678,6 +1825,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: None,
         }];
 
         assert!(
@@ -1719,6 +1869,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: None,
         }];
         store
             .replace_reward_market_pool_entries(build_date, 100, &entries, 100, 1)
@@ -1751,6 +1904,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: Some("0.5"),
         }];
         store
             .replace_reward_market_pool_entries(old_build_date, 100, &entries, 100, 1)
@@ -1787,6 +1943,9 @@ mod tests {
                 rewards_min_size: Some("100"),
                 rewards_max_spread: Some("4"),
                 market_daily_reward: Some("50"),
+                volume_24hr_clob: None,
+                volume_24hr: None,
+                liquidity_reward_roi: None,
             },
             RewardMarketPoolStorageEntry {
                 condition_id: "0xbbb",
@@ -1799,6 +1958,9 @@ mod tests {
                 rewards_min_size: Some("200"),
                 rewards_max_spread: Some("5"),
                 market_daily_reward: Some("60"),
+                volume_24hr_clob: None,
+                volume_24hr: None,
+                liquidity_reward_roi: None,
             },
         ];
         store
@@ -1825,63 +1987,44 @@ mod tests {
         assert_eq!(active[0].pool_version, Some(123));
     }
 
+    fn reward_pool_entry<'a>(
+        condition_id: &'a str,
+        token1: &'a str,
+        token2: &'a str,
+        market_competitiveness: Option<&'a str>,
+        liquidity_reward_roi: Option<&'a str>,
+    ) -> RewardMarketPoolStorageEntry<'a> {
+        RewardMarketPoolStorageEntry {
+            condition_id,
+            market_slug: None,
+            question: None,
+            token1,
+            token2,
+            tokens_json: "[]",
+            market_competitiveness,
+            rewards_min_size: Some("100"),
+            rewards_max_spread: Some("4"),
+            market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi,
+        }
+    }
+
     #[test]
-    fn load_liquidity_reward_pool_entries_selects_competitiveness_tails() {
+    fn load_liquidity_reward_pool_entries_selects_roi_descending_top_n() {
         let store = MarketStore::open(":memory:").expect("store should open");
         store.init_schema().expect("schema should initialize");
         let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
-        let entries = (0..8)
-            .map(|index| RewardMarketPoolStorageEntry {
-                condition_id: match index {
-                    0 => "0x0",
-                    1 => "0x1",
-                    2 => "0x2",
-                    3 => "0x3",
-                    4 => "0x4",
-                    5 => "0x5",
-                    6 => "0x6",
-                    _ => "0x7",
-                },
-                market_slug: None,
-                question: None,
-                token1: match index {
-                    0 => "token10",
-                    1 => "token11",
-                    2 => "token12",
-                    3 => "token13",
-                    4 => "token14",
-                    5 => "token15",
-                    6 => "token16",
-                    _ => "token17",
-                },
-                token2: match index {
-                    0 => "token20",
-                    1 => "token21",
-                    2 => "token22",
-                    3 => "token23",
-                    4 => "token24",
-                    5 => "token25",
-                    6 => "token26",
-                    _ => "token27",
-                },
-                tokens_json: "[]",
-                market_competitiveness: match index {
-                    0 => Some("0"),
-                    1 => Some("1"),
-                    2 => Some("2"),
-                    3 => Some("3"),
-                    4 => Some("4"),
-                    5 => Some("5"),
-                    6 => Some("6"),
-                    _ => Some("7"),
-                },
-                rewards_min_size: Some("100"),
-                rewards_max_spread: Some("4"),
-                market_daily_reward: Some("50"),
-            })
-            .collect::<Vec<_>>();
+        let entries = vec![
+            reward_pool_entry("0x0", "token10", "token20", Some("0"), Some("0.10")),
+            reward_pool_entry("0x1", "token11", "token21", Some("1"), Some("0.50")),
+            reward_pool_entry("0x2", "token12", "token22", Some("2"), Some("0.30")),
+            reward_pool_entry("0x3", "token13", "token23", Some("3"), Some("0.20")),
+            reward_pool_entry("0x4", "token14", "token24", Some("4"), Some("0.40")),
+        ];
         store
-            .replace_reward_market_pool_entries(build_date, 123, &entries, 200, 6)
+            .replace_reward_market_pool_entries(build_date, 123, &entries, 200, 3)
             .expect("pool should replace");
         let selected = store
             .load_liquidity_reward_pool_entries()
@@ -1891,42 +2034,32 @@ mod tests {
             .map(|entry| entry.condition_id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            condition_ids,
-            vec!["0x0", "0x1", "0x2", "0x5", "0x6", "0x7"]
-        );
+        assert_eq!(condition_ids, vec!["0x1", "0x4", "0x2"]);
         assert!(selected.iter().all(|entry| entry.liquidity_reward_selected));
         assert_eq!(
             selected
                 .iter()
                 .map(|entry| entry.liquidity_reward_select_reason.as_deref())
                 .collect::<Vec<_>>(),
-            vec![
-                Some("competitiveness_low_tail"),
-                Some("competitiveness_low_tail"),
-                Some("competitiveness_low_tail"),
-                Some("competitiveness_high_tail"),
-                Some("competitiveness_high_tail"),
-                Some("competitiveness_high_tail"),
-            ]
+            vec![Some("roi_descending_top_n"); 3]
         );
         assert_eq!(
             selected
                 .iter()
                 .map(|entry| entry.liquidity_reward_select_rank)
                 .collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+            vec![Some(1), Some(2), Some(3)]
         );
         assert_eq!(
             selected
                 .iter()
                 .map(|entry| entry.liquidity_reward_selected_at_ms)
                 .collect::<Vec<_>>(),
-            vec![Some(200); 6]
+            vec![Some(200); 3]
         );
 
         store
-            .kick_reward_market_pool_entry("0x6", "out", 250)
+            .kick_reward_market_pool_entry("0x4", "out", 250)
             .expect("kick should update");
         let selected_after_kick = store
             .load_liquidity_reward_pool_entries()
@@ -1936,9 +2069,62 @@ mod tests {
             .map(|entry| entry.condition_id.as_str())
             .collect::<Vec<_>>();
 
+        assert_eq!(condition_ids_after_kick, vec!["0x1", "0x2"]);
+    }
+
+    #[test]
+    fn load_liquidity_reward_pool_entries_skips_entries_without_parseable_roi() {
+        let store = MarketStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let build_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let entries = vec![
+            reward_pool_entry(
+                "0xinvalid",
+                "invalid token1",
+                "invalid token2",
+                Some("10"),
+                Some("not-a-number"),
+            ),
+            reward_pool_entry(
+                "0xmissing",
+                "missing token1",
+                "missing token2",
+                Some("20"),
+                None,
+            ),
+            reward_pool_entry(
+                "0xlow",
+                "low token1",
+                "low token2",
+                Some("30"),
+                Some("0.25"),
+            ),
+            reward_pool_entry(
+                "0xhigh",
+                "high token1",
+                "high token2",
+                Some("40"),
+                Some("0.75"),
+            ),
+        ];
+        store
+            .replace_reward_market_pool_entries(build_date, 123, &entries, 200, 3)
+            .expect("pool should replace");
+        let selected = store
+            .load_liquidity_reward_pool_entries()
+            .expect("pool entries should load");
+        let condition_ids = selected
+            .iter()
+            .map(|entry| entry.condition_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(condition_ids, vec!["0xhigh", "0xlow"]);
         assert_eq!(
-            condition_ids_after_kick,
-            vec!["0x0", "0x1", "0x2", "0x5", "0x7"]
+            selected
+                .iter()
+                .map(|entry| entry.liquidity_reward_select_rank)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
         );
     }
 }

@@ -1,11 +1,23 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, Utc};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE;
+use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, Utc};
+use hmac::{Hmac, Mac as _};
+use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk_v2::clob::types::response::{
-    CurrentRewardResponse, MarketRewardResponse, Token,
+    CurrentRewardResponse, MarketRewardResponse, Page, Token,
 };
+use polymarket_client_sdk_v2::gamma::Client as GammaClient;
+use polymarket_client_sdk_v2::gamma::types::request::MarketBySlugRequest;
 use polymarket_client_sdk_v2::types::Decimal;
+use reqwest::header::HeaderMap;
+use reqwest::{Method, Request};
+use serde::Deserialize;
+use sha2::Sha256;
 use tracing::{info, warn};
 
 use crate::clob_client::{AuthenticatedClobClient, build_authenticated_clob_client};
@@ -16,10 +28,34 @@ use crate::storage::{
 };
 use crate::strategy::{RewardPoolRemovalEvent, StrategyEvent};
 
+#[derive(Debug, Clone, Deserialize)]
+struct RewardCurrentMarket {
+    #[serde(flatten)]
+    market: CurrentRewardResponse,
+    #[serde(alias = "totalDailyRate")]
+    total_daily_rate: Option<Decimal>,
+}
+
 #[derive(Clone)]
-pub struct RewardMarketPoolEntry {
-    pub market: Arc<CurrentRewardResponse>,
-    pub detail: Arc<MarketRewardResponse>,
+struct RewardMarketPoolEntry {
+    market: Arc<RewardCurrentMarket>,
+    detail: Arc<MarketRewardResponse>,
+    gamma: RewardMarketGammaSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RewardMarketGammaSnapshot {
+    end_time: Option<NaiveDateTime>,
+    volume_24hr_clob: Option<Decimal>,
+    volume_24hr: Option<Decimal>,
+}
+
+fn selected_volume_24hr(snapshot: &RewardMarketGammaSnapshot) -> Option<Decimal> {
+    snapshot.volume_24hr_clob.or(snapshot.volume_24hr)
+}
+
+fn volume_passes_threshold(volume: Option<Decimal>) -> bool {
+    volume.is_some_and(|volume| volume >= Decimal::from(50_000u32))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +63,20 @@ pub struct RewardMarketPoolMeta {
     pub build_date_utc: NaiveDate,
     pub version: u64,
     pub built_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewardMarketPoolBuildTrigger {
+    Startup,
+}
+
+fn should_build_reward_market_pool(
+    last_success_meta: Option<RewardMarketPoolMeta>,
+    trigger: RewardMarketPoolBuildTrigger,
+) -> bool {
+    match trigger {
+        RewardMarketPoolBuildTrigger::Startup => last_success_meta.is_none(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +91,9 @@ struct OwnedRewardMarketPoolStorageEntry {
     rewards_min_size: Option<String>,
     rewards_max_spread: Option<String>,
     market_daily_reward: Option<String>,
+    volume_24hr_clob: Option<String>,
+    volume_24hr: Option<String>,
+    liquidity_reward_roi: Option<String>,
 }
 
 impl RewardMarketPoolEntry {
@@ -56,13 +109,8 @@ pub struct RewardMarketPoolRules {
 
 #[derive(Clone)]
 pub enum RewardMarketRule {
-    MinDailyReward(Decimal),
-    MinHoursBeforeEnd(i64),
-    MaxRewardsMinSize(Decimal),
-    ExcludeCompetitivenessTails {
-        lower_percent: u32,
-        upper_percent: u32,
-    },
+    MinDaysBeforeEnd(i64),
+    PositiveRewardsMinSize,
 }
 
 impl RewardMarketPoolRules {
@@ -72,59 +120,36 @@ impl RewardMarketPoolRules {
         }
     }
 
-    pub fn default_active_pool(max_rewards_min_size: Option<Decimal>) -> Self {
-        let mut rules = vec![
-            RewardMarketRule::MinDailyReward(Decimal::from(50u32)),
-            RewardMarketRule::MinHoursBeforeEnd(48),
-        ];
-        if let Some(max_rewards_min_size) = max_rewards_min_size {
-            rules.push(RewardMarketRule::MaxRewardsMinSize(max_rewards_min_size));
-        }
-        rules.push(RewardMarketRule::ExcludeCompetitivenessTails {
-            lower_percent: 20,
-            upper_percent: 20,
-        });
-        Self::new(rules)
+    pub fn default_active_pool(_max_rewards_min_size: Option<Decimal>) -> Self {
+        Self::new(vec![
+            RewardMarketRule::MinDaysBeforeEnd(60),
+            RewardMarketRule::PositiveRewardsMinSize,
+        ])
     }
 
-    fn basic_matches(&self, market: &CurrentRewardResponse, now: NaiveDateTime) -> bool {
-        self.rules
-            .iter()
-            .all(|rule| rule.basic_matches(market, now))
+    fn basic_matches(&self, market: &CurrentRewardResponse) -> bool {
+        self.rules.iter().all(|rule| rule.basic_matches(market))
     }
 
-    fn apply_pool_rules(&self, entries: Vec<RewardMarketPoolEntry>) -> Vec<RewardMarketPoolEntry> {
-        self.rules
-            .iter()
-            .fold(entries, |entries, rule| rule.apply_pool_rule(entries))
+    fn gamma_matches(&self, gamma: &RewardMarketGammaSnapshot, now: NaiveDateTime) -> bool {
+        self.rules.iter().all(|rule| rule.gamma_matches(gamma, now))
     }
 }
 
 impl RewardMarketRule {
-    fn basic_matches(&self, market: &CurrentRewardResponse, now: NaiveDateTime) -> bool {
+    fn basic_matches(&self, market: &CurrentRewardResponse) -> bool {
         match self {
-            Self::MinDailyReward(min_daily_reward) => {
-                market_daily_reward(market) > *min_daily_reward
-            }
-            Self::MinHoursBeforeEnd(min_hours_before_end) => {
-                market_end_time(market).is_some_and(|end_time| {
-                    end_time - now > ChronoDuration::hours(*min_hours_before_end)
-                })
-            }
-            Self::MaxRewardsMinSize(max_rewards_min_size) => {
-                market.rewards_min_size <= *max_rewards_min_size
-            }
-            Self::ExcludeCompetitivenessTails { .. } => true,
+            Self::MinDaysBeforeEnd(_) => true,
+            Self::PositiveRewardsMinSize => market.rewards_min_size > Decimal::ZERO,
         }
     }
 
-    fn apply_pool_rule(&self, entries: Vec<RewardMarketPoolEntry>) -> Vec<RewardMarketPoolEntry> {
+    fn gamma_matches(&self, gamma: &RewardMarketGammaSnapshot, now: NaiveDateTime) -> bool {
         match self {
-            Self::ExcludeCompetitivenessTails {
-                lower_percent,
-                upper_percent,
-            } => exclude_competitiveness_tails(entries, *lower_percent, *upper_percent),
-            _ => entries,
+            Self::MinDaysBeforeEnd(min_days_before_end) => gamma.end_time.is_some_and(|end_time| {
+                end_time - now > ChronoDuration::days(*min_days_before_end)
+            }),
+            Self::PositiveRewardsMinSize => true,
         }
     }
 }
@@ -149,8 +174,16 @@ pub async fn run_reward_market_loader(
     loop {
         let now = Utc::now();
         let build_date_utc = now.date_naive();
-        if last_success_meta.map(|meta| meta.build_date_utc) == Some(build_date_utc) {
-            tokio::time::sleep(duration_until_next_utc_midnight(now)).await;
+        if !should_build_reward_market_pool(
+            last_success_meta,
+            RewardMarketPoolBuildTrigger::Startup,
+        ) {
+            info!(
+                target: "order",
+                pool_version = last_success_meta.map(|meta| meta.version),
+                "reward_market_loader 已存在奖励市场池，跳过自动重建"
+            );
+            tokio::time::sleep(retry_interval).await;
             continue;
         }
 
@@ -170,9 +203,9 @@ pub async fn run_reward_market_loader(
                     target: "order",
                     build_date_utc = %meta.build_date_utc,
                     pool_version = meta.version,
-                    "reward_market_loader 当日奖励市场池构建完成，等待下一个 UTC 零点"
+                    "reward_market_loader 奖励市场池首次构建完成"
                 );
-                tokio::time::sleep(duration_until_next_utc_midnight(Utc::now())).await;
+                tokio::time::sleep(retry_interval).await;
             }
             Err(error) => {
                 warn!(
@@ -180,7 +213,7 @@ pub async fn run_reward_market_loader(
                     build_date_utc = %build_date_utc,
                     retry_secs = retry_interval.as_secs(),
                     error = %error,
-                    "reward_market_loader 当日奖励市场池构建失败，保留旧缓存并稍后重试"
+                    "reward_market_loader 奖励市场池构建失败，保留旧缓存并稍后重试"
                 );
                 tokio::time::sleep(retry_interval).await;
             }
@@ -218,8 +251,12 @@ async fn load_reward_markets_once(
     let now = Utc::now().naive_utc();
 
     loop {
-        let page = client.current_rewards(next_cursor.clone()).await?;
-        markets.extend(page.data);
+        let page = load_current_rewards_page(auth, next_cursor.clone()).await?;
+        markets.extend(
+            page.data
+                .into_iter()
+                .filter(|market| market.total_daily_rate.is_some()),
+        );
 
         let cursor = page.next_cursor.trim();
         if cursor.is_empty() || cursor == "LTE=" {
@@ -231,13 +268,12 @@ async fn load_reward_markets_once(
     let loaded_market_count = markets.len();
     let basic_pool_candidates = markets
         .iter()
-        .filter(|market| pool_rules.basic_matches(market, now))
+        .filter(|market| pool_rules.basic_matches(&market.market))
         .cloned()
         .collect::<Vec<_>>();
     let basic_pool_candidate_count = basic_pool_candidates.len();
-    let pool_entries = load_pool_entries(&client, basic_pool_candidates).await?;
+    let pool_entries = load_pool_entries(&client, basic_pool_candidates, pool_rules, now).await?;
     let detailed_pool_candidate_count = pool_entries.len();
-    let pool_entries = pool_rules.apply_pool_rules(pool_entries);
     let reward_market_pool_count = pool_entries.len();
     let owned_entries = pool_entries_to_storage_entries(&pool_entries);
     let stored_reward_market_pool_count = owned_entries.len();
@@ -255,6 +291,9 @@ async fn load_reward_markets_once(
             rewards_min_size: entry.rewards_min_size.as_deref(),
             rewards_max_spread: entry.rewards_max_spread.as_deref(),
             market_daily_reward: entry.market_daily_reward.as_deref(),
+            volume_24hr_clob: entry.volume_24hr_clob.as_deref(),
+            volume_24hr: entry.volume_24hr.as_deref(),
+            liquidity_reward_roi: entry.liquidity_reward_roi.as_deref(),
         })
         .collect::<Vec<_>>();
     let replace_result = store.replace_reward_market_pool_entries(
@@ -292,6 +331,58 @@ async fn load_reward_markets_once(
     Ok(meta)
 }
 
+async fn load_current_rewards_page(
+    auth: &AuthConfig,
+    next_cursor: Option<String>,
+) -> anyhow::Result<Page<RewardCurrentMarket>> {
+    let cursor = next_cursor.map_or(String::new(), |cursor| format!("?next_cursor={cursor}"));
+    let url = format!("https://clob.polymarket.com/rewards/markets/current{cursor}");
+    let http_client = reqwest::Client::new();
+    let request = http_client.request(Method::GET, url).build()?;
+    let headers = create_clob_l2_headers(auth, &request)?;
+    let response = http_client
+        .execute(request_with_headers(request, headers)?)
+        .await?;
+    Ok(response.error_for_status()?.json().await?)
+}
+
+fn request_with_headers(mut request: Request, headers: HeaderMap) -> anyhow::Result<Request> {
+    request.headers_mut().extend(headers);
+    Ok(request)
+}
+
+fn create_clob_l2_headers(auth: &AuthConfig, request: &Request) -> anyhow::Result<HeaderMap> {
+    let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
+    let timestamp = Utc::now().timestamp();
+    let message = format!(
+        "{timestamp}{}{}{}",
+        request.method(),
+        request.url().path(),
+        request_body_string(request)
+    );
+    let decoded_secret = URL_SAFE.decode(&auth.api_secret)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&decoded_secret)?;
+    mac.update(message.as_bytes());
+    let signature = URL_SAFE.encode(mac.finalize().into_bytes());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("POLY_ADDRESS", signer.address().to_checksum(None).parse()?);
+    headers.insert("POLY_API_KEY", auth.api_key.parse()?);
+    headers.insert("POLY_PASSPHRASE", auth.passphrase.parse()?);
+    headers.insert("POLY_SIGNATURE", signature.parse()?);
+    headers.insert("POLY_TIMESTAMP", timestamp.to_string().parse()?);
+    Ok(headers)
+}
+
+fn request_body_string(request: &Request) -> String {
+    request
+        .body()
+        .and_then(|body| body.as_bytes())
+        .map(String::from_utf8_lossy)
+        .map(|body| body.replace('\'', "\""))
+        .unwrap_or_default()
+}
+
 fn notify_removed_liquidity_reward_pool_entries(
     removed_entries: Vec<RemovedLiquidityRewardPoolEntry>,
     strategy_tx: &tokio::sync::mpsc::Sender<StrategyEvent>,
@@ -314,16 +405,36 @@ fn notify_removed_liquidity_reward_pool_entries(
 
 async fn load_pool_entries(
     client: &AuthenticatedClobClient,
-    markets: Vec<CurrentRewardResponse>,
+    markets: Vec<RewardCurrentMarket>,
+    pool_rules: &RewardMarketPoolRules,
+    now: NaiveDateTime,
 ) -> anyhow::Result<Vec<RewardMarketPoolEntry>> {
+    let gamma_client = GammaClient::default();
     let mut entries = Vec::new();
     for market in markets {
-        let condition_id = normalize_condition_id(&market.condition_id.to_string());
+        let condition_id = normalize_condition_id(&market.market.condition_id.to_string());
         match load_market_reward_detail(client, &condition_id).await {
-            Ok(Some(detail)) => entries.push(RewardMarketPoolEntry {
-                market: Arc::new(market),
-                detail: Arc::new(detail),
-            }),
+            Ok(Some(detail)) => {
+                match load_gamma_market_snapshot(&gamma_client, &detail.market_slug).await {
+                    Ok(gamma) => {
+                        if !pool_rules.gamma_matches(&gamma, now) {
+                            continue;
+                        }
+                        let volume_24hr = selected_volume_24hr(&gamma);
+                        if !volume_passes_threshold(volume_24hr) {
+                            continue;
+                        }
+                        entries.push(RewardMarketPoolEntry {
+                            market: Arc::new(market),
+                            detail: Arc::new(detail),
+                            gamma,
+                        });
+                    }
+                    Err(error) => {
+                        warn!(target: "order", condition_id = %condition_id, market_slug = %detail.market_slug, error = %error, "reward_market_loader 查询 Gamma 市场成交量失败，跳过市场池候选")
+                    }
+                }
+            }
             Ok(None) => {
                 warn!(target: "order", condition_id = %condition_id, "reward_market_loader 当前奖励市场详情为空，跳过市场池候选")
             }
@@ -335,19 +446,36 @@ async fn load_pool_entries(
     Ok(entries)
 }
 
+async fn load_gamma_market_snapshot(
+    gamma_client: &GammaClient,
+    market_slug: &str,
+) -> anyhow::Result<RewardMarketGammaSnapshot> {
+    let market = gamma_client
+        .market_by_slug(&MarketBySlugRequest::builder().slug(market_slug).build())
+        .await?;
+    Ok(RewardMarketGammaSnapshot {
+        end_time: market.end_date.map(|end_date| end_date.naive_utc()),
+        volume_24hr_clob: market.volume_24hr_clob,
+        volume_24hr: market.volume_24hr,
+    })
+}
+
 fn pool_entries_to_storage_entries(
     entries: &[RewardMarketPoolEntry],
 ) -> Vec<OwnedRewardMarketPoolStorageEntry> {
     entries
         .iter()
         .filter_map(|entry| {
+            let Some(daily_reward) = market_daily_reward(&entry.market) else {
+                return None;
+            };
             let tokens = &entry.detail.tokens;
             if tokens.len() < 2 {
-                warn!(target: "order", condition_id = %entry.market.condition_id, token_count = tokens.len(), "reward_market_loader 奖励市场 token 数不足，跳过入库");
+                warn!(target: "order", condition_id = %entry.market.market.condition_id, token_count = tokens.len(), "reward_market_loader 奖励市场 token 数不足，跳过入库");
                 return None;
             }
             Some(OwnedRewardMarketPoolStorageEntry {
-                condition_id: normalize_condition_id(&entry.market.condition_id.to_string()),
+                condition_id: normalize_condition_id(&entry.market.market.condition_id.to_string()),
                 market_slug: Some(entry.detail.market_slug.clone()),
                 question: Some(entry.detail.question.clone()),
                 token1: tokens[0].token_id.to_string(),
@@ -356,7 +484,10 @@ fn pool_entries_to_storage_entries(
                 market_competitiveness: Some(entry.market_competitiveness().to_string()),
                 rewards_min_size: Some(entry.detail.rewards_min_size.to_string()),
                 rewards_max_spread: Some(entry.detail.rewards_max_spread.to_string()),
-                market_daily_reward: Some(market_daily_reward(&entry.market).to_string()),
+                market_daily_reward: Some(daily_reward.to_string()),
+                volume_24hr_clob: entry.gamma.volume_24hr_clob.map(|volume| volume.to_string()),
+                volume_24hr: entry.gamma.volume_24hr.map(|volume| volume.to_string()),
+                liquidity_reward_roi: liquidity_reward_roi(entry).map(|value| value.to_string()),
             })
         })
         .collect()
@@ -383,31 +514,6 @@ async fn load_market_reward_detail(
     }
 }
 
-fn exclude_competitiveness_tails(
-    mut entries: Vec<RewardMarketPoolEntry>,
-    lower_percent: u32,
-    upper_percent: u32,
-) -> Vec<RewardMarketPoolEntry> {
-    entries.sort_by(|left, right| {
-        left.market_competitiveness()
-            .partial_cmp(&right.market_competitiveness())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let len = entries.len();
-    let lower_cut = percentile_cut_count(len, lower_percent);
-    let upper_cut = percentile_cut_count(len, upper_percent);
-    entries
-        .into_iter()
-        .skip(lower_cut)
-        .take(len.saturating_sub(lower_cut + upper_cut))
-        .collect()
-}
-
-fn percentile_cut_count(len: usize, percent: u32) -> usize {
-    (len * percent as usize) / 100
-}
-
 fn tokens_json(tokens: &[Token]) -> String {
     let values = tokens
         .iter()
@@ -423,36 +529,20 @@ fn tokens_json(tokens: &[Token]) -> String {
     serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
 }
 
-fn duration_until_next_utc_midnight(now: DateTime<Utc>) -> Duration {
-    let next_day = now.date_naive() + ChronoDuration::days(1);
-    let Some(next_midnight) = next_day.and_hms_opt(0, 0, 0).map(|time| time.and_utc()) else {
-        return Duration::from_secs(60);
-    };
-    (next_midnight - now)
-        .to_std()
-        .unwrap_or_else(|_| Duration::from_secs(60))
-}
-
 fn now_ms() -> anyhow::Result<u64> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok(duration.as_millis() as u64)
 }
 
-fn market_daily_reward(market: &CurrentRewardResponse) -> Decimal {
-    market
-        .rewards_config
-        .iter()
-        .map(|config| config.rate_per_day)
-        .fold(Decimal::ZERO, |total, reward| total + reward)
+fn market_daily_reward(market: &RewardCurrentMarket) -> Option<Decimal> {
+    market.total_daily_rate
 }
 
-fn market_end_time(market: &CurrentRewardResponse) -> Option<NaiveDateTime> {
-    market
-        .rewards_config
-        .iter()
-        .map(|config| config.end_date)
-        .max()
-        .and_then(|end_date| end_date.and_hms_opt(23, 59, 59))
+fn liquidity_reward_roi(entry: &RewardMarketPoolEntry) -> Option<Decimal> {
+    if entry.detail.rewards_min_size <= Decimal::ZERO {
+        return None;
+    }
+    Some(market_daily_reward(&entry.market)? / entry.detail.rewards_min_size)
 }
 
 fn normalize_condition_id(condition_id: &str) -> String {
@@ -477,6 +567,16 @@ mod tests {
         market_with_min_size(condition_id, rate_per_day, end_date, "1")
     }
 
+    fn reward_current_market(
+        condition_id: B256,
+        total_daily_rate: Option<Decimal>,
+    ) -> RewardCurrentMarket {
+        RewardCurrentMarket {
+            market: market(condition_id, "51", "2026-05-10"),
+            total_daily_rate,
+        }
+    }
+
     fn market_with_min_size(
         condition_id: B256,
         rate_per_day: &str,
@@ -499,6 +599,14 @@ mod tests {
     }
 
     fn detail(condition_id: B256, competitiveness: &str) -> MarketRewardResponse {
+        detail_with_min_size(condition_id, competitiveness, "1")
+    }
+
+    fn detail_with_min_size(
+        condition_id: B256,
+        competitiveness: &str,
+        rewards_min_size: &str,
+    ) -> MarketRewardResponse {
         serde_json::from_value(json!({
             "condition_id": condition_id.to_string(),
             "question": "question",
@@ -506,7 +614,7 @@ mod tests {
             "event_slug": "event",
             "image": "",
             "rewards_max_spread": "1",
-            "rewards_min_size": "1",
+            "rewards_min_size": rewards_min_size,
             "market_competitiveness": competitiveness,
             "tokens": [{
                 "token_id": "1",
@@ -526,59 +634,159 @@ mod tests {
 
     fn pool_entry(condition_id: B256, competitiveness: &str) -> RewardMarketPoolEntry {
         RewardMarketPoolEntry {
-            market: Arc::new(market(condition_id, "51", "2026-05-10")),
+            market: Arc::new(reward_current_market(
+                condition_id,
+                Some(Decimal::from(51u32)),
+            )),
             detail: Arc::new(detail(condition_id, competitiveness)),
+            gamma: RewardMarketGammaSnapshot {
+                end_time: Some(
+                    NaiveDate::from_ymd_opt(2026, 8, 1)
+                        .unwrap()
+                        .and_hms_opt(23, 59, 59)
+                        .unwrap(),
+                ),
+                volume_24hr_clob: Some(Decimal::from(60_000u32)),
+                volume_24hr: Some(Decimal::from(70_000u32)),
+            },
         }
     }
 
-    fn test_now() -> NaiveDateTime {
-        chrono::NaiveDate::from_ymd_opt(2026, 5, 2)
+    #[test]
+    fn liquidity_reward_roi_uses_total_daily_rate() {
+        let entry = RewardMarketPoolEntry {
+            market: Arc::new(RewardCurrentMarket {
+                market: market(condition_id(1), "50", "2026-08-01"),
+                total_daily_rate: Some(Decimal::from(80u32)),
+            }),
+            detail: Arc::new(detail_with_min_size(condition_id(1), "10", "200")),
+            gamma: RewardMarketGammaSnapshot {
+                end_time: Some(
+                    NaiveDate::from_ymd_opt(2026, 8, 1)
+                        .unwrap()
+                        .and_hms_opt(23, 59, 59)
+                        .unwrap(),
+                ),
+                volume_24hr_clob: Some(Decimal::from(60_000u32)),
+                volume_24hr: None,
+            },
+        };
+
+        assert_eq!(
+            liquidity_reward_roi(&entry),
+            Some(Decimal::try_from(0.4_f64).unwrap())
+        );
+    }
+
+    #[test]
+    fn liquidity_reward_roi_is_none_when_rewards_min_size_is_zero() {
+        let entry = RewardMarketPoolEntry {
+            market: Arc::new(reward_current_market(
+                condition_id(1),
+                Some(Decimal::from(50u32)),
+            )),
+            detail: Arc::new(detail_with_min_size(condition_id(1), "10", "0")),
+            gamma: RewardMarketGammaSnapshot {
+                end_time: Some(
+                    NaiveDate::from_ymd_opt(2026, 8, 1)
+                        .unwrap()
+                        .and_hms_opt(23, 59, 59)
+                        .unwrap(),
+                ),
+                volume_24hr_clob: Some(Decimal::from(60_000u32)),
+                volume_24hr: None,
+            },
+        };
+
+        assert_eq!(liquidity_reward_roi(&entry), None);
+    }
+
+    #[test]
+    fn selected_volume_prefers_clob_volume_over_total_volume() {
+        let snapshot = RewardMarketGammaSnapshot {
+            end_time: Some(
+                NaiveDate::from_ymd_opt(2026, 8, 1)
+                    .unwrap()
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap(),
+            ),
+            volume_24hr_clob: Some(Decimal::from(60_000u32)),
+            volume_24hr: Some(Decimal::from(70_000u32)),
+        };
+
+        assert_eq!(
+            selected_volume_24hr(&snapshot),
+            Some(Decimal::from(60_000u32))
+        );
+    }
+
+    #[test]
+    fn selected_volume_falls_back_to_total_volume() {
+        let snapshot = RewardMarketGammaSnapshot {
+            end_time: Some(
+                NaiveDate::from_ymd_opt(2026, 8, 1)
+                    .unwrap()
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap(),
+            ),
+            volume_24hr_clob: None,
+            volume_24hr: Some(Decimal::from(55_000u32)),
+        };
+
+        assert_eq!(
+            selected_volume_24hr(&snapshot),
+            Some(Decimal::from(55_000u32))
+        );
+    }
+
+    #[test]
+    fn volume_rule_requires_at_least_fifty_thousand() {
+        assert!(volume_passes_threshold(Some(Decimal::from(50_000u32))));
+        assert!(volume_passes_threshold(Some(Decimal::from(50_001u32))));
+        assert!(!volume_passes_threshold(Some(Decimal::from(49_999u32))));
+        assert!(!volume_passes_threshold(None));
+    }
+
+    #[test]
+    fn default_active_pool_uses_gamma_end_date_for_sixty_day_rule() {
+        let rules = RewardMarketPoolRules::default_active_pool(None);
+        let now = NaiveDate::from_ymd_opt(2026, 5, 13)
             .unwrap()
             .and_hms_opt(0, 0, 0)
-            .unwrap()
+            .unwrap();
+        let gamma_too_soon = RewardMarketGammaSnapshot {
+            end_time: Some(
+                NaiveDate::from_ymd_opt(2026, 7, 11)
+                    .unwrap()
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap(),
+            ),
+            volume_24hr_clob: Some(Decimal::from(60_000u32)),
+            volume_24hr: None,
+        };
+        let gamma_far_enough = RewardMarketGammaSnapshot {
+            end_time: Some(
+                NaiveDate::from_ymd_opt(2026, 7, 13)
+                    .unwrap()
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap(),
+            ),
+            volume_24hr_clob: Some(Decimal::from(60_000u32)),
+            volume_24hr: None,
+        };
+
+        assert!(!rules.gamma_matches(&gamma_too_soon, now));
+        assert!(rules.gamma_matches(&gamma_far_enough, now));
     }
 
     #[test]
-    fn applies_daily_reward_end_time_and_min_size_basic_rules() {
-        let rules = RewardMarketPoolRules::default_active_pool(Some(Decimal::from(100u32)));
-        let eligible = market(condition_id(4), "51", "2026-05-10");
-        let low_reward = market(condition_id(5), "50", "2026-05-10");
-        let ending_soon = market(condition_id(6), "51", "2026-05-03");
-        let oversized = market_with_min_size(condition_id(7), "51", "2026-05-10", "1000");
-        let capped = market_with_min_size(condition_id(8), "51", "2026-05-10", "100");
-
-        assert!(rules.basic_matches(&eligible, test_now()));
-        assert!(!rules.basic_matches(&low_reward, test_now()));
-        assert!(!rules.basic_matches(&ending_soon, test_now()));
-        assert!(!rules.basic_matches(&oversized, test_now()));
-        assert!(rules.basic_matches(&capped, test_now()));
-    }
-
-    #[test]
-    fn default_active_pool_allows_any_min_size_without_cap() {
+    fn default_active_pool_requires_positive_rewards_min_size() {
         let rules = RewardMarketPoolRules::default_active_pool(None);
-        let oversized = market_with_min_size(condition_id(9), "51", "2026-05-10", "1000");
+        let zero_min_size = market_with_min_size(condition_id(1), "100", "2026-08-01", "0");
+        let positive_min_size = market_with_min_size(condition_id(2), "100", "2026-08-01", "100");
 
-        assert!(rules.basic_matches(&oversized, test_now()));
-    }
-
-    #[test]
-    fn excludes_top_and_bottom_competitiveness_tails() {
-        let rules = RewardMarketPoolRules::new([RewardMarketRule::ExcludeCompetitivenessTails {
-            lower_percent: 20,
-            upper_percent: 20,
-        }]);
-        let entries = (0..10)
-            .map(|index| pool_entry(condition_id(index as u8), &index.to_string()))
-            .collect::<Vec<_>>();
-
-        let filtered = rules.apply_pool_rules(entries);
-        let competitiveness = filtered
-            .iter()
-            .map(|entry| entry.market_competitiveness().to_string())
-            .collect::<Vec<_>>();
-
-        assert_eq!(competitiveness, vec!["2", "3", "4", "5", "6", "7"]);
+        assert!(!rules.basic_matches(&zero_min_size));
+        assert!(rules.basic_matches(&positive_min_size));
     }
 
     #[test]
@@ -593,7 +801,20 @@ mod tests {
         assert_eq!(entries[0].rewards_min_size.as_deref(), Some("1"));
         assert_eq!(entries[0].rewards_max_spread.as_deref(), Some("1"));
         assert_eq!(entries[0].market_daily_reward.as_deref(), Some("51"));
+        assert_eq!(entries[0].volume_24hr_clob.as_deref(), Some("60000"));
+        assert_eq!(entries[0].volume_24hr.as_deref(), Some("70000"));
+        assert_eq!(entries[0].liquidity_reward_roi.as_deref(), Some("51"));
         assert!(entries[0].tokens_json.contains("Yes"));
+    }
+
+    #[test]
+    fn skips_pool_entries_without_total_daily_rate() {
+        let mut entry = pool_entry(condition_id(8), "0.5");
+        Arc::make_mut(&mut entry.market).total_daily_rate = None;
+
+        let entries = pool_entries_to_storage_entries(&[entry]);
+
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -604,6 +825,28 @@ mod tests {
         let entries = pool_entries_to_storage_entries(&[entry]);
 
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn reward_pool_builds_when_no_previous_meta_exists() {
+        assert!(should_build_reward_market_pool(
+            None,
+            RewardMarketPoolBuildTrigger::Startup
+        ));
+    }
+
+    #[test]
+    fn reward_pool_does_not_auto_rebuild_when_previous_meta_exists() {
+        let meta = RewardMarketPoolMeta {
+            build_date_utc: NaiveDate::from_ymd_opt(2026, 5, 12).unwrap(),
+            version: 123,
+            built_at_ms: 123,
+        };
+
+        assert!(!should_build_reward_market_pool(
+            Some(meta),
+            RewardMarketPoolBuildTrigger::Startup
+        ));
     }
 
     #[test]
@@ -622,6 +865,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: None,
         }];
         store
             .replace_reward_market_pool_entries(build_date_utc, 123, &entries, 123, 1)
@@ -659,24 +905,6 @@ mod tests {
         assert_eq!(
             removal.reason,
             "reward_pool_rebuild_removed: build_date_utc=2026-05-05"
-        );
-    }
-
-    #[test]
-    fn computes_duration_until_next_utc_midnight() {
-        let parse = |value: &str| value.parse::<DateTime<Utc>>().unwrap();
-
-        assert_eq!(
-            duration_until_next_utc_midnight(parse("2026-05-03T00:00:00Z")).as_secs(),
-            86_400
-        );
-        assert_eq!(
-            duration_until_next_utc_midnight(parse("2026-05-03T12:00:00Z")).as_secs(),
-            43_200
-        );
-        assert_eq!(
-            duration_until_next_utc_midnight(parse("2026-05-03T23:59:30Z")).as_secs(),
-            30
         );
     }
 

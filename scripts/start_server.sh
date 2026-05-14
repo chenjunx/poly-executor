@@ -78,11 +78,6 @@ shopt -s nullglob
 liquidity_files=("$PROJECT_DIR"/liquidity*.csv "$PROJECT_DIR"/liuqui*.csv)
 shopt -u nullglob
 
-if ((${#liquidity_files[@]} == 0)); then
-  echo "Missing required liquidity reward csv file: $PROJECT_DIR/liquidity*.csv" >&2
-  exit 1
-fi
-
 for src in "${liquidity_files[@]}"; do
   cp -f "$src" "$RELEASE_DIR/"
 done

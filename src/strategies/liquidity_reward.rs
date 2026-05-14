@@ -1836,6 +1836,9 @@ mod tests {
             rewards_min_size: Some("100"),
             rewards_max_spread: Some("4"),
             market_daily_reward: Some("50"),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: Some("0.5"),
         }];
         market_store
             .replace_reward_market_pool_entries(build_date, 123, &entries, 100, 1)
@@ -2239,6 +2242,9 @@ mod tests {
             rewards_min_size: rewards_min_size.map(str::to_string),
             rewards_max_spread: rewards_max_spread.map(str::to_string),
             market_daily_reward: market_daily_reward.map(str::to_string),
+            volume_24hr_clob: None,
+            volume_24hr: None,
+            liquidity_reward_roi: None,
             build_date_utc: Some("2026-05-04".to_string()),
             pool_version: Some(1),
             liquidity_reward_selected: true,

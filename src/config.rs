@@ -14,6 +14,8 @@ pub(crate) struct AppConfig {
     #[serde(default, alias = "mid_requote")]
     pub(crate) liquidity_reward: LiquidityRewardConfig,
     #[serde(default)]
+    pub(crate) account: AccountConfig,
+    #[serde(default)]
     pub(crate) notification: NotificationConfig,
     #[serde(default)]
     pub(crate) topic_threads: HashMap<String, usize>,
@@ -103,6 +105,26 @@ impl Default for LiquidityRewardConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct AccountConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_account_refresh_interval_secs")]
+    pub(crate) refresh_interval_secs: u64,
+    #[serde(default)]
+    pub(crate) store_enabled: bool,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            refresh_interval_secs: default_account_refresh_interval_secs(),
+            store_enabled: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub(crate) struct NotificationConfig {
     #[serde(default)]
@@ -137,6 +159,10 @@ impl Default for DingtalkConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_account_refresh_interval_secs() -> u64 {
+    60
 }
 
 fn default_liquidity_reward_source() -> String {
@@ -189,4 +215,18 @@ pub(crate) fn load_app_config() -> anyhow::Result<AppConfig> {
 
 fn default_monitor_interval_secs() -> u64 {
     30
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_config_defaults_to_disabled_read_only_monitor() {
+        let config = AccountConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.refresh_interval_secs, 60);
+        assert!(!config.store_enabled);
+    }
 }
