@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use chrono::Local;
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{info, warn};
+use tracing::info;
 
 const PRICE_SCALE: u32 = 10_000;
 
 use crate::price_store::PriceStore;
 use crate::strategy::{
-    Filters, OrderSignal, PairEntry, Strategy, StrategyEvent, StrategyRegistration,
+    Filters, PairEntry, Strategy, StrategyEvent, StrategyKind, StrategyRegistration,
     TopicRegistration,
 };
 
@@ -104,6 +104,7 @@ impl PairArbitrageStrategy {
 
         let registration = Arc::new(StrategyRegistration {
             name: Arc::from("pair_arbitrage"),
+            kind: StrategyKind::PairArbitrage,
             topics: Arc::<[Arc<str>]>::from(subscriptions),
             topic_tokens: Arc::<[TopicRegistration]>::from(topic_token_regs),
             related_tokens: Arc::<[String]>::from(asset_ids),
@@ -129,7 +130,7 @@ impl Strategy for PairArbitrageStrategy {
     fn spawn(
         self,
         mut rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
-        order_tx: tokio::sync::mpsc::Sender<OrderSignal>,
+        order_gateway: crate::order_gateway::OrderGatewayHandle,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let store = PriceStore::new();
@@ -149,7 +150,7 @@ impl Strategy for PairArbitrageStrategy {
                             &self.filters,
                             &event.topic,
                             &updated,
-                            &order_tx,
+                            &order_gateway,
                         );
                     }
                     StrategyEvent::Positions(update) => {
@@ -157,10 +158,7 @@ impl Strategy for PairArbitrageStrategy {
                             continue;
                         };
                     }
-                    StrategyEvent::OrderStatus(_)
-                    | StrategyEvent::OrderFill(_)
-                    | StrategyEvent::TradeConfirmed(_)
-                    | StrategyEvent::RewardPoolRemoval(_) => {}
+                    StrategyEvent::RewardPoolRemoval(_) => {}
                 }
             }
         })
@@ -177,7 +175,7 @@ fn check_pairs(
     filters: &Filters,
     topic: &Arc<str>,
     updated_assets: &[String],
-    order_tx: &tokio::sync::mpsc::Sender<OrderSignal>,
+    _order_gateway: &crate::order_gateway::OrderGatewayHandle,
 ) {
     let Some(pairs) = pairs_by_topic.get(topic) else {
         return;
@@ -246,15 +244,87 @@ fn check_pairs(
             p1.updated_at_ms,
         );
         info!(target: "alerts", "{}", line.trim_end());
+    }
+}
 
-        if let Err(err) = order_tx.try_send(OrderSignal::PairArbitrage {
-            token0: p0.asset_id.clone(),
-            token1: p1.asset_id.clone(),
-            ask0,
-            ask1,
-            gap,
-        }) {
-            warn!(topic = %topic, error = %err, "pair_arbitrage 发送下单信号失败");
+#[cfg(test)]
+mod gateway_migration_tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use super::*;
+    use crate::strategy::{CleanOrderbook, PairEntry, StrategyKind};
+
+    fn filters() -> Filters {
+        Filters {
+            min_diff: Decimal::try_from(0.01_f64).expect("decimal should build"),
+            max_spread: Decimal::try_from(0.10_f64).expect("decimal should build"),
+            min_price: Decimal::try_from(0.01_f64).expect("decimal should build"),
+            max_price: Decimal::try_from(0.99_f64).expect("decimal should build"),
         }
+    }
+
+    fn clean_book(best_bid_price: u16, best_ask_price: u16) -> CleanOrderbook {
+        CleanOrderbook {
+            best_bid_price,
+            best_bid_size: 100,
+            best_ask_price,
+            best_ask_size: 100,
+            timestamp_ms: 100,
+            bids: Arc::new(BTreeMap::new()),
+            asks: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    #[test]
+    fn pair_arbitrage_keeps_alert_only_without_gateway_order() {
+        let store = PriceStore::new();
+        store.register(&["token-000000".to_string(), "token-111111".to_string()]);
+        store.apply("token-000000", clean_book(3_900, 4_000));
+        store.apply("token-111111", clean_book(4_900, 5_000));
+
+        let topic = Arc::<str>::from("topic");
+        let pairs = HashMap::from([(
+            topic.clone(),
+            Arc::<[PairEntry]>::from(vec![PairEntry {
+                tokens: ["token-000000".to_string(), "token-111111".to_string()],
+                topic: topic.clone(),
+            }]),
+        )]);
+        let (gateway, mut gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
+            8,
+            crate::order_gateway::GatewayPhase::Live,
+        );
+
+        let csv_path = std::env::temp_dir().join(format!(
+            "pair_arbitrage_kind_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &csv_path,
+            "token1,token2,topic\ntoken-000000,token-111111,topic\n",
+        )
+        .expect("csv should write");
+        let strategy = PairArbitrageStrategy::from_config(
+            Arc::new(filters()),
+            csv_path.to_str().expect("path should be utf-8"),
+        )
+        .expect("strategy should build");
+        std::fs::remove_file(&csv_path).expect("csv should be removed");
+
+        check_pairs(
+            &store,
+            &pairs,
+            &filters(),
+            &topic,
+            &["token-000000".to_string()],
+            &gateway,
+        );
+
+        assert_eq!(strategy.registration().kind, StrategyKind::PairArbitrage);
+        assert!(gateway_rx.try_recv().is_err());
     }
 }

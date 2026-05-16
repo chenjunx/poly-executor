@@ -113,6 +113,183 @@ pub struct RewardMarketPoolStorageEntry<'a> {
     pub liquidity_reward_roi: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderGatewayOrderSnapshot {
+    pub strategy_id: String,
+    pub market_id: Option<String>,
+    pub token_id: String,
+    pub local_id: String,
+    pub exch_id: Option<String>,
+    pub side: String,
+    pub order_type: String,
+    pub price: Option<String>,
+    pub size: String,
+    pub local_state: String,
+    pub remote_status_code: Option<String>,
+    pub filled_size_total: String,
+    pub remaining_size: String,
+    pub avg_fill_price: Option<String>,
+    pub last_submission_attempt: Option<i64>,
+    pub last_event_seq: u64,
+    pub terminal_at_ms: Option<u64>,
+}
+
+pub struct OrderGatewayEventInsert<'a> {
+    pub seq: u64,
+    pub strategy_id: &'a str,
+    pub token_id: &'a str,
+    pub market_id: Option<&'a str>,
+    pub local_id: Option<&'a str>,
+    pub exch_id: Option<&'a str>,
+    pub event_kind: &'a str,
+    pub local_state: &'a str,
+    pub remote_status_code: Option<&'a str>,
+    pub remote_reject_code: Option<&'a str>,
+    pub remote_reject_reason: Option<&'a str>,
+    pub fill_delta: Option<&'a str>,
+    pub fill_total: Option<&'a str>,
+    pub remaining_size: Option<&'a str>,
+    pub avg_fill_price: Option<&'a str>,
+    pub error_code: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub raw_json: &'a str,
+    pub recovery: bool,
+}
+
+pub struct OrderGatewaySubmissionInsert<'a> {
+    pub local_id: &'a str,
+    pub submit_attempt: i64,
+    pub strategy_id: &'a str,
+    pub token_id: &'a str,
+    pub side: &'a str,
+    pub order_type: &'a str,
+    pub price: Option<&'a str>,
+    pub size: &'a str,
+    pub exch_id: Option<&'a str>,
+    pub unsigned_payload_json: &'a str,
+    pub signed_payload_json: &'a str,
+    pub signature: &'a str,
+    pub signer_address: &'a str,
+    pub nonce_or_salt: Option<&'a str>,
+    pub expiration: Option<i64>,
+    pub exchange_payload_hash: &'a str,
+    pub rest_request_json: &'a str,
+    pub rest_response_json: Option<&'a str>,
+    pub rest_status_code: Option<i64>,
+    pub submit_state: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOrderGatewaySubmission {
+    pub local_id: String,
+    pub submit_attempt: i64,
+    pub signed_payload_json: String,
+    pub exchange_payload_hash: String,
+    pub submit_state: String,
+}
+
+pub struct PositionJournalInsert<'a> {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub event_type: &'a str,
+    pub strategy_id: Option<&'a str>,
+    pub token_id: &'a str,
+    pub local_order_id: Option<&'a str>,
+    pub exchange_order_id: Option<&'a str>,
+    pub side: Option<&'a str>,
+    pub qty: Option<&'a str>,
+    pub price: Option<&'a str>,
+    pub source: &'a str,
+    pub recovery: bool,
+    pub payload_json: &'a str,
+}
+
+pub struct PositionSnapshotRow<'a> {
+    pub scope_type: &'a str,
+    pub strategy_id: Option<&'a str>,
+    pub token_id: &'a str,
+    pub filled_position: &'a str,
+    pub cost_basis: &'a str,
+    pub realized_pnl: &'a str,
+    pub working_buy_exposure: &'a str,
+    pub working_sell_exposure: &'a str,
+}
+
+pub struct PositionOpenOrderSnapshotRow<'a> {
+    pub snapshot_id: u64,
+    pub seq: u64,
+    pub strategy_id: &'a str,
+    pub token_id: &'a str,
+    pub local_order_id: &'a str,
+    pub exchange_order_id: Option<&'a str>,
+    pub side: &'a str,
+    pub price: &'a str,
+    pub original_size: &'a str,
+    pub remaining_size: &'a str,
+    pub local_state: &'a str,
+}
+
+pub struct PositionReconciliationInsert<'a> {
+    pub reconciliation_id: &'a str,
+    pub started_at_ms: u64,
+    pub exchange_data_as_of_ms: u64,
+    pub last_local_seq_compared: u64,
+    pub status: &'a str,
+    pub mismatch_count: u64,
+    pub adjustment_journal_seq: Option<u64>,
+    pub summary_json: &'a str,
+    pub alert_message: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPositionJournalRow {
+    pub seq: u64,
+    pub event_type: String,
+    pub strategy_id: Option<String>,
+    pub token_id: String,
+    pub local_order_id: Option<String>,
+    pub side: Option<String>,
+    pub qty: Option<String>,
+    pub price: Option<String>,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPositionSnapshotRow {
+    pub scope_type: String,
+    pub strategy_id: Option<String>,
+    pub token_id: String,
+    pub filled_position: String,
+    pub cost_basis: String,
+    pub realized_pnl: String,
+    pub working_buy_exposure: String,
+    pub working_sell_exposure: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPositionOpenOrderSnapshotRow {
+    pub snapshot_id: u64,
+    pub seq: u64,
+    pub strategy_id: String,
+    pub token_id: String,
+    pub local_order_id: String,
+    pub exchange_order_id: Option<String>,
+    pub side: String,
+    pub price: String,
+    pub original_size: String,
+    pub remaining_size: String,
+    pub local_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPositionSnapshotBatch {
+    pub snapshot_id: u64,
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub rows: Vec<StoredPositionSnapshotRow>,
+    pub open_orders: Vec<StoredPositionOpenOrderSnapshotRow>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActiveRewardMarketPoolEntry {
     pub condition_id: String,
@@ -220,7 +397,149 @@ impl OrderStore {
                     updated_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (token, side)
                 );
-                ",
+
+                CREATE TABLE IF NOT EXISTS order_gateway_orders (
+                    local_id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    market_id TEXT,
+                    token_id TEXT NOT NULL,
+                    exch_id TEXT UNIQUE,
+                    side TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
+                    price TEXT,
+                    size TEXT NOT NULL,
+                    local_state TEXT NOT NULL,
+                    remote_status_code TEXT,
+                    filled_size_total TEXT NOT NULL,
+                    remaining_size TEXT NOT NULL,
+                    avg_fill_price TEXT,
+                    last_submission_attempt INTEGER,
+                    last_event_seq INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    terminal_at_ms INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS order_gateway_events (
+                    seq INTEGER PRIMARY KEY,
+                    created_at_ms INTEGER NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    token_id TEXT NOT NULL,
+                    market_id TEXT,
+                    local_id TEXT,
+                    exch_id TEXT,
+                    event_kind TEXT NOT NULL,
+                    local_state TEXT NOT NULL,
+                    remote_status_code TEXT,
+                    remote_reject_code TEXT,
+                    remote_reject_reason TEXT,
+                    fill_delta TEXT,
+                    fill_total TEXT,
+                    remaining_size TEXT,
+                    avg_fill_price TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    raw_json TEXT NOT NULL,
+                    recovery INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS order_gateway_submissions (
+                    local_id TEXT NOT NULL,
+                    submit_attempt INTEGER NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    token_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
+                    price TEXT,
+                    size TEXT NOT NULL,
+                    exch_id TEXT,
+                    unsigned_payload_json TEXT NOT NULL,
+                    signed_payload_json TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    signer_address TEXT NOT NULL,
+                    nonce_or_salt TEXT,
+                    expiration INTEGER,
+                    exchange_payload_hash TEXT NOT NULL,
+                    rest_request_json TEXT NOT NULL,
+                    rest_response_json TEXT,
+                    rest_status_code INTEGER,
+                    submit_state TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (local_id, submit_attempt)
+                );
+
+                CREATE TABLE IF NOT EXISTS order_gateway_cancel_attempts (
+                    cancel_attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    local_id TEXT,
+                    exch_id TEXT,
+                    scope TEXT NOT NULL,
+                    rest_request_json TEXT NOT NULL,
+                    rest_response_json TEXT,
+                    rest_status_code INTEGER,
+                    cancel_state TEXT NOT NULL,
+                    error_code TEXT,
+                    created_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS position_journal (
+                    seq INTEGER PRIMARY KEY,
+                    ts_ms INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    strategy_id TEXT,
+                    token_id TEXT NOT NULL,
+                    local_order_id TEXT,
+                    exchange_order_id TEXT,
+                    side TEXT,
+                    qty TEXT,
+                    price TEXT,
+                    source TEXT NOT NULL,
+                    recovery INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS position_snapshots (
+                    snapshot_id INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    ts_ms INTEGER NOT NULL,
+                    scope_type TEXT NOT NULL,
+                    strategy_id TEXT,
+                    token_id TEXT NOT NULL,
+                    filled_position TEXT NOT NULL,
+                    cost_basis TEXT NOT NULL,
+                    realized_pnl TEXT NOT NULL,
+                    working_buy_exposure TEXT NOT NULL,
+                    working_sell_exposure TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, scope_type, strategy_id, token_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS position_open_orders_snapshot (
+                    snapshot_id INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    token_id TEXT NOT NULL,
+                    local_order_id TEXT NOT NULL,
+                    exchange_order_id TEXT,
+                    side TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    original_size TEXT NOT NULL,
+                    remaining_size TEXT NOT NULL,
+                    local_state TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, local_order_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS position_reconciliations (
+                    reconciliation_id TEXT PRIMARY KEY,
+                    started_at_ms INTEGER NOT NULL,
+                    exchange_data_as_of_ms INTEGER NOT NULL,
+                    last_local_seq_compared INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    mismatch_count INTEGER NOT NULL,
+                    adjustment_journal_seq INTEGER,
+                    summary_json TEXT NOT NULL,
+                    alert_message TEXT
+                );
+",
             )?;
             ensure_column(
                 conn,
@@ -494,6 +813,461 @@ impl OrderStore {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn upsert_order_gateway_order(
+        &self,
+        snapshot: &OrderGatewayOrderSnapshot,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO order_gateway_orders (
+                    local_id, strategy_id, market_id, token_id, exch_id, side, order_type,
+                    price, size, local_state, remote_status_code, filled_size_total,
+                    remaining_size, avg_fill_price, last_submission_attempt, last_event_seq,
+                    created_at_ms, updated_at_ms, terminal_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                ON CONFLICT(local_id) DO UPDATE SET
+                    strategy_id = excluded.strategy_id,
+                    market_id = excluded.market_id,
+                    token_id = excluded.token_id,
+                    exch_id = COALESCE(excluded.exch_id, order_gateway_orders.exch_id),
+                    side = excluded.side,
+                    order_type = excluded.order_type,
+                    price = excluded.price,
+                    size = excluded.size,
+                    local_state = excluded.local_state,
+                    remote_status_code = excluded.remote_status_code,
+                    filled_size_total = excluded.filled_size_total,
+                    remaining_size = excluded.remaining_size,
+                    avg_fill_price = excluded.avg_fill_price,
+                    last_submission_attempt = excluded.last_submission_attempt,
+                    last_event_seq = excluded.last_event_seq,
+                    updated_at_ms = excluded.updated_at_ms,
+                    terminal_at_ms = excluded.terminal_at_ms
+                ",
+                params![
+                    snapshot.local_id,
+                    snapshot.strategy_id,
+                    snapshot.market_id,
+                    snapshot.token_id,
+                    snapshot.exch_id,
+                    snapshot.side,
+                    snapshot.order_type,
+                    snapshot.price,
+                    snapshot.size,
+                    snapshot.local_state,
+                    snapshot.remote_status_code,
+                    snapshot.filled_size_total,
+                    snapshot.remaining_size,
+                    snapshot.avg_fill_price,
+                    snapshot.last_submission_attempt,
+                    snapshot.last_event_seq as i64,
+                    now,
+                    now,
+                    snapshot.terminal_at_ms.map(|value| value as i64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn append_order_gateway_event(
+        &self,
+        event: &OrderGatewayEventInsert<'_>,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO order_gateway_events (
+                    seq, created_at_ms, strategy_id, token_id, market_id, local_id, exch_id,
+                    event_kind, local_state, remote_status_code, remote_reject_code,
+                    remote_reject_reason, fill_delta, fill_total, remaining_size, avg_fill_price,
+                    error_code, error_message, raw_json, recovery
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ",
+                params![
+                    event.seq as i64,
+                    now,
+                    event.strategy_id,
+                    event.token_id,
+                    event.market_id,
+                    event.local_id,
+                    event.exch_id,
+                    event.event_kind,
+                    event.local_state,
+                    event.remote_status_code,
+                    event.remote_reject_code,
+                    event.remote_reject_reason,
+                    event.fill_delta,
+                    event.fill_total,
+                    event.remaining_size,
+                    event.avg_fill_price,
+                    event.error_code,
+                    event.error_message,
+                    event.raw_json,
+                    if event.recovery { 1_i64 } else { 0_i64 },
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_order_gateway_submission(
+        &self,
+        submission: &OrderGatewaySubmissionInsert<'_>,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO order_gateway_submissions (
+                    local_id, submit_attempt, strategy_id, token_id, side, order_type,
+                    price, size, exch_id, unsigned_payload_json, signed_payload_json, signature,
+                    signer_address, nonce_or_salt, expiration, exchange_payload_hash,
+                    rest_request_json, rest_response_json, rest_status_code, submit_state,
+                    created_at_ms, updated_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                ",
+                params![
+                    submission.local_id,
+                    submission.submit_attempt,
+                    submission.strategy_id,
+                    submission.token_id,
+                    submission.side,
+                    submission.order_type,
+                    submission.price,
+                    submission.size,
+                    submission.exch_id,
+                    submission.unsigned_payload_json,
+                    submission.signed_payload_json,
+                    submission.signature,
+                    submission.signer_address,
+                    submission.nonce_or_salt,
+                    submission.expiration,
+                    submission.exchange_payload_hash,
+                    submission.rest_request_json,
+                    submission.rest_response_json,
+                    submission.rest_status_code,
+                    submission.submit_state,
+                    now,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn append_position_journal(&self, event: &PositionJournalInsert<'_>) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO position_journal (
+                    seq, ts_ms, event_type, strategy_id, token_id, local_order_id,
+                    exchange_order_id, side, qty, price, source, recovery, payload_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ",
+                params![
+                    event.seq as i64,
+                    event.ts_ms as i64,
+                    event.event_type,
+                    event.strategy_id,
+                    event.token_id,
+                    event.local_order_id,
+                    event.exchange_order_id,
+                    event.side,
+                    event.qty,
+                    event.price,
+                    event.source,
+                    if event.recovery { 1_i64 } else { 0_i64 },
+                    event.payload_json,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_position_snapshot_rows(
+        &self,
+        snapshot_id: u64,
+        seq: u64,
+        ts_ms: u64,
+        rows: &[PositionSnapshotRow<'_>],
+        open_orders: &[PositionOpenOrderSnapshotRow<'_>],
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> anyhow::Result<()> {
+                for row in rows {
+                    conn.execute(
+                        "
+                        INSERT INTO position_snapshots (
+                            snapshot_id, seq, ts_ms, scope_type, strategy_id, token_id,
+                            filled_position, cost_basis, realized_pnl, working_buy_exposure,
+                            working_sell_exposure
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                        ",
+                        params![
+                            snapshot_id as i64,
+                            seq as i64,
+                            ts_ms as i64,
+                            row.scope_type,
+                            row.strategy_id,
+                            row.token_id,
+                            row.filled_position,
+                            row.cost_basis,
+                            row.realized_pnl,
+                            row.working_buy_exposure,
+                            row.working_sell_exposure,
+                        ],
+                    )?;
+                }
+                for order in open_orders {
+                    conn.execute(
+                        "
+                        INSERT INTO position_open_orders_snapshot (
+                            snapshot_id, seq, strategy_id, token_id, local_order_id,
+                            exchange_order_id, side, price, original_size, remaining_size, local_state
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                        ",
+                        params![
+                            order.snapshot_id as i64,
+                            order.seq as i64,
+                            order.strategy_id,
+                            order.token_id,
+                            order.local_order_id,
+                            order.exchange_order_id,
+                            order.side,
+                            order.price,
+                            order.original_size,
+                            order.remaining_size,
+                            order.local_state,
+                        ],
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                conn.execute_batch("ROLLBACK")?;
+                return Err(error);
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_position_reconciliation(
+        &self,
+        reconciliation: &PositionReconciliationInsert<'_>,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO position_reconciliations (
+                    reconciliation_id, started_at_ms, exchange_data_as_of_ms,
+                    last_local_seq_compared, status, mismatch_count, adjustment_journal_seq,
+                    summary_json, alert_message
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    reconciliation.reconciliation_id,
+                    reconciliation.started_at_ms as i64,
+                    reconciliation.exchange_data_as_of_ms as i64,
+                    reconciliation.last_local_seq_compared as i64,
+                    reconciliation.status,
+                    reconciliation.mismatch_count as i64,
+                    reconciliation
+                        .adjustment_journal_seq
+                        .map(|value| value as i64),
+                    reconciliation.summary_json,
+                    reconciliation.alert_message,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_position_journal_after(
+        &self,
+        seq: u64,
+    ) -> anyhow::Result<Vec<StoredPositionJournalRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                SELECT seq, event_type, strategy_id, token_id, local_order_id, side, qty, price, payload_json
+                FROM position_journal
+                WHERE seq > ?1
+                ORDER BY seq ASC
+                ",
+            )?;
+            let rows = stmt.query_map(params![seq as i64], |row| {
+                Ok(StoredPositionJournalRow {
+                    seq: row.get::<_, i64>(0)? as u64,
+                    event_type: row.get(1)?,
+                    strategy_id: row.get(2)?,
+                    token_id: row.get(3)?,
+                    local_order_id: row.get(4)?,
+                    side: row.get(5)?,
+                    qty: row.get(6)?,
+                    price: row.get(7)?,
+                    payload_json: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn load_latest_position_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<StoredPositionSnapshotBatch>> {
+        self.with_conn(|conn| {
+            let snapshot_id = conn
+                .query_row(
+                    "SELECT snapshot_id FROM position_snapshots ORDER BY snapshot_id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(snapshot_id) = snapshot_id else {
+                return Ok(None);
+            };
+            let mut row_stmt = conn.prepare(
+                "
+                SELECT seq, ts_ms, scope_type, strategy_id, token_id, filled_position,
+                       cost_basis, realized_pnl, working_buy_exposure, working_sell_exposure
+                FROM position_snapshots
+                WHERE snapshot_id = ?1
+                ORDER BY scope_type, strategy_id, token_id
+                ",
+            )?;
+            let rows = row_stmt
+                .query_map(params![snapshot_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        StoredPositionSnapshotRow {
+                            scope_type: row.get(2)?,
+                            strategy_id: row.get(3)?,
+                            token_id: row.get(4)?,
+                            filled_position: row.get(5)?,
+                            cost_basis: row.get(6)?,
+                            realized_pnl: row.get(7)?,
+                            working_buy_exposure: row.get(8)?,
+                            working_sell_exposure: row.get(9)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let seq = rows.first().map(|row| row.0).unwrap_or(0);
+            let ts_ms = rows.first().map(|row| row.1).unwrap_or(0);
+            let rows = rows.into_iter().map(|row| row.2).collect::<Vec<_>>();
+
+            let mut order_stmt = conn.prepare(
+                "
+                SELECT snapshot_id, seq, strategy_id, token_id, local_order_id,
+                       exchange_order_id, side, price, original_size, remaining_size, local_state
+                FROM position_open_orders_snapshot
+                WHERE snapshot_id = ?1
+                ORDER BY local_order_id
+                ",
+            )?;
+            let open_orders = order_stmt
+                .query_map(params![snapshot_id], |row| {
+                    Ok(StoredPositionOpenOrderSnapshotRow {
+                        snapshot_id: row.get::<_, i64>(0)? as u64,
+                        seq: row.get::<_, i64>(1)? as u64,
+                        strategy_id: row.get(2)?,
+                        token_id: row.get(3)?,
+                        local_order_id: row.get(4)?,
+                        exchange_order_id: row.get(5)?,
+                        side: row.get(6)?,
+                        price: row.get(7)?,
+                        original_size: row.get(8)?,
+                        remaining_size: row.get(9)?,
+                        local_state: row.get(10)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(Some(StoredPositionSnapshotBatch {
+                snapshot_id: snapshot_id as u64,
+                seq,
+                ts_ms,
+                rows,
+                open_orders,
+            }))
+        })
+    }
+
+    pub fn load_order_gateway_recoverable_orders(
+        &self,
+    ) -> anyhow::Result<Vec<OrderGatewayOrderSnapshot>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                SELECT strategy_id, market_id, token_id, local_id, exch_id, side, order_type,
+                       price, size, local_state, remote_status_code, filled_size_total,
+                       remaining_size, avg_fill_price, last_submission_attempt, last_event_seq,
+                       terminal_at_ms
+                FROM order_gateway_orders
+                WHERE local_state NOT IN ('Filled', 'Cancelled', 'Expired', 'Rejected', 'Failed', 'UnknownTerminal')
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(OrderGatewayOrderSnapshot {
+                    strategy_id: row.get(0)?,
+                    market_id: row.get(1)?,
+                    token_id: row.get(2)?,
+                    local_id: row.get(3)?,
+                    exch_id: row.get(4)?,
+                    side: row.get(5)?,
+                    order_type: row.get(6)?,
+                    price: row.get(7)?,
+                    size: row.get(8)?,
+                    local_state: row.get(9)?,
+                    remote_status_code: row.get(10)?,
+                    filled_size_total: row.get(11)?,
+                    remaining_size: row.get(12)?,
+                    avg_fill_price: row.get(13)?,
+                    last_submission_attempt: row.get(14)?,
+                    last_event_seq: row.get::<_, i64>(15)? as u64,
+                    terminal_at_ms: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn load_latest_order_gateway_submission(
+        &self,
+        local_id: &str,
+    ) -> anyhow::Result<Option<StoredOrderGatewaySubmission>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "
+                SELECT local_id, submit_attempt, signed_payload_json, exchange_payload_hash, submit_state
+                FROM order_gateway_submissions
+                WHERE local_id = ?1
+                ORDER BY submit_attempt DESC
+                LIMIT 1
+                ",
+                params![local_id],
+                |row| {
+                    Ok(StoredOrderGatewaySubmission {
+                        local_id: row.get(0)?,
+                        submit_attempt: row.get(1)?,
+                        signed_payload_json: row.get(2)?,
+                        exchange_payload_hash: row.get(3)?,
+                        submit_state: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 
@@ -1557,6 +2331,176 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_gateway_schema_persists_snapshot_event_and_submission() {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        let snapshot = OrderGatewayOrderSnapshot {
+            strategy_id: "liquidity_reward".to_string(),
+            market_id: Some("liquidity_reward".to_string()),
+            token_id: "token-1".to_string(),
+            local_id: "local-1".to_string(),
+            exch_id: Some("exch-1".to_string()),
+            side: "Buy".to_string(),
+            order_type: "LimitGtc".to_string(),
+            price: Some("0.42".to_string()),
+            size: "10".to_string(),
+            local_state: "Open".to_string(),
+            remote_status_code: Some("open".to_string()),
+            filled_size_total: "0".to_string(),
+            remaining_size: "10".to_string(),
+            avg_fill_price: None,
+            last_submission_attempt: Some(1),
+            last_event_seq: 7,
+            terminal_at_ms: None,
+        };
+        store
+            .upsert_order_gateway_order(&snapshot)
+            .expect("snapshot should persist");
+        store
+            .append_order_gateway_event(&OrderGatewayEventInsert {
+                seq: 7,
+                strategy_id: "liquidity_reward",
+                token_id: "token-1",
+                market_id: Some("liquidity_reward"),
+                local_id: Some("local-1"),
+                exch_id: Some("exch-1"),
+                event_kind: "Open",
+                local_state: "Open",
+                remote_status_code: Some("open"),
+                remote_reject_code: None,
+                remote_reject_reason: None,
+                fill_delta: None,
+                fill_total: Some("0"),
+                remaining_size: Some("10"),
+                avg_fill_price: None,
+                error_code: None,
+                error_message: None,
+                raw_json: "{}",
+                recovery: false,
+            })
+            .expect("event should persist");
+        store
+            .insert_order_gateway_submission(&OrderGatewaySubmissionInsert {
+                local_id: "local-1",
+                submit_attempt: 1,
+                strategy_id: "liquidity_reward",
+                token_id: "token-1",
+                side: "Buy",
+                order_type: "LimitGtc",
+                price: Some("0.42"),
+                size: "10",
+                exch_id: Some("exch-1"),
+                unsigned_payload_json: "{\"unsigned\":true}",
+                signed_payload_json: "{\"signed\":true}",
+                signature: "0xsig",
+                signer_address: "0xsigner",
+                nonce_or_salt: Some("salt-1"),
+                expiration: None,
+                exchange_payload_hash: "hash-1",
+                rest_request_json: "{\"request\":true}",
+                rest_response_json: Some("{\"ok\":true}"),
+                rest_status_code: Some(200),
+                submit_state: "Submitted",
+            })
+            .expect("submission should persist");
+
+        let active = store
+            .load_order_gateway_recoverable_orders()
+            .expect("recoverable orders should load");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].local_id, "local-1");
+        assert_eq!(active[0].exch_id.as_deref(), Some("exch-1"));
+    }
+
+    #[test]
+    fn position_engine_schema_persists_journal_snapshot_open_order_and_reconciliation() {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        store
+            .append_position_journal(&PositionJournalInsert {
+                seq: 10,
+                ts_ms: 1000,
+                event_type: "OrderFillApplied",
+                strategy_id: Some("strategy-a"),
+                token_id: "token-1",
+                local_order_id: Some("local-1"),
+                exchange_order_id: Some("exch-1"),
+                side: Some("Buy"),
+                qty: Some("4"),
+                price: Some("0.4"),
+                source: "Live",
+                recovery: false,
+                payload_json: "{}",
+            })
+            .expect("journal should persist");
+
+        store
+            .insert_position_snapshot_rows(
+                3,
+                10,
+                1000,
+                &[PositionSnapshotRow {
+                    scope_type: "strategy",
+                    strategy_id: Some("strategy-a"),
+                    token_id: "token-1",
+                    filled_position: "4",
+                    cost_basis: "1.6",
+                    realized_pnl: "0",
+                    working_buy_exposure: "6",
+                    working_sell_exposure: "0",
+                }],
+                &[PositionOpenOrderSnapshotRow {
+                    snapshot_id: 3,
+                    seq: 10,
+                    strategy_id: "strategy-a",
+                    token_id: "token-1",
+                    local_order_id: "local-1",
+                    exchange_order_id: Some("exch-1"),
+                    side: "Buy",
+                    price: "0.4",
+                    original_size: "10",
+                    remaining_size: "6",
+                    local_state: "Open",
+                }],
+            )
+            .expect("snapshot should persist");
+
+        store
+            .insert_position_reconciliation(&PositionReconciliationInsert {
+                reconciliation_id: "recon-1",
+                started_at_ms: 1000,
+                exchange_data_as_of_ms: 1100,
+                last_local_seq_compared: 10,
+                status: "Adjusted",
+                mismatch_count: 1,
+                adjustment_journal_seq: Some(11),
+                summary_json: "{}",
+                alert_message: Some("position mismatch"),
+            })
+            .expect("reconciliation should persist");
+
+        let latest = store
+            .load_latest_position_snapshot()
+            .expect("snapshot should load")
+            .expect("snapshot should exist");
+        assert_eq!(latest.snapshot_id, 3);
+        assert_eq!(latest.seq, 10);
+        assert_eq!(latest.rows.len(), 1);
+        assert_eq!(latest.rows[0].cost_basis, "1.6");
+        assert_eq!(latest.open_orders.len(), 1);
+        assert_eq!(latest.open_orders[0].remaining_size, "6");
+
+        let journal = store
+            .load_position_journal_after(9)
+            .expect("journal should load");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].seq, 10);
+        assert_eq!(journal[0].event_type, "OrderFillApplied");
+    }
 
     #[test]
     fn account_fund_snapshot_round_trips_latest_snapshot() {

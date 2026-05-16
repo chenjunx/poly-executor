@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::order_gateway::OrderGatewayHandle;
+
 use polymarket_client_sdk_v2::types::Decimal;
 
 #[derive(Clone)]
@@ -17,208 +19,6 @@ pub struct Filters {
 pub enum QuoteSide {
     Buy,
     Sell,
-}
-
-#[derive(Debug, Clone)]
-pub enum OrderSignal {
-    PairArbitrage {
-        token0: String,
-        token1: String,
-        ask0: Decimal,
-        ask1: Decimal,
-        gap: Decimal,
-    },
-    LiquidityRewardPlace {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        mid: Decimal,
-        side: QuoteSide,
-        price: Decimal,
-        order_size: Decimal,
-        local_order_id: String,
-        simulated: bool,
-    },
-    LiquidityRewardMarketSell {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        price: Decimal,
-        order_size: Decimal,
-        local_order_id: String,
-        simulated: bool,
-    },
-    LiquidityRewardStageReplacement {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        mid: Decimal,
-        side: QuoteSide,
-        price: Decimal,
-        order_size: Decimal,
-        active_local_order_id: String,
-        pending_local_order_id: String,
-        request_cancel: bool,
-        simulated: bool,
-    },
-    LiquidityRewardCancel {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        side: QuoteSide,
-        active_local_order_id: String,
-        simulated: bool,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum UnifiedOrder {
-    PairArbitrage {
-        token0: String,
-        token1: String,
-        ask0: Decimal,
-        ask1: Decimal,
-        gap: Decimal,
-    },
-    LiquidityRewardPlace {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        mid: Decimal,
-        side: QuoteSide,
-        price: Decimal,
-        order_size: Decimal,
-        local_order_id: String,
-        simulated: bool,
-    },
-    LiquidityRewardMarketSell {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        price: Decimal,
-        order_size: Decimal,
-        local_order_id: String,
-        simulated: bool,
-    },
-    LiquidityRewardStageReplacement {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        mid: Decimal,
-        side: QuoteSide,
-        price: Decimal,
-        order_size: Decimal,
-        active_local_order_id: String,
-        pending_local_order_id: String,
-        request_cancel: bool,
-        simulated: bool,
-    },
-    LiquidityRewardCancel {
-        strategy: Arc<str>,
-        topic: Arc<str>,
-        token: String,
-        side: QuoteSide,
-        active_local_order_id: String,
-        simulated: bool,
-    },
-}
-
-impl From<OrderSignal> for UnifiedOrder {
-    fn from(signal: OrderSignal) -> Self {
-        match signal {
-            OrderSignal::PairArbitrage {
-                token0,
-                token1,
-                ask0,
-                ask1,
-                gap,
-            } => Self::PairArbitrage {
-                token0,
-                token1,
-                ask0,
-                ask1,
-                gap,
-            },
-            OrderSignal::LiquidityRewardPlace {
-                strategy,
-                topic,
-                token,
-                mid,
-                side,
-                price,
-                order_size,
-                local_order_id,
-                simulated,
-            } => Self::LiquidityRewardPlace {
-                strategy,
-                topic,
-                token,
-                mid,
-                side,
-                price,
-                order_size,
-                local_order_id,
-                simulated,
-            },
-            OrderSignal::LiquidityRewardMarketSell {
-                strategy,
-                topic,
-                token,
-                price,
-                order_size,
-                local_order_id,
-                simulated,
-            } => Self::LiquidityRewardMarketSell {
-                strategy,
-                topic,
-                token,
-                price,
-                order_size,
-                local_order_id,
-                simulated,
-            },
-            OrderSignal::LiquidityRewardStageReplacement {
-                strategy,
-                topic,
-                token,
-                mid,
-                side,
-                price,
-                order_size,
-                active_local_order_id,
-                pending_local_order_id,
-                request_cancel,
-                simulated,
-            } => Self::LiquidityRewardStageReplacement {
-                strategy,
-                topic,
-                token,
-                mid,
-                side,
-                price,
-                order_size,
-                active_local_order_id,
-                pending_local_order_id,
-                request_cancel,
-                simulated,
-            },
-            OrderSignal::LiquidityRewardCancel {
-                strategy,
-                topic,
-                token,
-                side,
-                active_local_order_id,
-                simulated,
-            } => Self::LiquidityRewardCancel {
-                strategy,
-                topic,
-                token,
-                side,
-                active_local_order_id,
-                simulated,
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,26 +75,6 @@ pub struct RelevantPositionsUpdate {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrderStatusEvent {
-    pub token: String,
-    pub local_order_id: String,
-    pub status: Arc<str>,
-    pub reason: Option<Arc<str>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OrderFillEvent {
-    pub strategy: Arc<str>,
-    pub topic: Option<Arc<str>>,
-    pub token: String,
-    pub local_order_id: String,
-    pub remote_order_id: Option<String>,
-    pub side: QuoteSide,
-    pub delta_size: Decimal,
-    pub total_matched_size: Decimal,
-}
-
-#[derive(Debug, Clone)]
 pub struct RewardPoolRemovalEvent {
     pub condition_id: String,
     pub token1: String,
@@ -303,25 +83,9 @@ pub struct RewardPoolRemovalEvent {
 }
 
 #[derive(Debug, Clone)]
-pub struct TradeConfirmedEvent {
-    pub token: String,
-    pub market: String,
-    pub trade_id: String,
-    pub size: Decimal,
-    pub price: Decimal,
-    pub side: QuoteSide,
-    pub taker_order_id: Option<String>,
-    pub maker_order_ids: Arc<[String]>,
-    pub timestamp_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
     Positions(PositionsUpdateEvent),
-    OrderStatus(OrderStatusEvent),
-    OrderFill(OrderFillEvent),
-    TradeConfirmed(TradeConfirmedEvent),
     RewardPoolRemoval(RewardPoolRemovalEvent),
 }
 
@@ -331,9 +95,23 @@ pub struct TopicRegistration {
     pub tokens: Arc<[String]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyKind {
+    MarketMaker,
+    PairArbitrage,
+    LiquidityReward,
+    TrendFollowing,
+    MeanReversion,
+    Arbitrage,
+    Hedging,
+    Liquidation,
+    Monitoring,
+}
+
 #[derive(Debug, Clone)]
 pub struct StrategyRegistration {
     pub name: Arc<str>,
+    pub kind: StrategyKind,
     pub topics: Arc<[Arc<str>]>,
     pub topic_tokens: Arc<[TopicRegistration]>,
     pub related_tokens: Arc<[String]>,
@@ -423,6 +201,6 @@ pub trait Strategy: Send + 'static {
     fn spawn(
         self,
         rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
-        order_tx: tokio::sync::mpsc::Sender<OrderSignal>,
+        order_gateway: OrderGatewayHandle,
     ) -> tokio::task::JoinHandle<()>;
 }

@@ -73,49 +73,6 @@ impl Dispatcher {
                         }
                     }
                 }
-                StrategyEvent::OrderStatus(order_event) => {
-                    if let Some(strategies) = self.position_routes.get(&order_event.token) {
-                        for strategy in strategies {
-                            if let Err(err) = strategy.tx.try_send(event.clone()) {
-                                warn!(
-                                    strategy = %strategy.name,
-                                    asset_id = %order_event.token,
-                                    error = %err,
-                                    "dispatcher 投递订单状态事件失败"
-                                );
-                            }
-                        }
-                    }
-                }
-                StrategyEvent::OrderFill(fill_event) => {
-                    if let Some(strategies) = self.position_routes.get(&fill_event.token) {
-                        for strategy in strategies {
-                            if let Err(err) = strategy.tx.try_send(event.clone()) {
-                                warn!(
-                                    strategy = %strategy.name,
-                                    asset_id = %fill_event.token,
-                                    error = %err,
-                                    "dispatcher 投递订单成交事件失败"
-                                );
-                            }
-                        }
-                    }
-                }
-                StrategyEvent::TradeConfirmed(trade_event) => {
-                    if let Some(strategies) = self.position_routes.get(&trade_event.token) {
-                        for strategy in strategies {
-                            if let Err(err) = strategy.tx.try_send(event.clone()) {
-                                warn!(
-                                    strategy = %strategy.name,
-                                    asset_id = %trade_event.token,
-                                    trade_id = %trade_event.trade_id,
-                                    error = %err,
-                                    "dispatcher 投递成交确认事件失败"
-                                );
-                            }
-                        }
-                    }
-                }
                 StrategyEvent::RewardPoolRemoval(removal_event) => {
                     let mut notified: std::collections::HashSet<Arc<str>> =
                         std::collections::HashSet::new();
@@ -140,5 +97,104 @@ impl Dispatcher {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashMap};
+
+    use polymarket_client_sdk_v2::types::Decimal;
+
+    use crate::strategy::{
+        CleanOrderbook, MarketEvent, PositionSnapshot, PositionView, PositionsUpdateEvent,
+    };
+
+    fn test_market_event(topic: &str, token: &str) -> StrategyEvent {
+        StrategyEvent::Market(MarketEvent {
+            topic: Arc::from(topic),
+            asset_id: Arc::from(token),
+            book: CleanOrderbook {
+                best_bid_price: 4000,
+                best_bid_size: 100,
+                best_ask_price: 4100,
+                best_ask_size: 100,
+                timestamp_ms: 1,
+                bids: Arc::new(BTreeMap::new()),
+                asks: Arc::new(BTreeMap::new()),
+            },
+        })
+    }
+
+    fn test_positions_event(token: &str) -> StrategyEvent {
+        let mut by_asset = HashMap::new();
+        by_asset.insert(
+            token.to_string(),
+            PositionView {
+                asset_id: token.to_string(),
+                size: Decimal::ONE,
+                avg_price: Decimal::ONE,
+                cur_price: Decimal::ONE,
+                current_value: Decimal::ONE,
+                cash_pnl: Decimal::ZERO,
+                title: Arc::from("title"),
+                outcome: Arc::from("outcome"),
+            },
+        );
+        StrategyEvent::Positions(PositionsUpdateEvent {
+            snapshot: Arc::new(PositionSnapshot {
+                by_asset: Arc::new(by_asset),
+            }),
+            changed_assets: Arc::from([token.to_string()]),
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatcher_keeps_market_routing_without_order_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let strategy = StrategyHandle {
+            name: Arc::from("test"),
+            topics: Arc::from([Arc::from("topic")]),
+            related_tokens: Arc::from(["token-1".to_string()]),
+            tx,
+        };
+        let dispatcher = Dispatcher::new(vec![strategy]);
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(dispatcher.run(input_rx));
+
+        input_tx
+            .send(test_market_event("topic", "token-1"))
+            .await
+            .unwrap();
+        drop(input_tx);
+
+        let event = rx.recv().await.expect("market event routed");
+        assert!(matches!(event, StrategyEvent::Market(_)));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_keeps_position_routing_without_order_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let strategy = StrategyHandle {
+            name: Arc::from("test"),
+            topics: Arc::from([Arc::from("topic")]),
+            related_tokens: Arc::from(["token-1".to_string()]),
+            tx,
+        };
+        let dispatcher = Dispatcher::new(vec![strategy]);
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(dispatcher.run(input_rx));
+
+        input_tx
+            .send(test_positions_event("token-1"))
+            .await
+            .unwrap();
+        drop(input_tx);
+
+        let event = rx.recv().await.expect("position event routed");
+        assert!(matches!(event, StrategyEvent::Positions(_)));
+        task.await.unwrap();
     }
 }

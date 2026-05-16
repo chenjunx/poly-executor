@@ -28,6 +28,7 @@ alloy = { version = "1", default-features = false, features = ["contract", "prov
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
+arc-swap = "1"
 
 [profile.release]
 opt-level = 3          # 开启最高级别的代码优化 (默认就是3，写上更清晰)

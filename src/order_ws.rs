@@ -5,11 +5,8 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
-use polymarket_client_sdk_v2::clob::types::Side;
 use polymarket_client_sdk_v2::clob::ws::Client;
-use polymarket_client_sdk_v2::clob::ws::types::response::{
-    TradeMessage, TradeMessageStatus, WsMessage,
-};
+use polymarket_client_sdk_v2::clob::ws::types::response::{TradeMessage, WsMessage};
 use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
 use tracing::{info, warn};
@@ -19,10 +16,7 @@ use crate::{
     notification::{LiquidityRewardFillNotification, NotificationEvent, Notifier},
     positions::PositionRefreshTrigger,
     storage::OrderStore,
-    strategy::{
-        OrderCorrelationMap, OrderFillEvent, OrderStatusEvent, QuoteSide, StrategyEvent,
-        TradeConfirmedEvent,
-    },
+    strategy::{OrderCorrelationMap, QuoteSide},
 };
 
 pub async fn run(
@@ -30,7 +24,7 @@ pub async fn run(
     correlations: OrderCorrelationMap,
     order_store: OrderStore,
     positions_refresh_tx: tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
-    strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
+    observation_tx: tokio::sync::mpsc::Sender<crate::order_gateway::GatewayObservation>,
     notifier: Option<Notifier>,
 ) {
     loop {
@@ -39,7 +33,7 @@ pub async fn run(
             &correlations,
             &order_store,
             &positions_refresh_tx,
-            &strategy_tx,
+            &observation_tx,
             notifier.as_ref(),
         )
         .await
@@ -58,7 +52,7 @@ async fn subscribe_orders(
     correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
     positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
-    strategy_tx: &tokio::sync::mpsc::Sender<StrategyEvent>,
+    observation_tx: &tokio::sync::mpsc::Sender<crate::order_gateway::GatewayObservation>,
     notifier: Option<&Notifier>,
 ) -> anyhow::Result<()> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
@@ -173,18 +167,15 @@ async fn subscribe_orders(
                         fill_delta(previous_size_matched, current_size_matched)
                     {
                         let total_matched_size = current_size_matched.unwrap_or(Decimal::ZERO);
-                        if let Err(error) =
-                            strategy_tx.try_send(StrategyEvent::OrderFill(OrderFillEvent {
-                                strategy: local_meta.strategy.clone(),
-                                topic: local_meta.topic.clone(),
-                                token: local_meta.token.clone(),
-                                local_order_id: local_meta.local_order_id.clone(),
-                                remote_order_id: local_meta.remote_order_id.clone(),
-                                side: local_meta.side,
-                                delta_size,
-                                total_matched_size,
-                            }))
-                        {
+                        if let Err(error) = observation_tx.try_send(gateway_fill_observation(
+                            Some(order.id.clone()),
+                            Some(local_meta.local_order_id.clone()),
+                            local_meta.token.clone(),
+                            local_meta.side,
+                            delta_size,
+                            order.price,
+                            order.id.clone(),
+                        )) {
                             warn!(
                                 target: "order",
                                 strategy = %local_meta.strategy,
@@ -192,7 +183,7 @@ async fn subscribe_orders(
                                 local_order_id = %local_meta.local_order_id,
                                 delta_size = %delta_size,
                                 error = %error,
-                                "订单成交事件投递策略失败，可能无法触发风险处理"
+                                "订单成交 observation 投递 Gateway 失败"
                             );
                         }
                         if local_meta.strategy.as_ref() == "liquidity_reward" {
@@ -246,13 +237,6 @@ async fn subscribe_orders(
                         if let Some(remote_id) = &local_meta.remote_order_id {
                             correlations.remove(remote_id.as_str());
                         }
-                        let _ =
-                            strategy_tx.try_send(StrategyEvent::OrderStatus(OrderStatusEvent {
-                                token: local_meta.token.clone(),
-                                local_order_id: local_meta.local_order_id.clone(),
-                                status: Arc::from(status),
-                                reason: None,
-                            }));
                     }
                 } else {
                     info!(
@@ -302,11 +286,6 @@ async fn subscribe_orders(
                     matchtime = ?trade.matchtime,
                     "收到 trade websocket 更新"
                 );
-                if let Some(event) = trade_confirmed_event(&trade) {
-                    if let Err(error) = strategy_tx.try_send(StrategyEvent::TradeConfirmed(event)) {
-                        warn!(target: "order", trade_id = %trade.id, error = %error, "trade CONFIRMED 事件投递策略失败");
-                    }
-                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -318,32 +297,27 @@ async fn subscribe_orders(
     Ok(())
 }
 
-fn trade_confirmed_event(trade: &TradeMessage) -> Option<TradeConfirmedEvent> {
-    if trade.status != TradeMessageStatus::Confirmed {
-        return None;
+fn gateway_fill_observation(
+    exch_id: Option<String>,
+    local_id: Option<String>,
+    token_id: String,
+    side: QuoteSide,
+    fill_delta: Decimal,
+    fill_price: Decimal,
+    trade_id: String,
+) -> crate::order_gateway::GatewayObservation {
+    crate::order_gateway::GatewayObservation::WsFill {
+        exch_id: exch_id.map(crate::order_gateway::ExchangeOrderId::from),
+        local_id: local_id.map(crate::order_gateway::LocalOrderId::from),
+        token_id: crate::order_gateway::TokenId::from(token_id),
+        side: match side {
+            QuoteSide::Buy => crate::order_gateway::OrderSide::Buy,
+            QuoteSide::Sell => crate::order_gateway::OrderSide::Sell,
+        },
+        fill_delta,
+        fill_price,
+        trade_id: Arc::from(trade_id),
     }
-    let side = match trade.side {
-        Side::Buy => QuoteSide::Buy,
-        Side::Sell => QuoteSide::Sell,
-        Side::Unknown => return None,
-        _ => return None,
-    };
-    Some(TradeConfirmedEvent {
-        token: trade.asset_id.to_string(),
-        market: trade.market.to_string(),
-        trade_id: trade.id.clone(),
-        size: trade.size,
-        price: trade.price,
-        side,
-        taker_order_id: trade.taker_order_id.clone(),
-        maker_order_ids: trade
-            .maker_orders
-            .iter()
-            .map(|maker| maker.order_id.clone())
-            .collect::<Vec<_>>()
-            .into(),
-        timestamp_ms: trade.timestamp.or(trade.last_update).or(trade.matchtime),
-    })
 }
 
 const POST_FILL_POSITION_REFRESH_DELAYS: [Duration; 4] = [
@@ -399,8 +373,32 @@ fn classify_ws_status(
 }
 
 #[cfg(test)]
+mod gateway_observation_tests {
+    use super::*;
+
+    #[test]
+    fn ws_fill_delta_maps_to_gateway_observation() {
+        let observation = gateway_fill_observation(
+            Some("exch-1".to_string()),
+            None,
+            "token-1".to_string(),
+            QuoteSide::Buy,
+            Decimal::try_from(2_f64).unwrap(),
+            Decimal::try_from(0.42_f64).unwrap(),
+            "trade-1".to_string(),
+        );
+
+        assert!(matches!(
+            observation,
+            crate::order_gateway::GatewayObservation::WsFill { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_client_sdk_v2::clob::ws::types::response::TradeMessageStatus;
 
     fn dec(value: f64) -> Decimal {
         Decimal::try_from(value).unwrap()

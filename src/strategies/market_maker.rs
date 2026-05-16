@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::storage::ActiveRewardMarketPoolEntry;
 use crate::strategy::{
-    CleanOrderbook, MarketEvent, OrderSignal, Strategy, StrategyEvent, StrategyRegistration,
+    CleanOrderbook, MarketEvent, Strategy, StrategyEvent, StrategyKind, StrategyRegistration,
     TopicRegistration,
 };
 
@@ -85,30 +85,67 @@ fn log_fair_midpoint(event: &MarketEvent) {
 }
 
 impl MarketMakerStrategy {
+    pub fn from_csv(csv_file: &str) -> anyhow::Result<Option<Self>> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_path(csv_file)
+            .map_err(|e| anyhow::anyhow!("无法打开 {}: {}", csv_file, e))?;
+
+        let mut rules = Vec::new();
+        for result in reader.records() {
+            let record = result?;
+            if record.len() < 2 {
+                continue;
+            }
+
+            let token1 = record[0].trim();
+            let token2 = record[1].trim();
+            if token1.is_empty() || token2.is_empty() {
+                continue;
+            }
+
+            rules.push(MarketMakerRule {
+                condition_id: String::new(),
+                market_slug: None,
+                token1: token1.to_string(),
+                token2: token2.to_string(),
+            });
+        }
+
+        Self::from_rules(rules)
+    }
+
     pub fn from_pool_entries(
         entries: Vec<ActiveRewardMarketPoolEntry>,
     ) -> anyhow::Result<Option<Self>> {
-        if entries.is_empty() {
-            return Ok(None);
-        }
-
-        let mut rules = Vec::with_capacity(entries.len());
-        let mut related_tokens = BTreeSet::new();
-        for entry in entries {
-            related_tokens.insert(entry.token1.clone());
-            related_tokens.insert(entry.token2.clone());
-            rules.push(MarketMakerRule {
+        let rules = entries
+            .into_iter()
+            .map(|entry| MarketMakerRule {
                 condition_id: entry.condition_id,
                 market_slug: entry.market_slug,
                 token1: entry.token1,
                 token2: entry.token2,
-            });
+            })
+            .collect::<Vec<_>>();
+        Self::from_rules(rules)
+    }
+
+    pub fn from_rules(rules: Vec<MarketMakerRule>) -> anyhow::Result<Option<Self>> {
+        if rules.is_empty() {
+            return Ok(None);
+        }
+
+        let mut related_tokens = BTreeSet::new();
+        for rule in &rules {
+            related_tokens.insert(rule.token1.clone());
+            related_tokens.insert(rule.token2.clone());
         }
 
         let related_tokens = related_tokens.into_iter().collect::<Vec<_>>();
         let topic = Arc::<str>::from(MARKET_MAKER_TOPIC);
         let registration = Arc::new(StrategyRegistration {
             name: Arc::from(MARKET_MAKER_NAME),
+            kind: StrategyKind::MarketMaker,
             topics: Arc::<[Arc<str>]>::from(vec![topic.clone()]),
             topic_tokens: Arc::<[TopicRegistration]>::from(vec![TopicRegistration {
                 topic,
@@ -140,17 +177,13 @@ impl Strategy for MarketMakerStrategy {
     fn spawn(
         self,
         mut rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
-        _order_tx: tokio::sync::mpsc::Sender<OrderSignal>,
+        _order_gateway: crate::order_gateway::OrderGatewayHandle,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
                     StrategyEvent::Market(event) => log_fair_midpoint(&event),
-                    StrategyEvent::Positions(_)
-                    | StrategyEvent::OrderStatus(_)
-                    | StrategyEvent::OrderFill(_)
-                    | StrategyEvent::TradeConfirmed(_)
-                    | StrategyEvent::RewardPoolRemoval(_) => {}
+                    StrategyEvent::Positions(_) | StrategyEvent::RewardPoolRemoval(_) => {}
                 }
             }
         })
@@ -255,6 +288,35 @@ mod tests {
     }
 
     #[test]
+    fn from_csv_registers_csv_tokens() {
+        let csv_path = std::env::temp_dir().join(format!(
+            "market_maker_from_csv_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &csv_path,
+            "token1,token2,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,reward_daily_pool,fixed_price\ncsv-token-1,csv-token-2,market_maker,,4,100,50,false\n",
+        )
+        .expect("csv should write");
+
+        let strategy = MarketMakerStrategy::from_csv(csv_path.to_str().expect("utf8 path"))
+            .expect("csv should load")
+            .expect("csv row should build strategy");
+
+        assert_eq!(strategy.rules().len(), 1);
+        assert_eq!(strategy.rules()[0].token1, "csv-token-1");
+        assert_eq!(strategy.rules()[0].token2, "csv-token-2");
+        assert_eq!(
+            strategy.registration().related_tokens.as_ref(),
+            &["csv-token-1".to_string(), "csv-token-2".to_string()]
+        );
+    }
+
+    #[test]
     fn from_pool_entries_returns_none_for_empty_pool() {
         let strategy = MarketMakerStrategy::from_pool_entries(Vec::new())
             .expect("empty pool should not error");
@@ -274,6 +336,10 @@ mod tests {
         let registration = strategy.registration();
         assert_eq!(strategy.name(), "market_maker");
         assert_eq!(registration.name.as_ref(), "market_maker");
+        assert_eq!(
+            registration.kind,
+            crate::strategy::StrategyKind::MarketMaker
+        );
         assert_eq!(
             registration.topics.as_ref(),
             &[Arc::<str>::from("market_maker")]
@@ -324,9 +390,12 @@ mod tests {
         .expect("market maker should build")
         .expect("non-empty pool should create strategy");
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
-        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(8);
+        let (gateway_handle, _gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
+            8,
+            crate::order_gateway::GatewayPhase::Live,
+        );
 
-        let handle = strategy.spawn(event_rx, order_tx);
+        let handle = strategy.spawn(event_rx, gateway_handle);
         event_tx
             .send(StrategyEvent::Market(MarketEvent {
                 topic: Arc::from("market_maker"),
@@ -339,7 +408,5 @@ mod tests {
         handle
             .await
             .expect("market maker task should exit when event channel closes");
-
-        assert!(order_rx.try_recv().is_err());
     }
 }
