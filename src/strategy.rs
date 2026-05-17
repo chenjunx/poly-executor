@@ -50,6 +50,34 @@ pub struct PositionChangedEvent {
     pub changed_assets: Arc<[String]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivateRiskDecision {
+    Allow,
+    Reject { code: Arc<str>, reason: Arc<str> },
+}
+
+pub trait PrivateRiskCheck<I, S>: Send + Sync {
+    fn check_place(
+        &self,
+        intent: &I,
+        state: &S,
+        position: Option<&crate::position_engine::PositionEntrySnapshot>,
+    ) -> PrivateRiskDecision;
+}
+
+pub struct AllowAllPrivateRisk;
+
+impl<I, S> PrivateRiskCheck<I, S> for AllowAllPrivateRisk {
+    fn check_place(
+        &self,
+        _intent: &I,
+        _state: &S,
+        _position: Option<&crate::position_engine::PositionEntrySnapshot>,
+    ) -> PrivateRiskDecision {
+        PrivateRiskDecision::Allow
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
@@ -151,4 +179,24 @@ pub trait Strategy: Send + 'static {
         rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
         order_gateway: OrderGatewayHandle,
     ) -> tokio::task::JoinHandle<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestIntent;
+
+    #[derive(Debug)]
+    struct TestState;
+
+    #[test]
+    fn allow_all_private_risk_allows_strategy_intent() {
+        let risk = AllowAllPrivateRisk;
+
+        let decision = risk.check_place(&TestIntent, &TestState, None);
+
+        assert_eq!(decision, PrivateRiskDecision::Allow);
+    }
 }
