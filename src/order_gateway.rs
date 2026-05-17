@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -295,6 +296,14 @@ pub enum OrderEventPayload {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OrderEventOrderMeta {
+    pub side: OrderSide,
+    pub order_type: GatewayOrderType,
+    pub price: Option<Decimal>,
+    pub original_size: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderEventEnvelope {
     pub strategy_id: StrategyId,
     pub local_id: LocalOrderId,
@@ -305,6 +314,7 @@ pub struct OrderEventEnvelope {
     pub recovery: bool,
     pub kind: OrderEventKind,
     pub payload: OrderEventPayload,
+    pub order: Option<OrderEventOrderMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,6 +324,10 @@ pub struct OrderRecord {
     pub token_id: TokenId,
     pub local_id: LocalOrderId,
     pub exch_id: Option<ExchangeOrderId>,
+    pub side: OrderSide,
+    pub order_type: GatewayOrderType,
+    pub price: Option<Decimal>,
+    pub original_size: Decimal,
     pub local_state: LocalOrderState,
     pub filled_size_total: Decimal,
     pub remaining_size: Decimal,
@@ -389,6 +403,10 @@ impl GatewayState {
             token_id: request.token_id,
             local_id: request.local_id.clone(),
             exch_id: None,
+            side: request.side,
+            order_type: request.order_type,
+            price: request.price,
+            original_size: request.size,
             local_state: LocalOrderState::SubmitPending,
             filled_size_total: Decimal::try_from(0_f64).expect("zero decimal"),
             remaining_size: request.size,
@@ -668,6 +686,12 @@ impl GatewayState {
         payload: OrderEventPayload,
     ) -> OrderEventEnvelope {
         self.next_seq += 1;
+        let order = Some(OrderEventOrderMeta {
+            side: record.side,
+            order_type: record.order_type,
+            price: record.price,
+            original_size: record.original_size,
+        });
         OrderEventEnvelope {
             strategy_id: record.strategy_id,
             local_id: record.local_id,
@@ -678,6 +702,7 @@ impl GatewayState {
             recovery,
             kind,
             payload,
+            order,
         }
     }
 }
@@ -968,6 +993,7 @@ impl OrderGateway {
             recovery: false,
             kind,
             payload,
+            order: None,
         }
     }
 }
@@ -992,7 +1018,14 @@ impl OrderEventRing {
 
     pub fn subscribe_for_strategy(&self, strategy_id: StrategyId) -> OrderEventSubscriber {
         OrderEventSubscriber {
-            strategy_id,
+            strategy_id: Some(strategy_id),
+            rx: self.tx.subscribe(),
+        }
+    }
+
+    pub fn subscribe_all(&self) -> OrderEventSubscriber {
+        OrderEventSubscriber {
+            strategy_id: None,
             rx: self.tx.subscribe(),
         }
     }
@@ -1004,7 +1037,7 @@ pub enum OrderEventPublishError {
 }
 
 pub struct OrderEventSubscriber {
-    strategy_id: StrategyId,
+    strategy_id: Option<StrategyId>,
     rx: broadcast::Receiver<OrderEventEnvelope>,
 }
 
@@ -1019,7 +1052,7 @@ impl OrderEventSubscriber {
     pub fn try_recv_relevant(&mut self) -> Result<OrderEventEnvelope, OrderEventPollError> {
         loop {
             match self.rx.try_recv() {
-                Ok(event) if event.strategy_id == self.strategy_id => return Ok(event),
+                Ok(event) if self.is_relevant(&event) => return Ok(event),
                 Ok(_) => continue,
                 Err(broadcast::error::TryRecvError::Empty) => {
                     return Err(OrderEventPollError::Empty);
@@ -1032,6 +1065,27 @@ impl OrderEventSubscriber {
                 }
             }
         }
+    }
+
+    pub async fn recv_relevant(&mut self) -> Result<OrderEventEnvelope, OrderEventPollError> {
+        loop {
+            match self.rx.recv().await {
+                Ok(event) if self.is_relevant(&event) => return Ok(event),
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(OrderEventPollError::Closed);
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Err(OrderEventPollError::Lagged { skipped });
+                }
+            }
+        }
+    }
+
+    fn is_relevant(&self, event: &OrderEventEnvelope) -> bool {
+        self.strategy_id
+            .as_ref()
+            .is_none_or(|strategy_id| event.strategy_id == *strategy_id)
     }
 }
 
@@ -1051,10 +1105,10 @@ pub fn persist_gateway_event(
                 .exch_id
                 .as_ref()
                 .map(|value| value.as_str().to_string()),
-            side: "Buy".to_string(),
-            order_type: "LimitGtc".to_string(),
-            price: None,
-            size: (record.filled_size_total + record.remaining_size).to_string(),
+            side: format!("{:?}", record.side),
+            order_type: gateway_order_type_label(&record.order_type).to_string(),
+            price: record.price.map(|value| value.to_string()),
+            size: record.original_size.to_string(),
             local_state: format!("{:?}", record.local_state),
             remote_status_code: None,
             filled_size_total: record.filled_size_total.to_string(),
@@ -1100,6 +1154,50 @@ fn terminal_state(state: LocalOrderState) -> bool {
             | LocalOrderState::Failed
             | LocalOrderState::UnknownTerminal
     )
+}
+
+fn order_side_from_label(value: &str) -> Option<OrderSide> {
+    match value {
+        "Buy" | "buy" => Some(OrderSide::Buy),
+        "Sell" | "sell" => Some(OrderSide::Sell),
+        _ => None,
+    }
+}
+
+fn gateway_order_type_from_label(value: &str) -> GatewayOrderType {
+    match value {
+        "Market" => GatewayOrderType::Market,
+        "LimitGtd" => GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtd { expires_at_ms: 0 },
+        },
+        "LimitIoc" => GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Ioc,
+        },
+        "LimitFok" => GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Fok,
+        },
+        _ => GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtc,
+        },
+    }
+}
+
+fn gateway_order_type_label(order_type: &GatewayOrderType) -> &'static str {
+    match order_type {
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtc,
+        } => "LimitGtc",
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtd { .. },
+        } => "LimitGtd",
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Ioc,
+        } => "LimitIoc",
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Fok,
+        } => "LimitFok",
+        GatewayOrderType::Market => "Market",
+    }
 }
 
 fn event_kind_label(kind: OrderEventKind) -> &'static str {
@@ -1184,6 +1282,14 @@ pub fn recover_gateway_orders_for_test(
                 token_id: TokenId::from(snapshot.token_id),
                 local_id: local_id.clone(),
                 exch_id: None,
+                side: order_side_from_label(&snapshot.side).unwrap_or(OrderSide::Buy),
+                order_type: gateway_order_type_from_label(&snapshot.order_type),
+                price: snapshot
+                    .price
+                    .as_deref()
+                    .and_then(|value| Decimal::from_str(value).ok()),
+                original_size: Decimal::from_str(&snapshot.size)
+                    .unwrap_or_else(|_| Decimal::try_from(0_f64).expect("zero decimal")),
                 local_state: LocalOrderState::Failed,
                 filled_size_total: Decimal::try_from(0_f64).expect("zero decimal"),
                 remaining_size: Decimal::try_from(0_f64).expect("zero decimal"),
@@ -1296,6 +1402,7 @@ mod tests {
             recovery: false,
             kind: OrderEventKind::Accepted,
             payload: OrderEventPayload::Accepted { exch_id: None },
+            order: None,
         }
     }
 

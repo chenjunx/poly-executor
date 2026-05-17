@@ -10,40 +10,33 @@ mod order_gateway;
 mod order_ws;
 mod polymarket_rewards;
 mod position_engine;
-mod positions;
 mod price_store;
 mod proxy_ws;
 mod recovery;
-mod reward_market_cache;
-mod reward_market_pool_monitor;
+mod risk;
 mod storage;
 mod strategies;
 mod strategy;
 mod tick_size;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use notification::Notifier;
 
 use polymarket_client_sdk_v2::types::Decimal;
 use tracing::info;
 
 use config::{AccountConfig, AppConfig, load_app_config};
 use dispatcher::Dispatcher;
-use monitor::{FullBookSnapshot, RewardMonitorConfig};
-use order_gateway::{AllowAllRiskCheck, OrderGateway, OrderGatewayConfig};
-use positions::{PositionRefreshTrigger, SimulatedFillEvent};
+use order_gateway::{OrderGateway, OrderGatewayConfig};
 use recovery::{RecoveryArtifacts, RecoveryCoordinator};
+use risk::{GatewayRiskEngine, NoopMarketRiskReader, RiskConfig, StrategyKindRegistry};
 use storage::{MarketStore, OrderStore};
-use strategies::liquidity_reward::{LiquidityRewardRestoreState, LiquidityRewardRule};
-use strategies::liquidity_reward_fsm::LiquidityRewardFsmStrategy as LiquidityRewardStrategy;
 use strategies::market_maker::MarketMakerStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
-    CleanOrderbook, Filters, OrderCorrelationMap, Strategy, StrategyEvent, StrategyHandle,
-    StrategyKind, StrategyRegistration, build_token_topics, merge_topic_tokens,
+    CleanOrderbook, Filters, Strategy, StrategyEvent, StrategyHandle, StrategyRegistration,
+    build_token_topics, merge_topic_tokens,
 };
 
 type WsMessage = polymarket_client_sdk_v2::clob::ws::types::response::WsMessage;
@@ -53,19 +46,13 @@ type WsSender = tokio::sync::mpsc::Sender<WsMessage>;
 type WsReceiver = tokio::sync::mpsc::Receiver<WsMessage>;
 type StrategySender = tokio::sync::mpsc::Sender<StrategyEvent>;
 type StrategyReceiver = tokio::sync::mpsc::Receiver<StrategyEvent>;
-type MonitorSender = tokio::sync::mpsc::Sender<FullBookSnapshot>;
-type PositionRefreshReceiver = tokio::sync::mpsc::Receiver<PositionRefreshTrigger>;
-type SimFillReceiver = tokio::sync::mpsc::Receiver<SimulatedFillEvent>;
 type TickRecorderSender = tokio::sync::mpsc::Sender<(Arc<str>, CleanOrderbook)>;
 type RawRecorderSender = tokio::sync::mpsc::Sender<market::RawStoreEvent>;
 
 struct StrategyBootstrap {
     pair_strategy: PairArbitrageStrategy,
     pair_registration: StrategyRegistration,
-    liquidity_reward: Option<LiquidityRewardStrategy>,
     market_maker: Option<MarketMakerStrategy>,
-    liquidity_reward_tokens: Arc<HashSet<String>>,
-    reward_monitor_configs: HashMap<String, RewardMonitorConfig>,
     tick_size_map: tick_size::TickSizeMap,
 }
 
@@ -83,15 +70,11 @@ struct RecorderSenders {
 struct MarketRuntime {
     topic_tokens: TopicTokens,
     token_topics: TokenTopics,
-    liquidity_reward_tokens: Arc<HashSet<String>>,
     ws_tx: WsSender,
     ws_rx: WsReceiver,
     strategy_tx: StrategySender,
-    monitor_tx: Option<MonitorSender>,
     recorder_senders: RecorderSenders,
     tick_size_map: tick_size::TickSizeMap,
-    positions_refresh_rx: PositionRefreshReceiver,
-    sim_fill_rx: SimFillReceiver,
     proxy: Option<proxy_ws::Proxy>,
 }
 
@@ -109,30 +92,16 @@ async fn main() -> anyhow::Result<()> {
     let order_correlations = recovery.order_correlations;
     let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
     spawn_account_monitor(&app_config, market_store.clone());
-    let strategy_bootstrap = build_strategies(
-        &app_config,
-        order_store.clone(),
-        market_store.clone(),
-        recovery.liquidity_reward_restore_states,
-        notifier.clone(),
-    )
-    .await?;
+    let strategy_bootstrap = build_strategies(&app_config, market_store.clone()).await?;
     let StrategyBootstrap {
         pair_strategy,
         pair_registration,
-        liquidity_reward,
         market_maker,
-        liquidity_reward_tokens,
-        reward_monitor_configs,
         tick_size_map,
     } = strategy_bootstrap;
 
     let proxy = init_proxy(&app_config);
-    let registrations = build_strategy_registrations(
-        &pair_registration,
-        liquidity_reward.as_ref(),
-        market_maker.as_ref(),
-    );
+    let registrations = build_strategy_registrations(&pair_registration, market_maker.as_ref());
     let routing = build_routing(&registrations);
 
     info!("正在连接 Polymarket WebSocket...");
@@ -141,44 +110,42 @@ async fn main() -> anyhow::Result<()> {
     // ws_tx 承载公开行情；strategy_tx 承载行情、持仓、成交和奖励池事件。
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * routing.topic_tokens.len().max(1));
     let (strategy_tx, strategy_rx) = tokio::sync::mpsc::channel(1024);
-    spawn_reward_market_tasks(
-        &app_config,
-        market_store.clone(),
-        liquidity_reward_tokens.clone(),
-        proxy.clone(),
-        strategy_tx.clone(),
-        notifier.clone(),
-    )?;
-
+    let position_keeper = position_engine::recover_keeper(&order_store)?;
+    let (position_ingestor, position_ingest_handle, position_persist_rx) =
+        position_engine::PositionIngestor::new(16_384, 16_384, position_keeper);
+    let position_read_handle = position_ingest_handle.read_handle();
+    let position_status_handle = position_ingest_handle.status_handle();
+    let risk_engine = GatewayRiskEngine::new(
+        RiskConfig::default(),
+        position_read_handle,
+        position_status_handle,
+        StrategyKindRegistry::from_registrations(&registrations),
+        Arc::new(NoopMarketRiskReader),
+    );
     let gateway_config = OrderGatewayConfig {
         simulation_enabled: app_config.simulation.enabled,
         request_ring_capacity: 1024,
         event_ring_capacity: 16384,
     };
-    let (mut order_gateway, order_gateway_handle, _order_event_ring, order_observation_tx) =
-        OrderGateway::new(
-            gateway_config,
-            Arc::new(AllowAllRiskCheck),
-            order_store.clone(),
-        );
+    let (mut order_gateway, order_gateway_handle, order_event_ring, order_observation_tx) =
+        OrderGateway::new(gateway_config, Arc::new(risk_engine), order_store.clone());
+    tokio::spawn(position_ingestor.run_with_strategy_events(strategy_tx.clone()));
+    tokio::spawn(position_engine::run_persist_task(
+        order_store.clone(),
+        position_persist_rx,
+    ));
+    tokio::spawn(position_engine::run_order_event_bridge(
+        order_event_ring.subscribe_all(),
+        position_ingest_handle,
+    ));
     order_gateway
         .complete_recovery(0, 0, 0)
         .expect("order gateway recovery completion should publish");
     tokio::spawn(order_gateway.run_until_request_channel_closed());
 
-    let monitor_tx = spawn_reward_estimator(
-        &app_config,
-        reward_monitor_configs,
-        order_correlations.clone(),
-        market_store.clone(),
-    );
-    let (positions_refresh_tx, positions_refresh_rx) = tokio::sync::mpsc::channel(64);
-    let (_sim_fill_tx, sim_fill_rx) = tokio::sync::mpsc::channel::<SimulatedFillEvent>(64);
-
     spawn_strategy_tasks(
         pair_strategy,
         pair_registration,
-        liquidity_reward,
         market_maker,
         order_gateway_handle,
         strategy_rx,
@@ -189,25 +156,19 @@ async fn main() -> anyhow::Result<()> {
         MarketRuntime {
             topic_tokens: routing.topic_tokens,
             token_topics: routing.token_topics,
-            liquidity_reward_tokens,
             ws_tx,
             ws_rx,
             strategy_tx: strategy_tx.clone(),
-            monitor_tx,
             recorder_senders,
             tick_size_map,
-            positions_refresh_rx,
-            sim_fill_rx,
             proxy,
         },
     );
     if !app_config.simulation.enabled {
-        let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::Startup);
         tokio::spawn(order_ws::run(
             app_config.auth.clone(),
             order_correlations,
             order_store,
-            positions_refresh_tx,
             order_observation_tx,
             notifier,
         ));
@@ -234,64 +195,17 @@ async fn recover_orders(
 
 async fn build_strategies(
     app_config: &AppConfig,
-    order_store: OrderStore,
     market_store: MarketStore,
-    restored_liquidity_reward_states: HashMap<String, LiquidityRewardRestoreState>,
-    notifier: Option<Notifier>,
 ) -> anyhow::Result<StrategyBootstrap> {
     let pair_strategy = build_pair_strategy(app_config)?;
     let pair_registration = pair_strategy.registration().clone();
-    let liquidity_reward_strategy_opt = build_liquidity_reward_strategy(app_config, &market_store)?;
     let market_maker = build_market_maker_strategy(&market_store)?;
-    let reward_monitor_configs = build_reward_monitor_configs(
-        liquidity_reward_strategy_opt.as_ref(),
-        app_config.liquidity_reward.simulation,
-    );
     let tick_size_map = tick_size::new_tick_size_map();
-    // unwind 卖单需要按 token tick size 规整价格。
-    let lr_tokens = liquidity_reward_strategy_opt
-        .as_ref()
-        .map(|s| s.registration().related_tokens.to_vec())
-        .unwrap_or_default();
-    tick_size::load_for_tokens(&lr_tokens, &app_config.auth, &tick_size_map).await;
-
-    // 注入恢复状态、订单库和行情库后，策略才能在 halt 时撤单、unwind 并持久化 pool halt。
-    let liquidity_reward = liquidity_reward_strategy_opt.map(|strategy| {
-        strategy
-            .with_restore_state(
-                restored_liquidity_reward_states,
-                Some(order_store),
-                app_config.liquidity_reward.simulation,
-                tick_size_map.clone(),
-            )
-            .with_balance_cooldown(std::time::Duration::from_secs(
-                app_config.liquidity_reward.balance_cooldown_secs,
-            ))
-            .with_market_store(market_store)
-            .with_notifier(notifier)
-    });
-
-    let liquidity_reward_tokens = Arc::new(
-        liquidity_reward
-            .as_ref()
-            .map(|strategy| {
-                strategy
-                    .registration()
-                    .related_tokens
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default(),
-    );
 
     Ok(StrategyBootstrap {
         pair_strategy,
         pair_registration,
-        liquidity_reward,
         market_maker,
-        liquidity_reward_tokens,
-        reward_monitor_configs,
         tick_size_map,
     })
 }
@@ -339,75 +253,6 @@ fn build_market_maker_strategy_from_csv_file(
     Ok(strategy)
 }
 
-fn liquidity_reward_runtime_enabled(_app_config: &AppConfig) -> bool {
-    false
-}
-
-fn build_liquidity_reward_strategy(
-    app_config: &AppConfig,
-    market_store: &MarketStore,
-) -> anyhow::Result<Option<LiquidityRewardStrategy>> {
-    if !liquidity_reward_runtime_enabled(app_config) {
-        return Ok(None);
-    }
-
-    let liquidity_reward_file = if !app_config.liquidity_reward.file.is_empty() {
-        app_config.liquidity_reward.file.as_str()
-    } else {
-        "liquidity_reward.csv"
-    };
-    // LiquidityReward 可从 CSV 固定规则或 market.db 的 selected pool 构建。
-    match app_config.liquidity_reward.source.as_str() {
-        "csv" | "" => LiquidityRewardStrategy::from_csv(liquidity_reward_file),
-        "db_pool" => {
-            let entries = market_store.load_liquidity_reward_pool_entries()?;
-            LiquidityRewardStrategy::from_pool_entries(entries)
-        }
-        other => Err(anyhow::anyhow!("未知 liquidity_reward.source: {other}")),
-    }
-}
-
-fn build_reward_monitor_configs(
-    liquidity_reward_strategy: Option<&LiquidityRewardStrategy>,
-    lr_simulation: bool,
-) -> HashMap<String, RewardMonitorConfig> {
-    liquidity_reward_strategy
-        .map(|strategy| {
-            strategy
-                .rules()
-                .filter_map(|(token, rule)| reward_monitor_config(token, rule, lr_simulation))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn reward_monitor_config(
-    token: &str,
-    rule: &LiquidityRewardRule,
-    lr_simulation: bool,
-) -> Option<(String, RewardMonitorConfig)> {
-    let pool = rule.reward_daily_pool?;
-    let spread = rule.reward_max_spread_cents?;
-    let is_yes = token == rule.token1;
-    let paired_token = if is_yes {
-        rule.token2.clone()
-    } else {
-        Some(rule.token1.clone())
-    };
-    Some((
-        token.to_string(),
-        RewardMonitorConfig {
-            min_orders: rule.reward_min_orders.unwrap_or(0),
-            max_spread_cents: spread,
-            min_size: rule.reward_min_size.unwrap_or(0.0),
-            daily_reward_pool: pool,
-            simulation: lr_simulation,
-            paired_token,
-            is_yes_token: is_yes,
-        },
-    ))
-}
-
 fn init_proxy(app_config: &AppConfig) -> Option<proxy_ws::Proxy> {
     if !app_config.proxy.url.is_empty() {
         proxy_ws::Proxy::from_raw(&app_config.proxy.url)
@@ -418,13 +263,9 @@ fn init_proxy(app_config: &AppConfig) -> Option<proxy_ws::Proxy> {
 
 fn build_strategy_registrations(
     pair_registration: &StrategyRegistration,
-    liquidity_reward: Option<&LiquidityRewardStrategy>,
     market_maker: Option<&MarketMakerStrategy>,
 ) -> Vec<StrategyRegistration> {
     let mut registrations = vec![pair_registration.clone()];
-    if let Some(strategy) = liquidity_reward {
-        registrations.push(strategy.registration().clone());
-    }
     if let Some(strategy) = market_maker {
         registrations.push(strategy.registration().clone());
     }
@@ -464,85 +305,6 @@ fn spawn_account_monitor(app_config: &AppConfig, market_store: MarketStore) {
     ));
 }
 
-fn spawn_reward_market_tasks(
-    app_config: &AppConfig,
-    market_store: MarketStore,
-    liquidity_reward_tokens: Arc<HashSet<String>>,
-    proxy: Option<proxy_ws::Proxy>,
-    strategy_tx: StrategySender,
-    notifier: Option<Notifier>,
-) -> anyhow::Result<()> {
-    let reward_market_tasks_enabled = liquidity_reward_runtime_enabled(app_config)
-        && app_config.liquidity_reward.monitor_enabled
-        && !app_config.simulation.enabled;
-    if !reward_market_tasks_enabled {
-        return Ok(());
-    }
-
-    let pool_max_rewards_min_size = app_config
-        .liquidity_reward
-        .pool_max_rewards_min_size
-        .map(|value| {
-            if !value.is_finite() || value <= 0.0 {
-                anyhow::bail!("liquidity_reward.pool_max_rewards_min_size 必须是正数");
-            }
-            Decimal::try_from(value).map_err(Into::into)
-        })
-        .transpose()?;
-
-    // 三个后台任务分别负责奖励估算监控、每日池构建、池内市场健康检查。
-    tokio::spawn(monitor::run_liquidity_reward_monitor(
-        app_config.auth.clone(),
-        app_config.app.monitor_interval_secs.max(1),
-        liquidity_reward_tokens,
-    ));
-    let reward_market_monitor_interval =
-        std::time::Duration::from_secs(app_config.app.monitor_interval_secs.max(60));
-    tokio::spawn(reward_market_cache::run_reward_market_loader(
-        app_config.auth.clone(),
-        market_store.clone(),
-        reward_market_monitor_interval,
-        app_config.liquidity_reward.pool_market_count,
-        pool_max_rewards_min_size,
-        strategy_tx.clone(),
-    ));
-    tokio::spawn(reward_market_pool_monitor::run_reward_market_pool_monitor(
-        market_store,
-        proxy,
-        reward_market_pool_monitor::RewardMarketPoolMonitorConfig {
-            refresh_interval: reward_market_monitor_interval,
-            token1_spread_threshold: 0.1,
-            token1_min_bid: 0.1,
-            token1_max_bid: 0.9,
-            max_tokens_per_connection: 200,
-            strategy_tx,
-            notifier,
-        },
-    ));
-
-    Ok(())
-}
-
-fn spawn_reward_estimator(
-    app_config: &AppConfig,
-    reward_monitor_configs: HashMap<String, RewardMonitorConfig>,
-    order_correlations: OrderCorrelationMap,
-    market_store: MarketStore,
-) -> Option<MonitorSender> {
-    if reward_monitor_configs.is_empty() || !app_config.liquidity_reward.reward_estimator_enabled {
-        return None;
-    }
-
-    let (tx, rx) = tokio::sync::mpsc::channel(512);
-    tokio::spawn(monitor::run_reward_estimator(
-        rx,
-        reward_monitor_configs,
-        order_correlations,
-        market_store,
-    ));
-    Some(tx)
-}
-
 fn market_maker_strategy_handle(
     market_maker: &MarketMakerStrategy,
 ) -> Option<(StrategyHandle, tokio::sync::mpsc::Receiver<StrategyEvent>)> {
@@ -562,7 +324,6 @@ fn market_maker_strategy_handle(
 fn spawn_strategy_tasks(
     pair_strategy: PairArbitrageStrategy,
     pair_registration: StrategyRegistration,
-    liquidity_reward: Option<LiquidityRewardStrategy>,
     market_maker: Option<MarketMakerStrategy>,
     order_gateway_handle: order_gateway::OrderGatewayHandle,
     strategy_rx: StrategyReceiver,
@@ -576,19 +337,6 @@ fn spawn_strategy_tasks(
     }];
 
     pair_strategy.spawn(pair_rx, order_gateway_handle.clone());
-
-    // StrategyHandle 只保存路由元信息；实际策略任务各自消费自己的事件队列。
-    if let Some(liquidity_reward_strategy) = liquidity_reward {
-        let liquidity_reward_registration = liquidity_reward_strategy.registration().clone();
-        let (liquidity_reward_tx, liquidity_reward_rx) = tokio::sync::mpsc::channel(256);
-        strategy_handles.push(StrategyHandle {
-            name: liquidity_reward_registration.name.clone(),
-            topics: liquidity_reward_registration.topics.clone(),
-            related_tokens: liquidity_reward_registration.related_tokens.clone(),
-            tx: liquidity_reward_tx,
-        });
-        liquidity_reward_strategy.spawn(liquidity_reward_rx, order_gateway_handle.clone());
-    }
 
     if let Some(market_maker_strategy) = market_maker {
         if let Some((handle, market_maker_rx)) =
@@ -628,15 +376,11 @@ fn spawn_market_and_positions(app_config: &AppConfig, runtime: MarketRuntime) {
     let MarketRuntime {
         topic_tokens,
         token_topics,
-        liquidity_reward_tokens,
         ws_tx,
         ws_rx,
         strategy_tx,
-        monitor_tx,
         recorder_senders,
         tick_size_map,
-        positions_refresh_rx,
-        sim_fill_rx,
         proxy,
     } = runtime;
     let default_threads = app_config.app.default_threads.max(1);
@@ -644,27 +388,13 @@ fn spawn_market_and_positions(app_config: &AppConfig, runtime: MarketRuntime) {
     // market::run 汇总公开行情并按 token/topic 分发给策略、奖励估算和持久化 recorder。
     tokio::spawn(market::run(
         token_topics,
-        liquidity_reward_tokens,
         ws_rx,
         strategy_tx.clone(),
-        monitor_tx,
+        None,
         recorder_senders.tick_tx,
         recorder_senders.raw_store_tx,
         tick_size_map,
     ));
-
-    if app_config.simulation.enabled {
-        // 模拟模式用本地成交事件维护仓位；真实模式定期拉取远端持仓。
-        tokio::spawn(positions::run_simulated(sim_fill_rx, strategy_tx.clone()));
-        keep_channel_open(positions_refresh_rx);
-    } else {
-        tokio::spawn(positions::run(
-            app_config.auth.clone(),
-            positions_refresh_rx,
-            strategy_tx,
-        ));
-        keep_channel_open(sim_fill_rx);
-    }
 
     // 公开行情订阅单独启动，断线重连和分线程订阅由 market 模块处理。
     let topic_threads = app_config.topic_threads.clone();
@@ -677,13 +407,6 @@ fn spawn_market_and_positions(app_config: &AppConfig, runtime: MarketRuntime) {
             ws_tx,
         )
         .await;
-    });
-}
-
-fn keep_channel_open<T: Send + 'static>(receiver: tokio::sync::mpsc::Receiver<T>) {
-    tokio::spawn(async move {
-        let _receiver = receiver;
-        futures::future::pending::<()>().await;
     });
 }
 
@@ -723,10 +446,6 @@ fn init_stores(app_config: &AppConfig) -> anyhow::Result<(OrderStore, MarketStor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AppSettings, AuthConfig, LiquidityRewardConfig, NotificationConfig, OrderConfig,
-        ProxySettings, SimulationConfig,
-    };
     use crate::storage::ActiveRewardMarketPoolEntry;
     use crate::strategy::TopicRegistration;
 
@@ -775,7 +494,7 @@ mod tests {
     fn build_strategy_registrations_includes_market_maker_when_present() {
         let pair_registration = StrategyRegistration {
             name: Arc::from("pair_arbitrage"),
-            kind: StrategyKind::PairArbitrage,
+            kind: strategy::StrategyKind::PairArbitrage,
             topics: Arc::<[Arc<str>]>::from(vec![Arc::from("pair")]),
             topic_tokens: Arc::<[TopicRegistration]>::from(vec![TopicRegistration {
                 topic: Arc::from("pair"),
@@ -791,88 +510,11 @@ mod tests {
         .expect("market maker should build")
         .expect("non-empty pool should create market maker");
 
-        let registrations =
-            build_strategy_registrations(&pair_registration, None, Some(&market_maker));
+        let registrations = build_strategy_registrations(&pair_registration, Some(&market_maker));
 
         assert_eq!(registrations.len(), 2);
         assert_eq!(registrations[0].name.as_ref(), "pair_arbitrage");
         assert_eq!(registrations[1].name.as_ref(), "market_maker");
-    }
-
-    fn app_config_with_liquidity_reward_enabled() -> AppConfig {
-        AppConfig {
-            proxy: ProxySettings { url: String::new() },
-            app: AppSettings {
-                log_file: "alerts.log".to_string(),
-                assets_file: "assets.csv".to_string(),
-                sqlite_path: String::new(),
-                market_sqlite_path: String::new(),
-                min_diff: 0.0,
-                max_spread: 0.0,
-                min_price: 0.0,
-                max_price: 1.0,
-                default_threads: 1,
-                monitor_interval_secs: 30,
-                tick_store_enabled: false,
-                raw_store_enabled: false,
-            },
-            auth: AuthConfig {
-                api_key: String::new(),
-                api_secret: String::new(),
-                passphrase: String::new(),
-                private_key: String::new(),
-                funder: String::new(),
-            },
-            order: OrderConfig { size_usdc: 1.0 },
-            simulation: SimulationConfig { enabled: false },
-            liquidity_reward: LiquidityRewardConfig {
-                enabled: true,
-                source: "db_pool".to_string(),
-                monitor_enabled: true,
-                ..LiquidityRewardConfig::default()
-            },
-            account: AccountConfig::default(),
-            notification: NotificationConfig::default(),
-            topic_threads: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn liquidity_reward_runtime_is_forced_disabled_even_when_config_enabled() {
-        let config = app_config_with_liquidity_reward_enabled();
-
-        assert!(!liquidity_reward_runtime_enabled(&config));
-    }
-
-    #[test]
-    fn build_liquidity_reward_strategy_is_forced_disabled_even_when_config_enabled() {
-        let store = MarketStore::open(":memory:").expect("store should open");
-        store.init_schema().expect("schema should initialize");
-        let build_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
-        let entries = vec![storage::RewardMarketPoolStorageEntry {
-            condition_id: "0xlr",
-            market_slug: Some("lr-market"),
-            question: Some("LR market?"),
-            token1: "lr-token-1",
-            token2: "lr-token-2",
-            tokens_json: "[]",
-            market_competitiveness: None,
-            rewards_min_size: Some("100"),
-            rewards_max_spread: Some("4"),
-            market_daily_reward: Some("50"),
-            volume_24hr_clob: Some("60000"),
-            volume_24hr: Some("65000"),
-            liquidity_reward_roi: Some("0.5"),
-        }];
-        store
-            .replace_reward_market_pool_entries(build_date, 1, &entries, 100, 1)
-            .expect("pool entries should save");
-        let config = app_config_with_liquidity_reward_enabled();
-
-        let strategy = build_liquidity_reward_strategy(&config, &store)
-            .expect("forced disabled liquidity reward should not error");
-
-        assert!(strategy.is_none());
     }
 
     #[test]

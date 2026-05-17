@@ -183,7 +183,7 @@ impl Strategy for MarketMakerStrategy {
             while let Some(event) = rx.recv().await {
                 match event {
                     StrategyEvent::Market(event) => log_fair_midpoint(&event),
-                    StrategyEvent::Positions(_) | StrategyEvent::RewardPoolRemoval(_) => {}
+                    StrategyEvent::PositionChanged(_) => {}
                 }
             }
         })

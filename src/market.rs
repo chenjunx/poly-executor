@@ -7,7 +7,7 @@ use polymarket_client_sdk_v2::clob::ws::types::response::{
     BookUpdate, PriceChangeBatchEntry, WsMessage,
 };
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::monitor::FullBookSnapshot;
 use crate::proxy_ws;
@@ -307,7 +307,6 @@ fn pack_book(book: &BTreeMap<u16, u32>) -> Vec<u8> {
 
 pub async fn run(
     token_topics: Arc<HashMap<String, Arc<[Arc<str>]>>>,
-    liquidity_reward_tokens: Arc<std::collections::HashSet<String>>,
     mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
     market_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
     monitor_tx: Option<tokio::sync::mpsc::Sender<FullBookSnapshot>>,
@@ -343,13 +342,6 @@ pub async fn run(
         }
 
         for (asset_id, book) in events {
-            log_liquidity_reward_orderbook_diagnostics(
-                &msg,
-                &asset_id,
-                &book,
-                liquidity_reward_tokens.as_ref(),
-            );
-
             if let Some(ref tx) = tick_tx {
                 let _ = tx.try_send((asset_id.clone(), book.clone()));
             }
@@ -395,72 +387,6 @@ pub async fn run(
                 }
             }
         }
-    }
-}
-
-fn log_liquidity_reward_orderbook_diagnostics(
-    msg: &WsMessage,
-    asset_id: &Arc<str>,
-    book: &CleanOrderbook,
-    liquidity_reward_tokens: &std::collections::HashSet<String>,
-) {
-    if !liquidity_reward_tokens.contains(asset_id.as_ref()) {
-        return;
-    }
-
-    match msg {
-        WsMessage::Book(snapshot) => {
-            let first_bid = snapshot.bids.first().map(|level| (level.price, level.size));
-            let last_bid = snapshot.bids.last().map(|level| (level.price, level.size));
-            let first_ask = snapshot.asks.first().map(|level| (level.price, level.size));
-            let last_ask = snapshot.asks.last().map(|level| (level.price, level.size));
-
-            info!(
-                target: "order",
-                asset_id = %asset_id,
-                event_type = "book",
-                bids_len = snapshot.bids.len(),
-                asks_len = snapshot.asks.len(),
-                first_bid_price = ?first_bid.as_ref().map(|level| level.0),
-                first_bid_size = ?first_bid.as_ref().map(|level| level.1),
-                last_bid_price = ?last_bid.as_ref().map(|level| level.0),
-                last_bid_size = ?last_bid.as_ref().map(|level| level.1),
-                first_ask_price = ?first_ask.as_ref().map(|level| level.0),
-                first_ask_size = ?first_ask.as_ref().map(|level| level.1),
-                last_ask_price = ?last_ask.as_ref().map(|level| level.0),
-                last_ask_size = ?last_ask.as_ref().map(|level| level.1),
-                best_bid_price = book.best_bid_price,
-                best_bid_size = book.best_bid_size,
-                best_ask_price = book.best_ask_price,
-                best_ask_size = book.best_ask_size,
-                ts = book.timestamp_ms,
-                "liquidity_reward 监控 token 的订单簿快照诊断"
-            );
-        }
-        WsMessage::PriceChange(price_change) => {
-            for change in &price_change.price_changes {
-                if change.asset_id.to_string().as_str() != asset_id.as_ref() {
-                    continue;
-                }
-                debug!(
-                    target: "order",
-                    asset_id = %asset_id,
-                    event_type = "price_change",
-                    side = ?change.side,
-                    level_price = %change.price,
-                    level_size = ?change.size,
-                    delta_best_bid = ?change.best_bid,
-                    delta_best_ask = ?change.best_ask,
-                    best_bid_price = book.best_bid_price,
-                    best_bid_size = book.best_bid_size,
-                    best_ask_price = book.best_ask_price,
-                    best_ask_size = book.best_ask_size,
-                    ts = book.timestamp_ms,
-                    "liquidity_reward 监控 token 的订单簿增量诊断"
-                );
-            }
-        }
-        _ => {}
     }
 }
 

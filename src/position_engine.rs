@@ -1,10 +1,19 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use arc_swap::ArcSwapOption;
 use polymarket_client_sdk_v2::types::Decimal;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tracing::warn;
+
+use crate::order_gateway::{
+    OrderEventEnvelope, OrderEventPollError, OrderEventSubscriber, OrderSide,
+};
+use crate::storage::{OrderStore, PositionJournalInsert};
+use crate::strategy::{PositionChangedEvent, StrategyEvent};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionEntrySnapshot {
@@ -40,20 +49,20 @@ impl PositionEntrySnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionSide {
     Buy,
     Sell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionEventSource {
     Live,
     Recovery,
     Reconciliation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionTerminalReason {
     Cancelled,
     Expired,
@@ -62,7 +71,7 @@ pub enum PositionTerminalReason {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PositionEntryKey {
     Strategy {
         strategy_id: String,
@@ -73,7 +82,7 @@ pub enum PositionEntryKey {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PositionEvent {
     OrderWorkingRegistered {
         strategy_id: String,
@@ -235,6 +244,11 @@ pub struct PositionReadHandle {
     entries: Arc<PositionReadRegistry>,
 }
 
+#[derive(Clone)]
+pub struct PositionStatusHandle {
+    status: Arc<AtomicU8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionEngineStatus {
     Recovering,
@@ -276,8 +290,173 @@ impl PositionPersistRecord {
     }
 }
 
+pub fn recover_keeper(store: &OrderStore) -> anyhow::Result<PositionKeeper> {
+    let snapshot = store.load_latest_position_snapshot()?;
+    let snapshot_seq = snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(0);
+    let mut keeper = match snapshot {
+        Some(snapshot) => PositionKeeper::from_snapshot(position_snapshot_from_stored(snapshot)?)?,
+        None => PositionKeeper::default(),
+    };
+    let events = store
+        .load_position_journal_after(snapshot_seq)?
+        .into_iter()
+        .filter_map(|row| match serde_json::from_str::<PositionEvent>(&row.payload_json) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                warn!(seq = row.seq, error = %error, "position journal payload 解析失败，跳过该记录");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    keeper.apply_replay_events(events)?;
+    Ok(keeper)
+}
+
+pub async fn run_order_event_bridge(
+    mut subscriber: OrderEventSubscriber,
+    ingest_handle: PositionIngestHandle,
+) {
+    loop {
+        match subscriber.recv_relevant().await {
+            Ok(event) => {
+                let Some(position_event) = position_event_from_order_event(&event) else {
+                    continue;
+                };
+                if let Err(error) = ingest_handle.try_ingest(position_event) {
+                    ingest_handle.mark_degraded();
+                    warn!(error = ?error, "position engine 投递订单事件失败");
+                }
+            }
+            Err(OrderEventPollError::Lagged { skipped }) => {
+                ingest_handle.mark_degraded();
+                warn!(
+                    skipped,
+                    "position engine 订单事件订阅落后，仓位状态已标记 degraded"
+                );
+            }
+            Err(OrderEventPollError::Closed) => {
+                warn!("position engine 订单事件订阅已关闭");
+                return;
+            }
+            Err(OrderEventPollError::Empty) => {}
+        }
+    }
+}
+
+pub async fn run_persist_task(
+    store: OrderStore,
+    mut persist_rx: mpsc::Receiver<PositionPersistRecord>,
+) {
+    while let Some(record) = persist_rx.recv().await {
+        if let Err(error) = persist_record(&store, &record) {
+            warn!(seq = record.seq(), error = %error, "position journal 持久化失败");
+        }
+    }
+}
+
+fn persist_record(store: &OrderStore, record: &PositionPersistRecord) -> anyhow::Result<()> {
+    match record {
+        PositionPersistRecord::Journal(event) => append_position_event(store, event),
+    }
+}
+
+fn append_position_event(store: &OrderStore, event: &PositionEvent) -> anyhow::Result<()> {
+    let payload_json = serde_json::to_string(event)?;
+    let qty = position_event_qty(event).map(|value| value.to_string());
+    let price = position_event_price(event).map(|value| value.to_string());
+    store.append_position_journal(&PositionJournalInsert {
+        seq: event.seq(),
+        ts_ms: position_event_ts_ms(event),
+        event_type: position_event_type(event),
+        strategy_id: position_event_strategy_id(event),
+        token_id: position_event_token_id(event),
+        local_order_id: position_event_local_order_id(event),
+        exchange_order_id: position_event_exchange_order_id(event),
+        side: position_event_side(event).map(position_side_label),
+        qty: qty.as_deref(),
+        price: price.as_deref(),
+        source: position_event_source(event),
+        recovery: position_event_recovery(event),
+        payload_json: &payload_json,
+    })
+}
+
+fn position_snapshot_from_stored(
+    stored: crate::storage::StoredPositionSnapshotBatch,
+) -> anyhow::Result<PositionKeeperSnapshot> {
+    let entries = stored
+        .rows
+        .into_iter()
+        .map(|row| {
+            let snapshot = PositionEntrySnapshot {
+                filled_position: Decimal::from_str(&row.filled_position)?,
+                cost_basis: Decimal::from_str(&row.cost_basis)?,
+                realized_pnl: Decimal::from_str(&row.realized_pnl)?,
+                working_buy_exposure: Decimal::from_str(&row.working_buy_exposure)?,
+                working_sell_exposure: Decimal::from_str(&row.working_sell_exposure)?,
+                last_update_seq: stored.seq,
+                last_update_ts_ms: stored.ts_ms,
+                degraded: false,
+            };
+            let key = match row.scope_type.as_str() {
+                "strategy" => PositionEntryKey::Strategy {
+                    strategy_id: row.strategy_id.unwrap_or_default(),
+                    token_id: row.token_id,
+                },
+                _ => PositionEntryKey::Global {
+                    token_id: row.token_id,
+                },
+            };
+            Ok((key, snapshot))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let open_orders = stored
+        .open_orders
+        .into_iter()
+        .map(|row| {
+            Ok(PositionOpenOrderSnapshot {
+                strategy_id: row.strategy_id,
+                token_id: row.token_id,
+                local_order_id: row.local_order_id,
+                exchange_order_id: row.exchange_order_id,
+                side: position_side_from_label(&row.side)?,
+                price: Decimal::from_str(&row.price)?,
+                original_size: Decimal::from_str(&row.original_size)?,
+                remaining_size: Decimal::from_str(&row.remaining_size)?,
+                terminal: matches!(
+                    row.local_state.as_str(),
+                    "Filled" | "Cancelled" | "Rejected" | "Failed" | "UnknownTerminal"
+                ),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(PositionKeeperSnapshot {
+        seq: stored.seq,
+        ts_ms: stored.ts_ms,
+        entries,
+        open_orders,
+    })
+}
+
+pub fn position_event_from_order_event(event: &OrderEventEnvelope) -> Option<PositionEvent> {
+    let order = event.order.as_ref()?;
+    position_event_from_gateway_event(
+        event,
+        position_side_from_order_side(order.side),
+        order.original_size,
+        order.price.unwrap_or(Decimal::ZERO),
+    )
+}
+
+fn position_side_from_order_side(side: OrderSide) -> PositionSide {
+    match side {
+        OrderSide::Buy => PositionSide::Buy,
+        OrderSide::Sell => PositionSide::Sell,
+    }
+}
+
 pub fn position_event_from_gateway_event(
-    event: &crate::order_gateway::OrderEventEnvelope,
+    event: &OrderEventEnvelope,
     side: PositionSide,
     original_size: Decimal,
     price: Decimal,
@@ -389,6 +568,128 @@ pub fn position_event_from_gateway_event(
     }
 }
 
+fn position_event_type(event: &PositionEvent) -> &'static str {
+    match event {
+        PositionEvent::OrderWorkingRegistered { .. } => "OrderWorkingRegistered",
+        PositionEvent::OrderFillApplied { .. } => "OrderFillApplied",
+        PositionEvent::OrderTerminalApplied { .. } => "OrderTerminalApplied",
+        PositionEvent::OrderStale { .. } => "OrderStale",
+    }
+}
+
+fn position_event_strategy_id(event: &PositionEvent) -> Option<&str> {
+    match event {
+        PositionEvent::OrderWorkingRegistered { strategy_id, .. }
+        | PositionEvent::OrderFillApplied { strategy_id, .. }
+        | PositionEvent::OrderTerminalApplied { strategy_id, .. }
+        | PositionEvent::OrderStale { strategy_id, .. } => Some(strategy_id.as_str()),
+    }
+}
+
+fn position_event_token_id(event: &PositionEvent) -> &str {
+    match event {
+        PositionEvent::OrderWorkingRegistered { token_id, .. }
+        | PositionEvent::OrderFillApplied { token_id, .. }
+        | PositionEvent::OrderTerminalApplied { token_id, .. }
+        | PositionEvent::OrderStale { token_id, .. } => token_id.as_str(),
+    }
+}
+
+fn position_event_local_order_id(event: &PositionEvent) -> Option<&str> {
+    match event {
+        PositionEvent::OrderWorkingRegistered { local_order_id, .. }
+        | PositionEvent::OrderFillApplied { local_order_id, .. }
+        | PositionEvent::OrderTerminalApplied { local_order_id, .. }
+        | PositionEvent::OrderStale { local_order_id, .. } => Some(local_order_id.as_str()),
+    }
+}
+
+fn position_event_exchange_order_id(event: &PositionEvent) -> Option<&str> {
+    match event {
+        PositionEvent::OrderWorkingRegistered {
+            exchange_order_id, ..
+        }
+        | PositionEvent::OrderFillApplied {
+            exchange_order_id, ..
+        } => exchange_order_id.as_deref(),
+        PositionEvent::OrderTerminalApplied { .. } | PositionEvent::OrderStale { .. } => None,
+    }
+}
+
+fn position_event_side(event: &PositionEvent) -> Option<PositionSide> {
+    match event {
+        PositionEvent::OrderWorkingRegistered { side, .. }
+        | PositionEvent::OrderFillApplied { side, .. } => Some(*side),
+        PositionEvent::OrderTerminalApplied { .. } | PositionEvent::OrderStale { .. } => None,
+    }
+}
+
+fn position_event_qty(event: &PositionEvent) -> Option<Decimal> {
+    match event {
+        PositionEvent::OrderWorkingRegistered { size, .. } => Some(*size),
+        PositionEvent::OrderFillApplied { fill_qty, .. } => Some(*fill_qty),
+        PositionEvent::OrderTerminalApplied { .. } | PositionEvent::OrderStale { .. } => None,
+    }
+}
+
+fn position_event_price(event: &PositionEvent) -> Option<Decimal> {
+    match event {
+        PositionEvent::OrderWorkingRegistered { price, .. } => Some(*price),
+        PositionEvent::OrderFillApplied { fill_price, .. } => Some(*fill_price),
+        PositionEvent::OrderTerminalApplied { .. } | PositionEvent::OrderStale { .. } => None,
+    }
+}
+
+fn position_event_source(event: &PositionEvent) -> &'static str {
+    match event {
+        PositionEvent::OrderWorkingRegistered { source, .. }
+        | PositionEvent::OrderFillApplied { source, .. }
+        | PositionEvent::OrderTerminalApplied { source, .. }
+        | PositionEvent::OrderStale { source, .. } => position_source_label(*source),
+    }
+}
+
+fn position_event_recovery(event: &PositionEvent) -> bool {
+    match event {
+        PositionEvent::OrderWorkingRegistered { recovery, .. }
+        | PositionEvent::OrderFillApplied { recovery, .. }
+        | PositionEvent::OrderTerminalApplied { recovery, .. }
+        | PositionEvent::OrderStale { recovery, .. } => *recovery,
+    }
+}
+
+fn position_event_ts_ms(event: &PositionEvent) -> u64 {
+    match event {
+        PositionEvent::OrderWorkingRegistered { ts_ms, .. }
+        | PositionEvent::OrderFillApplied { ts_ms, .. }
+        | PositionEvent::OrderTerminalApplied { ts_ms, .. }
+        | PositionEvent::OrderStale { ts_ms, .. } => *ts_ms,
+    }
+}
+
+fn position_side_label(side: PositionSide) -> &'static str {
+    match side {
+        PositionSide::Buy => "Buy",
+        PositionSide::Sell => "Sell",
+    }
+}
+
+fn position_side_from_label(value: &str) -> anyhow::Result<PositionSide> {
+    match value {
+        "Buy" | "buy" => Ok(PositionSide::Buy),
+        "Sell" | "sell" => Ok(PositionSide::Sell),
+        other => Err(anyhow::anyhow!("未知 position side: {other}")),
+    }
+}
+
+fn position_source_label(source: PositionEventSource) -> &'static str {
+    match source {
+        PositionEventSource::Live => "Live",
+        PositionEventSource::Recovery => "Recovery",
+        PositionEventSource::Reconciliation => "Reconciliation",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionIngestError {
     RingFull,
@@ -422,9 +723,10 @@ impl PositionEvent {
 }
 
 impl PositionIngestor {
-    pub fn new_for_test(
+    pub fn new(
         input_capacity: usize,
         persist_capacity: usize,
+        keeper: PositionKeeper,
     ) -> (
         Self,
         PositionIngestHandle,
@@ -433,6 +735,13 @@ impl PositionIngestor {
         let (tx, rx) = mpsc::channel(input_capacity.max(1));
         let (persist_tx, persist_rx) = mpsc::channel(persist_capacity.max(1));
         let publisher = PositionSnapshotPublisher::default();
+        let initial_keys = keeper
+            .export_snapshot(0, 0)
+            .entries
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        publisher.publish_changed(&keeper, &initial_keys);
         let read_handle = publisher.read_handle();
         let status = Arc::new(AtomicU8::new(PositionEngineStatus::Live.as_u8()));
         let handle = PositionIngestHandle {
@@ -443,28 +752,73 @@ impl PositionIngestor {
         let ingestor = Self {
             rx,
             persist_tx,
-            keeper: PositionKeeper::default(),
+            keeper,
             publisher,
             status,
         };
         (ingestor, handle, persist_rx)
     }
 
+    pub fn new_for_test(
+        input_capacity: usize,
+        persist_capacity: usize,
+    ) -> (
+        Self,
+        PositionIngestHandle,
+        mpsc::Receiver<PositionPersistRecord>,
+    ) {
+        Self::new(input_capacity, persist_capacity, PositionKeeper::default())
+    }
+
     pub async fn run_until_input_closed(mut self) {
         while let Some(event) = self.rx.recv().await {
-            let changed = self.keeper.apply_event(event.clone());
-            self.publisher.publish_changed(&self.keeper, &changed);
-            if self
-                .persist_tx
-                .try_send(PositionPersistRecord::Journal(event))
-                .is_err()
-            {
-                self.status
-                    .store(PositionEngineStatus::Degraded.as_u8(), Ordering::Release);
-            }
+            self.apply_and_publish(event, None).await;
         }
         self.status
             .store(PositionEngineStatus::Stopped.as_u8(), Ordering::Release);
+    }
+
+    pub async fn run_with_strategy_events(
+        mut self,
+        strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
+    ) {
+        while let Some(event) = self.rx.recv().await {
+            self.apply_and_publish(event, Some(&strategy_tx)).await;
+        }
+        self.status
+            .store(PositionEngineStatus::Stopped.as_u8(), Ordering::Release);
+    }
+
+    async fn apply_and_publish(
+        &mut self,
+        event: PositionEvent,
+        strategy_tx: Option<&tokio::sync::mpsc::Sender<StrategyEvent>>,
+    ) {
+        let changed = self.keeper.apply_event(event.clone());
+        self.publisher.publish_changed(&self.keeper, &changed);
+        if let Some(event) = position_changed_from_keys(&changed) {
+            if let Some(strategy_tx) = strategy_tx {
+                if strategy_tx
+                    .send(StrategyEvent::PositionChanged(event))
+                    .await
+                    .is_err()
+                {
+                    warn!("position engine 广播仓位变化事件失败，策略通道已关闭");
+                }
+            }
+        }
+        if self
+            .persist_tx
+            .try_send(PositionPersistRecord::Journal(event))
+            .is_err()
+        {
+            self.mark_degraded();
+        }
+    }
+
+    fn mark_degraded(&self) {
+        self.status
+            .store(PositionEngineStatus::Degraded.as_u8(), Ordering::Release);
     }
 }
 
@@ -480,6 +834,23 @@ impl PositionIngestHandle {
         self.read_handle.clone()
     }
 
+    pub fn status(&self) -> PositionEngineStatus {
+        PositionEngineStatus::from_u8(self.status.load(Ordering::Acquire))
+    }
+
+    pub fn status_handle(&self) -> PositionStatusHandle {
+        PositionStatusHandle {
+            status: self.status.clone(),
+        }
+    }
+
+    pub fn mark_degraded(&self) {
+        self.status
+            .store(PositionEngineStatus::Degraded.as_u8(), Ordering::Release);
+    }
+}
+
+impl PositionStatusHandle {
     pub fn status(&self) -> PositionEngineStatus {
         PositionEngineStatus::from_u8(self.status.load(Ordering::Acquire))
     }
@@ -513,6 +884,25 @@ impl PositionSnapshotPublisher {
             }
         }
     }
+}
+
+fn position_changed_from_keys(changed: &[PositionEntryKey]) -> Option<PositionChangedEvent> {
+    let mut changed_assets = changed
+        .iter()
+        .filter_map(|key| match key {
+            PositionEntryKey::Global { token_id } => Some(token_id.clone()),
+            PositionEntryKey::Strategy { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    changed_assets.sort();
+    changed_assets.dedup();
+    if changed_assets.is_empty() {
+        return None;
+    }
+
+    Some(PositionChangedEvent {
+        changed_assets: Arc::from(changed_assets),
+    })
 }
 
 impl PositionReadHandle {
@@ -1185,6 +1575,35 @@ mod tests {
     }
 
     #[test]
+    fn position_changed_from_keys_dedups_global_assets_only() {
+        let event = position_changed_from_keys(&[
+            PositionEntryKey::Strategy {
+                strategy_id: "strategy-a".to_string(),
+                token_id: "token-1".to_string(),
+            },
+            PositionEntryKey::Global {
+                token_id: "token-2".to_string(),
+            },
+            PositionEntryKey::Global {
+                token_id: "token-2".to_string(),
+            },
+            PositionEntryKey::Global {
+                token_id: "token-1".to_string(),
+            },
+        ])
+        .expect("global changes should publish event");
+
+        assert_eq!(event.changed_assets.as_ref(), ["token-1", "token-2"]);
+        assert!(
+            position_changed_from_keys(&[PositionEntryKey::Strategy {
+                strategy_id: "strategy-a".to_string(),
+                token_id: "token-1".to_string(),
+            }])
+            .is_none()
+        );
+    }
+
+    #[test]
     fn read_handle_returns_latest_strategy_and_global_entry_snapshots() {
         let publisher = PositionSnapshotPublisher::default();
         let handle = publisher.read_handle();
@@ -1356,6 +1775,7 @@ mod tests {
             payload: OrderEventPayload::Open {
                 exch_id: ExchangeOrderId::from("exch-1"),
             },
+            order: None,
         };
         let fill = OrderEventEnvelope {
             strategy_id: StrategyId::from("strategy-a"),
@@ -1372,6 +1792,7 @@ mod tests {
                 cum_qty: dec(3.0),
                 avg_fill_price: Some(dec(0.4)),
             },
+            order: None,
         };
         let cancel = OrderEventEnvelope {
             strategy_id: StrategyId::from("strategy-a"),
@@ -1385,6 +1806,7 @@ mod tests {
             payload: OrderEventPayload::Cancelled {
                 reason: CancelReason::Requested,
             },
+            order: None,
         };
 
         let open_event =

@@ -45,48 +45,15 @@ pub struct MarketEvent {
     pub book: CleanOrderbook,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PositionView {
-    pub asset_id: String,
-    pub size: Decimal,
-    pub avg_price: Decimal,
-    pub cur_price: Decimal,
-    pub current_value: Decimal,
-    pub cash_pnl: Decimal,
-    pub title: Arc<str>,
-    pub outcome: Arc<str>,
-}
-
 #[derive(Debug, Clone)]
-pub struct PositionSnapshot {
-    pub by_asset: Arc<HashMap<String, PositionView>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PositionsUpdateEvent {
-    pub snapshot: Arc<PositionSnapshot>,
+pub struct PositionChangedEvent {
     pub changed_assets: Arc<[String]>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RelevantPositionsUpdate {
-    pub snapshot: Arc<PositionSnapshot>,
-    pub changed_assets: Arc<[String]>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RewardPoolRemovalEvent {
-    pub condition_id: String,
-    pub token1: String,
-    pub token2: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum StrategyEvent {
     Market(MarketEvent),
-    Positions(PositionsUpdateEvent),
-    RewardPoolRemoval(RewardPoolRemovalEvent),
+    PositionChanged(PositionChangedEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +66,6 @@ pub struct TopicRegistration {
 pub enum StrategyKind {
     MarketMaker,
     PairArbitrage,
-    LiquidityReward,
     TrendFollowing,
     MeanReversion,
     Arbitrage,
@@ -179,24 +145,6 @@ pub type OrderCorrelationMap = Arc<DashMap<String, LocalOrderMeta>>;
 pub trait Strategy: Send + 'static {
     fn name(&self) -> &str;
     fn registration(&self) -> &StrategyRegistration;
-
-    fn relevant_positions(&self, event: &PositionsUpdateEvent) -> Option<RelevantPositionsUpdate> {
-        let related_tokens = &self.registration().related_tokens;
-        let changed_assets: Vec<String> = event
-            .changed_assets
-            .iter()
-            .filter(|asset| related_tokens.iter().any(|token| token == *asset))
-            .cloned()
-            .collect();
-        if changed_assets.is_empty() {
-            return None;
-        }
-
-        Some(RelevantPositionsUpdate {
-            snapshot: event.snapshot.clone(),
-            changed_assets: changed_assets.into(),
-        })
-    }
 
     fn spawn(
         self,

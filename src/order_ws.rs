@@ -14,7 +14,6 @@ use tracing::{info, warn};
 use crate::{
     config::AuthConfig,
     notification::{LiquidityRewardFillNotification, NotificationEvent, Notifier},
-    positions::PositionRefreshTrigger,
     storage::OrderStore,
     strategy::{OrderCorrelationMap, QuoteSide},
 };
@@ -23,7 +22,6 @@ pub async fn run(
     auth: AuthConfig,
     correlations: OrderCorrelationMap,
     order_store: OrderStore,
-    positions_refresh_tx: tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
     observation_tx: tokio::sync::mpsc::Sender<crate::order_gateway::GatewayObservation>,
     notifier: Option<Notifier>,
 ) {
@@ -32,7 +30,6 @@ pub async fn run(
             &auth,
             &correlations,
             &order_store,
-            &positions_refresh_tx,
             &observation_tx,
             notifier.as_ref(),
         )
@@ -51,7 +48,6 @@ async fn subscribe_orders(
     auth: &AuthConfig,
     correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
-    positions_refresh_tx: &tokio::sync::mpsc::Sender<PositionRefreshTrigger>,
     observation_tx: &tokio::sync::mpsc::Sender<crate::order_gateway::GatewayObservation>,
     notifier: Option<&Notifier>,
 ) -> anyhow::Result<()> {
@@ -255,18 +251,6 @@ async fn subscribe_orders(
                         "收到订单 websocket 更新，但未匹配到本地订单"
                     );
                 }
-
-                let _ = positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
-                if matches!(status, "partially_filled" | "filled") {
-                    let positions_refresh_tx = positions_refresh_tx.clone();
-                    tokio::spawn(async move {
-                        for delay in post_fill_position_refresh_delays() {
-                            tokio::time::sleep(*delay).await;
-                            let _ =
-                                positions_refresh_tx.try_send(PositionRefreshTrigger::OrderUpdate);
-                        }
-                    });
-                }
             }
             Ok(WsMessage::Trade(trade)) => {
                 let maker_order_ids = trade_maker_order_ids(&trade);
@@ -318,17 +302,6 @@ fn gateway_fill_observation(
         fill_price,
         trade_id: Arc::from(trade_id),
     }
-}
-
-const POST_FILL_POSITION_REFRESH_DELAYS: [Duration; 4] = [
-    Duration::from_secs(3),
-    Duration::from_secs(12),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-];
-
-fn post_fill_position_refresh_delays() -> &'static [Duration] {
-    &POST_FILL_POSITION_REFRESH_DELAYS
 }
 
 fn trade_maker_order_ids(trade: &TradeMessage) -> Vec<String> {
@@ -402,27 +375,6 @@ mod tests {
 
     fn dec(value: f64) -> Decimal {
         Decimal::try_from(value).unwrap()
-    }
-
-    #[test]
-    fn post_fill_position_refreshes_extend_to_one_minute() {
-        let cumulative = post_fill_position_refresh_delays()
-            .iter()
-            .scan(Duration::ZERO, |elapsed, delay| {
-                *elapsed += *delay;
-                Some(*elapsed)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            cumulative,
-            vec![
-                Duration::from_secs(3),
-                Duration::from_secs(15),
-                Duration::from_secs(30),
-                Duration::from_secs(60),
-            ]
-        );
     }
 
     #[test]

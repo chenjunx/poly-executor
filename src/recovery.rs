@@ -12,13 +12,8 @@ use polymarket_client_sdk_v2::types::Decimal;
 
 use crate::clob_client::{AuthenticatedClobClient, build_authenticated_clob_client};
 use crate::config::AuthConfig;
-use crate::storage::{
-    OrderStore, StoredLiquidityRewardSharedState, StoredLiquidityRewardSideState, StoredOrder,
-};
-use crate::strategies::liquidity_reward::{
-    LiquidityRewardRestoreSideState, LiquidityRewardRestoreState,
-};
-use crate::strategy::{OrderCorrelationMap, QuoteSide};
+use crate::storage::{OrderStore, StoredOrder};
+use crate::strategy::OrderCorrelationMap;
 
 const END_CURSOR: &str = "LTE=";
 
@@ -29,10 +24,9 @@ pub struct RecoveryCoordinator {
     simulation_enabled: bool,
 }
 
-// 恢复产物会交给订单执行器和策略，作为重启后继续管理存量订单的入口。
+// 恢复产物会交给订单执行器，作为重启后继续管理存量订单的入口。
 pub struct RecoveryArtifacts {
     pub order_correlations: OrderCorrelationMap,
-    pub liquidity_reward_restore_states: HashMap<String, LiquidityRewardRestoreState>,
 }
 
 impl RecoveryCoordinator {
@@ -45,30 +39,19 @@ impl RecoveryCoordinator {
     }
 
     pub async fn recover(&self) -> anyhow::Result<RecoveryArtifacts> {
-        // 先读取本地快照，再用远端状态筛掉不可恢复订单，最后重建策略内存状态。
+        // 先读取本地 active 订单，再用远端状态筛掉不可恢复订单，最后重建订单关联索引。
         let local_projection = self.load_local_projection()?;
         let reconciled_active_orders = self
             .reconcile_orders_against_exchange(local_projection.active_orders)
             .await?;
         let order_correlations = self.build_order_correlations(&reconciled_active_orders)?;
-        let liquidity_reward_restore_states = build_liquidity_reward_restore_states(
-            local_projection.shared_states,
-            local_projection.side_states,
-            &order_correlations,
-            self.simulation_enabled,
-        );
 
-        Ok(RecoveryArtifacts {
-            order_correlations,
-            liquidity_reward_restore_states,
-        })
+        Ok(RecoveryArtifacts { order_correlations })
     }
 
     fn load_local_projection(&self) -> anyhow::Result<LocalProjection> {
         Ok(LocalProjection {
             active_orders: self.order_store.load_active_orders()?,
-            shared_states: self.order_store.load_liquidity_reward_shared_states()?,
-            side_states: self.order_store.load_liquidity_reward_side_states()?,
         })
     }
 
@@ -272,8 +255,6 @@ impl RecoveryCoordinator {
 
 struct LocalProjection {
     active_orders: Vec<StoredOrder>,
-    shared_states: Vec<StoredLiquidityRewardSharedState>,
-    side_states: Vec<StoredLiquidityRewardSideState>,
 }
 
 async fn fetch_remote_open_orders(
@@ -298,139 +279,6 @@ async fn fetch_remote_open_orders(
     }
 
     Ok(remote_open_orders)
-}
-
-fn build_liquidity_reward_restore_states(
-    shared_states: Vec<StoredLiquidityRewardSharedState>,
-    side_states: Vec<StoredLiquidityRewardSideState>,
-    order_correlations: &OrderCorrelationMap,
-    simulation_enabled: bool,
-) -> HashMap<String, LiquidityRewardRestoreState> {
-    // shared 保存行情上下文，side 保存买/卖两侧订单状态；恢复时需要重新合并。
-    let mut restored_liquidity_reward_states =
-        restore_liquidity_reward_states_from_shared_states(shared_states);
-
-    for side_state in side_states {
-        let restore_state = restored_liquidity_reward_states
-            .entry(side_state.token.clone())
-            .or_insert_with(default_liquidity_reward_restore_state);
-        apply_liquidity_reward_side_state(
-            restore_state,
-            side_state,
-            order_correlations,
-            simulation_enabled,
-        );
-    }
-
-    restored_liquidity_reward_states
-}
-
-fn restore_liquidity_reward_states_from_shared_states(
-    shared_states: Vec<StoredLiquidityRewardSharedState>,
-) -> HashMap<String, LiquidityRewardRestoreState> {
-    shared_states
-        .into_iter()
-        .map(|state| {
-            (
-                state.token.clone(),
-                LiquidityRewardRestoreState {
-                    topic: Arc::from(state.topic),
-                    buy: LiquidityRewardRestoreSideState::default(),
-                    sell: LiquidityRewardRestoreSideState::default(),
-                    last_mid: state.last_mid,
-                    last_best_bid: state.last_best_bid,
-                    last_best_ask: state.last_best_ask,
-                    last_position_size: state.last_position_size,
-                },
-            )
-        })
-        .collect()
-}
-
-fn default_liquidity_reward_restore_state() -> LiquidityRewardRestoreState {
-    LiquidityRewardRestoreState {
-        topic: Arc::from("liquidity_reward"),
-        buy: LiquidityRewardRestoreSideState::default(),
-        sell: LiquidityRewardRestoreSideState::default(),
-        last_mid: None,
-        last_best_bid: None,
-        last_best_ask: None,
-        last_position_size: Decimal::ZERO,
-    }
-}
-
-fn apply_liquidity_reward_side_state(
-    restore_state: &mut LiquidityRewardRestoreState,
-    side_state: StoredLiquidityRewardSideState,
-    order_correlations: &OrderCorrelationMap,
-    simulation_enabled: bool,
-) {
-    let side = side_state.side;
-    let lane = restore_lane_mut(restore_state, side);
-
-    lane.active_local_order_id = side_state.active_local_order_id.filter(|order_id| {
-        recoverable_order_matches_side(order_correlations, order_id, side, simulation_enabled)
-    });
-    lane.active_order_size = lane.active_local_order_id.as_ref().and_then(|order_id| {
-        order_correlations
-            .get(order_id)
-            .map(|entry| entry.order_size)
-    });
-    lane.active_price = lane
-        .active_local_order_id
-        .as_ref()
-        .and_then(|order_id| order_correlations.get(order_id).map(|entry| entry.price));
-
-    lane.pending_local_order_id = side_state.pending_local_order_id.filter(|order_id| {
-        recoverable_order_matches_side(order_correlations, order_id, side, simulation_enabled)
-    });
-    apply_pending_replacement_fields(
-        lane,
-        side_state.pending_price,
-        side_state.pending_order_size,
-        side_state.pending_mid,
-    );
-    lane.last_quoted_mid = side_state.last_quoted_mid;
-    lane.cancel_requested = side_state.cancel_requested;
-}
-
-fn restore_lane_mut(
-    restore_state: &mut LiquidityRewardRestoreState,
-    side: QuoteSide,
-) -> &mut LiquidityRewardRestoreSideState {
-    match side {
-        QuoteSide::Buy => &mut restore_state.buy,
-        QuoteSide::Sell => &mut restore_state.sell,
-    }
-}
-
-fn recoverable_order_matches_side(
-    order_correlations: &OrderCorrelationMap,
-    order_id: &str,
-    side: QuoteSide,
-    simulation_enabled: bool,
-) -> bool {
-    // 真实模式必须有 remote id，否则重启后无法确认、撤销或接收该订单后续状态。
-    order_correlations.get(order_id).is_some_and(|entry| {
-        entry.side == side && (simulation_enabled || entry.remote_order_id.is_some())
-    })
-}
-
-fn apply_pending_replacement_fields(
-    lane: &mut LiquidityRewardRestoreSideState,
-    pending_price: Option<Decimal>,
-    pending_order_size: Option<Decimal>,
-    pending_mid: Option<Decimal>,
-) {
-    if lane.pending_local_order_id.is_some() {
-        lane.pending_price = pending_price;
-        lane.pending_order_size = pending_order_size;
-        lane.pending_mid = pending_mid;
-    } else {
-        lane.pending_price = None;
-        lane.pending_order_size = None;
-        lane.pending_mid = None;
-    }
 }
 
 fn map_open_order_status(order: &OpenOrderResponse) -> &'static str {

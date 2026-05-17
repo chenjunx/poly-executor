@@ -153,12 +153,7 @@ impl Strategy for PairArbitrageStrategy {
                             &order_gateway,
                         );
                     }
-                    StrategyEvent::Positions(update) => {
-                        let Some(_update) = self.relevant_positions(&update) else {
-                            continue;
-                        };
-                    }
-                    StrategyEvent::RewardPoolRemoval(_) => {}
+                    StrategyEvent::PositionChanged(_) => {}
                 }
             }
         })

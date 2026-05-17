@@ -51,10 +51,10 @@ impl Dispatcher {
                         }
                     }
                 }
-                StrategyEvent::Positions(positions_event) => {
+                StrategyEvent::PositionChanged(position_event) => {
                     let mut notified: std::collections::HashSet<Arc<str>> =
                         std::collections::HashSet::new();
-                    for asset_id in positions_event.changed_assets.iter() {
+                    for asset_id in position_event.changed_assets.iter() {
                         let Some(strategies) = self.position_routes.get(asset_id) else {
                             continue;
                         };
@@ -73,28 +73,6 @@ impl Dispatcher {
                         }
                     }
                 }
-                StrategyEvent::RewardPoolRemoval(removal_event) => {
-                    let mut notified: std::collections::HashSet<Arc<str>> =
-                        std::collections::HashSet::new();
-                    for token in [&removal_event.token1, &removal_event.token2] {
-                        let Some(strategies) = self.position_routes.get(token) else {
-                            continue;
-                        };
-                        for strategy in strategies {
-                            if !notified.insert(strategy.name.clone()) {
-                                continue;
-                            }
-                            if let Err(err) = strategy.tx.try_send(event.clone()) {
-                                warn!(
-                                    strategy = %strategy.name,
-                                    condition_id = %removal_event.condition_id,
-                                    error = %err,
-                                    "dispatcher 投递奖励池剔除事件失败"
-                                );
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -103,13 +81,9 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
 
-    use polymarket_client_sdk_v2::types::Decimal;
-
-    use crate::strategy::{
-        CleanOrderbook, MarketEvent, PositionSnapshot, PositionView, PositionsUpdateEvent,
-    };
+    use crate::strategy::{CleanOrderbook, MarketEvent, PositionChangedEvent};
 
     fn test_market_event(topic: &str, token: &str) -> StrategyEvent {
         StrategyEvent::Market(MarketEvent {
@@ -127,25 +101,8 @@ mod tests {
         })
     }
 
-    fn test_positions_event(token: &str) -> StrategyEvent {
-        let mut by_asset = HashMap::new();
-        by_asset.insert(
-            token.to_string(),
-            PositionView {
-                asset_id: token.to_string(),
-                size: Decimal::ONE,
-                avg_price: Decimal::ONE,
-                cur_price: Decimal::ONE,
-                current_value: Decimal::ONE,
-                cash_pnl: Decimal::ZERO,
-                title: Arc::from("title"),
-                outcome: Arc::from("outcome"),
-            },
-        );
-        StrategyEvent::Positions(PositionsUpdateEvent {
-            snapshot: Arc::new(PositionSnapshot {
-                by_asset: Arc::new(by_asset),
-            }),
+    fn test_position_changed_event(token: &str) -> StrategyEvent {
+        StrategyEvent::PositionChanged(PositionChangedEvent {
             changed_assets: Arc::from([token.to_string()]),
         })
     }
@@ -175,7 +132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_keeps_position_routing_without_order_events() {
+    async fn dispatcher_routes_position_changed_events_by_changed_assets() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let strategy = StrategyHandle {
             name: Arc::from("test"),
@@ -188,13 +145,13 @@ mod tests {
         let task = tokio::spawn(dispatcher.run(input_rx));
 
         input_tx
-            .send(test_positions_event("token-1"))
+            .send(test_position_changed_event("token-1"))
             .await
             .unwrap();
         drop(input_tx);
 
         let event = rx.recv().await.expect("position event routed");
-        assert!(matches!(event, StrategyEvent::Positions(_)));
+        assert!(matches!(event, StrategyEvent::PositionChanged(_)));
         task.await.unwrap();
     }
 }
