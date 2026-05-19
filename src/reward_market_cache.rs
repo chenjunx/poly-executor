@@ -343,7 +343,8 @@ async fn load_current_rewards_page(
     let response = http_client
         .execute(request_with_headers(request, headers)?)
         .await?;
-    Ok(response.error_for_status()?.json().await?)
+    let mut body = response.error_for_status()?.bytes().await?.to_vec();
+    Ok(simd_json::from_slice(&mut body)?)
 }
 
 fn request_with_headers(mut request: Request, headers: HeaderMap) -> anyhow::Result<Request> {
