@@ -11,30 +11,15 @@ use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::{
-    config::AuthConfig,
-    notification::{LiquidityRewardFillNotification, NotificationEvent, Notifier},
-    storage::OrderStore,
-    strategy::{OrderCorrelationMap, QuoteSide},
-};
+use crate::{config::AuthConfig, storage::OrderStore};
 
 pub async fn run(
     auth: AuthConfig,
-    correlations: OrderCorrelationMap,
     order_store: OrderStore,
     observation_tx: tokio::sync::mpsc::Sender<crate::order_gateway::GatewayObservation>,
-    notifier: Option<Notifier>,
 ) {
     loop {
-        match subscribe_orders(
-            &auth,
-            &correlations,
-            &order_store,
-            &observation_tx,
-            notifier.as_ref(),
-        )
-        .await
-        {
+        match subscribe_orders(&auth, &order_store, &observation_tx).await {
             Ok(()) => warn!(target: "order", "订单 websocket 已断开，5 秒后重连"),
             Err(error) => {
                 warn!(target: "order", error = %error, "订单 websocket 监听失败，5 秒后重连")
@@ -46,10 +31,8 @@ pub async fn run(
 
 async fn subscribe_orders(
     auth: &AuthConfig,
-    correlations: &OrderCorrelationMap,
     order_store: &OrderStore,
     observation_tx: &tokio::sync::mpsc::Sender<crate::order_gateway::GatewayObservation>,
-    notifier: Option<&Notifier>,
 ) -> anyhow::Result<()> {
     let signer = LocalSigner::from_str(&auth.private_key)?.with_chain_id(Some(POLYGON));
     let address = Address::from_str(&auth.funder)?;
@@ -69,32 +52,24 @@ async fn subscribe_orders(
     while let Some(message) = stream.next().await {
         match message {
             Ok(WsMessage::Order(order)) => {
-                let local_meta = correlations.get(&order.id).map(|entry| entry.clone());
-                let local_meta = match local_meta {
-                    Some(meta) => Some(meta),
-                    None => match order_store.find_order_by_remote(&order.id) {
-                        Ok(Some(stored_order)) => {
-                            let meta = stored_order.to_local_order_meta();
-                            correlations.insert(meta.local_order_id.clone(), meta.clone());
-                            if let Some(remote_order_id) = meta.remote_order_id.clone() {
-                                correlations.insert(remote_order_id, meta.clone());
-                            }
-                            info!(
-                                target: "order",
-                                order_id = %order.id,
-                                local_order_id = %meta.local_order_id,
-                                strategy = %meta.strategy,
-                                token = %meta.token,
-                                "订单 websocket 从数据库恢复本地订单关联"
-                            );
-                            Some(meta)
-                        }
-                        Ok(None) => None,
-                        Err(error) => {
-                            warn!(target: "order", order_id = %order.id, error = %error, "订单 websocket 从数据库恢复本地订单关联失败");
-                            None
-                        }
-                    },
+                let local_meta = match order_store.find_order_by_remote(&order.id) {
+                    Ok(Some(stored_order)) => {
+                        let meta = stored_order.to_local_order_meta();
+                        info!(
+                            target: "order",
+                            order_id = %order.id,
+                            local_order_id = %meta.local_order_id,
+                            strategy = %meta.strategy,
+                            token = %meta.token,
+                            "订单 websocket 从数据库恢复本地订单关联"
+                        );
+                        Some(meta)
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        warn!(target: "order", order_id = %order.id, error = %error, "订单 websocket 从数据库恢复本地订单关联失败");
+                        None
+                    }
                 };
                 let local_order_id = local_meta.as_ref().map(|meta| meta.local_order_id.clone());
                 let status = classify_ws_status(
@@ -159,81 +134,37 @@ async fn subscribe_orders(
                         status = status,
                         "收到订单 websocket 更新，并成功关联本地订单"
                     );
-                    if let Some(delta_size) =
-                        fill_delta(previous_size_matched, current_size_matched)
-                    {
-                        let total_matched_size = current_size_matched.unwrap_or(Decimal::ZERO);
-                        if let Err(error) = observation_tx.try_send(gateway_fill_observation(
-                            Some(order.id.clone()),
-                            Some(local_meta.local_order_id.clone()),
-                            local_meta.token.clone(),
-                            local_meta.side,
-                            delta_size,
-                            order.price,
+                    if let Err(error) =
+                        observation_tx.try_send(gateway_private_ws_order_update_observation(
                             order.id.clone(),
-                        )) {
-                            warn!(
-                                target: "order",
-                                strategy = %local_meta.strategy,
-                                token = %local_meta.token,
-                                local_order_id = %local_meta.local_order_id,
-                                delta_size = %delta_size,
-                                error = %error,
-                                "订单成交 observation 投递 Gateway 失败"
-                            );
-                        }
-                        if local_meta.strategy.as_ref() == "liquidity_reward" {
-                            if let Some(notifier) = notifier {
-                                notifier.try_notify(NotificationEvent::LiquidityRewardFill(
-                                    LiquidityRewardFillNotification {
-                                        strategy: local_meta.strategy.to_string(),
-                                        topic: local_meta
-                                            .topic
-                                            .as_ref()
-                                            .map(|topic| topic.to_string()),
-                                        token: local_meta.token.clone(),
-                                        local_order_id: local_meta.local_order_id.clone(),
-                                        remote_order_id: order.id.clone(),
-                                        side: local_meta.side,
-                                        order_price: local_meta.price,
-                                        order_size: local_meta.order_size,
-                                        delta_size,
-                                        total_matched_size,
-                                        market: order.market.to_string(),
-                                        asset_id: order.asset_id.to_string(),
-                                        ws_price: order.price.to_string(),
-                                        ws_original_size: order
-                                            .original_size
-                                            .map(|value| value.to_string()),
-                                        ws_size_matched: order
-                                            .size_matched
-                                            .map(|value| value.to_string()),
-                                        ws_status: status.to_string(),
-                                        ws_msg_type: format!("{:?}", order.msg_type),
-                                        ws_timestamp: order.timestamp,
-                                    },
-                                ));
-                            }
-                        }
-                        info!(
+                            local_meta.token.clone(),
+                            order.market.to_string(),
+                            order.price,
+                            previous_size_matched,
+                            current_size_matched,
+                            order.original_size,
+                            Some(status),
+                        ))
+                    {
+                        warn!(
                             target: "order",
-                            order_id = %order.id,
-                            local_order_id = %local_meta.local_order_id,
+                            strategy = %local_meta.strategy,
                             token = %local_meta.token,
-                            side = ?local_meta.side,
-                            delta_size = %delta_size,
-                            total_matched_size = %total_matched_size,
-                            "根据订单 websocket 成交增量触发策略库存更新"
+                            local_order_id = %local_meta.local_order_id,
+                            error = %error,
+                            "订单 websocket observation 投递 Gateway 失败"
                         );
                     }
-
-                    let is_terminal = matches!(status, "canceled" | "filled" | "rejected");
-                    if is_terminal {
-                        correlations.remove(&local_meta.local_order_id);
-                        if let Some(remote_id) = &local_meta.remote_order_id {
-                            correlations.remove(remote_id.as_str());
-                        }
-                    }
+                    info!(
+                        target: "order",
+                        order_id = %order.id,
+                        local_order_id = %local_meta.local_order_id,
+                        token = %local_meta.token,
+                        side = ?local_meta.side,
+                        current_size_matched = ?current_size_matched,
+                        original_size = ?order.original_size,
+                        "订单 websocket 匹配状态已投递 Gateway，等待 settlement 确认"
+                    );
                 } else {
                     info!(
                         target: "order",
@@ -270,6 +201,11 @@ async fn subscribe_orders(
                     matchtime = ?trade.matchtime,
                     "收到 trade websocket 更新"
                 );
+                for observation in trade_settlement_observations(&trade) {
+                    if let Err(error) = observation_tx.try_send(observation) {
+                        warn!(target: "order", trade_id = %trade.id, error = %error, "trade settlement observation 投递 Gateway 失败");
+                    }
+                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -281,27 +217,30 @@ async fn subscribe_orders(
     Ok(())
 }
 
-fn gateway_fill_observation(
-    exch_id: Option<String>,
-    local_id: Option<String>,
+fn gateway_private_ws_order_update_observation(
+    exch_id: String,
     token_id: String,
-    side: QuoteSide,
-    fill_delta: Decimal,
+    market_id: String,
     fill_price: Decimal,
-    trade_id: String,
+    previous_size_matched: Option<Decimal>,
+    current_size_matched: Option<Decimal>,
+    original_size: Option<Decimal>,
+    remote_status_code: Option<&str>,
 ) -> crate::order_gateway::GatewayObservation {
-    crate::order_gateway::GatewayObservation::WsFill {
-        exch_id: exch_id.map(crate::order_gateway::ExchangeOrderId::from),
-        local_id: local_id.map(crate::order_gateway::LocalOrderId::from),
-        token_id: crate::order_gateway::TokenId::from(token_id),
-        side: match side {
-            QuoteSide::Buy => crate::order_gateway::OrderSide::Buy,
-            QuoteSide::Sell => crate::order_gateway::OrderSide::Sell,
+    crate::order_gateway::GatewayObservation::PrivateWsOrderUpdate(
+        crate::order_gateway::PrivateWsOrderUpdate {
+            exch_id: crate::order_gateway::ExchangeOrderId::from(exch_id),
+            token_id: crate::order_gateway::TokenId::from(token_id),
+            market_id: crate::order_gateway::MarketId::from(market_id),
+            fill_price,
+            previous_size_matched,
+            current_size_matched,
+            original_size,
+            remote_status_code: remote_status_code.map(Arc::from),
+            ts_ns: 0,
+            recovery: false,
         },
-        fill_delta,
-        fill_price,
-        trade_id: Arc::from(trade_id),
-    }
+    )
 }
 
 fn trade_maker_order_ids(trade: &TradeMessage) -> Vec<String> {
@@ -312,14 +251,40 @@ fn trade_maker_order_ids(trade: &TradeMessage) -> Vec<String> {
         .collect()
 }
 
-fn fill_delta(
-    previous_size_matched: Option<Decimal>,
-    current_size_matched: Option<Decimal>,
-) -> Option<Decimal> {
-    let current_size_matched = current_size_matched?;
-    let previous_size_matched = previous_size_matched.unwrap_or(Decimal::ZERO);
-    let delta = current_size_matched - previous_size_matched;
-    (delta > Decimal::ZERO).then_some(delta)
+fn trade_settlement_observations(
+    trade: &TradeMessage,
+) -> Vec<crate::order_gateway::GatewayObservation> {
+    let Some(transaction_hash) = trade.transaction_hash else {
+        return Vec::new();
+    };
+    let transaction_hash = Arc::<str>::from(format!("{transaction_hash:#x}"));
+    let ts_ns = trade.timestamp.unwrap_or_default() as u64 * 1_000_000;
+    let mut observations = Vec::new();
+    if let Some(taker_order_id) = trade.taker_order_id.as_ref() {
+        observations.push(
+            crate::order_gateway::GatewayObservation::SettlementTradeObserved {
+                exch_id: crate::order_gateway::ExchangeOrderId::from(taker_order_id.as_str()),
+                transaction_hash: transaction_hash.clone(),
+                fill_qty: trade.size,
+                fill_price: trade.price,
+                ts_ns,
+                recovery: false,
+            },
+        );
+    }
+    for maker in &trade.maker_orders {
+        observations.push(
+            crate::order_gateway::GatewayObservation::SettlementTradeObserved {
+                exch_id: crate::order_gateway::ExchangeOrderId::from(maker.order_id.as_str()),
+                transaction_hash: transaction_hash.clone(),
+                fill_qty: maker.matched_amount,
+                fill_price: maker.price,
+                ts_ns,
+                recovery: false,
+            },
+        );
+    }
+    observations
 }
 
 fn classify_ws_status(
@@ -334,12 +299,9 @@ fn classify_ws_status(
     if msg_type.contains("reject") {
         return "rejected";
     }
-    if let (Some(original_size), Some(size_matched)) = (original_size, size_matched) {
-        if original_size == size_matched {
-            return "filled";
-        }
+    if let (Some(_original_size), Some(size_matched)) = (original_size, size_matched) {
         if size_matched != "0" {
-            return "partially_filled";
+            return "matched";
         }
     }
     "open"
@@ -348,22 +310,122 @@ fn classify_ws_status(
 #[cfg(test)]
 mod gateway_observation_tests {
     use super::*;
+    use polymarket_client_sdk_v2::clob::ws::types::response::TradeMessageStatus;
+
+    fn dec(value: f64) -> Decimal {
+        Decimal::try_from(value).unwrap()
+    }
 
     #[test]
-    fn ws_fill_delta_maps_to_gateway_observation() {
-        let observation = gateway_fill_observation(
-            Some("exch-1".to_string()),
-            None,
+    fn trade_message_maps_taker_and_maker_orders_to_settlement_observations() {
+        let trade = TradeMessage::builder()
+            .id("trade-1".to_string())
+            .market(
+                "0xfbc0c760359fe3f73b833535186c9592deda90f373d79b10c0af6ea6a1f947f1"
+                    .parse()
+                    .unwrap(),
+            )
+            .asset_id(
+                "31266632690440281732493182712982317452788219157475457369452413915821186184190"
+                    .parse()
+                    .unwrap(),
+            )
+            .side(polymarket_client_sdk_v2::clob::types::Side::Buy)
+            .size(dec(2.0))
+            .price(dec(0.56))
+            .status(TradeMessageStatus::Matched)
+            .taker_order_id("taker-1".to_string())
+            .maker_orders(vec![
+                polymarket_client_sdk_v2::clob::ws::types::response::MakerOrder::builder()
+                    .asset_id(
+                        "31266632690440281732493182712982317452788219157475457369452413915821186184190"
+                            .parse()
+                            .unwrap(),
+                    )
+                    .matched_amount(dec(1.25))
+                    .order_id("maker-1".to_string())
+                    .outcome("YES".to_string())
+                    .owner("00000000-0000-0000-0000-000000000001".parse().unwrap())
+                    .price(dec(0.56))
+                    .build(),
+            ])
+            .transaction_hash(
+                "0x0000000000000000000000000000000000000000000000000000000000000abc"
+                    .parse()
+                    .unwrap(),
+            )
+            .build();
+
+        let observations = trade_settlement_observations(&trade);
+
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            crate::order_gateway::GatewayObservation::SettlementTradeObserved {
+                exch_id,
+                transaction_hash,
+                fill_qty,
+                fill_price,
+                ..
+            } if exch_id.as_str() == "taker-1"
+                && transaction_hash.as_ref() == "0x0000000000000000000000000000000000000000000000000000000000000abc"
+                && *fill_qty == dec(2.0)
+                && *fill_price == dec(0.56)
+        )));
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            crate::order_gateway::GatewayObservation::SettlementTradeObserved {
+                exch_id,
+                transaction_hash,
+                fill_qty,
+                fill_price,
+                ..
+            } if exch_id.as_str() == "maker-1"
+                && transaction_hash.as_ref() == "0x0000000000000000000000000000000000000000000000000000000000000abc"
+                && *fill_qty == dec(1.25)
+                && *fill_price == dec(0.56)
+        )));
+    }
+
+    #[test]
+    fn ws_order_update_with_matched_size_maps_to_open_not_fill_observation() {
+        let observation = gateway_private_ws_order_update_observation(
+            "exch-1".to_string(),
             "token-1".to_string(),
-            QuoteSide::Buy,
-            Decimal::try_from(2_f64).unwrap(),
+            "market-1".to_string(),
             Decimal::try_from(0.42_f64).unwrap(),
-            "trade-1".to_string(),
+            Some(Decimal::ZERO),
+            Some(Decimal::try_from(10_f64).unwrap()),
+            Some(Decimal::try_from(10_f64).unwrap()),
+            Some("matched"),
+        );
+
+        let crate::order_gateway::GatewayObservation::PrivateWsOrderUpdate(update) = observation
+        else {
+            panic!("order update should remain a private ws order update");
+        };
+        assert_eq!(
+            update.current_size_matched,
+            Some(Decimal::try_from(10_f64).unwrap())
+        );
+    }
+
+    #[test]
+    fn ws_order_update_maps_to_gateway_private_ws_observation() {
+        let observation = gateway_private_ws_order_update_observation(
+            "exch-1".to_string(),
+            "token-1".to_string(),
+            "market-1".to_string(),
+            Decimal::try_from(0.42_f64).unwrap(),
+            Some(Decimal::ONE),
+            Some(Decimal::try_from(3_f64).unwrap()),
+            Some(Decimal::try_from(10_f64).unwrap()),
+            Some("matched"),
         );
 
         assert!(matches!(
             observation,
-            crate::order_gateway::GatewayObservation::WsFill { .. }
+            crate::order_gateway::GatewayObservation::PrivateWsOrderUpdate { .. }
         ));
     }
 }
@@ -416,35 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn fill_delta_ignores_missing_current_size() {
-        assert_eq!(fill_delta(None, None), None);
-    }
-
-    #[test]
-    fn fill_delta_ignores_first_zero_size() {
-        assert_eq!(fill_delta(None, Some(Decimal::ZERO)), None);
-    }
-
-    #[test]
-    fn fill_delta_detects_first_positive_size() {
-        assert_eq!(fill_delta(None, Some(Decimal::ONE)), Some(Decimal::ONE));
-    }
-
-    #[test]
-    fn fill_delta_ignores_unchanged_size() {
-        assert_eq!(fill_delta(Some(Decimal::ONE), Some(Decimal::ONE)), None);
-    }
-
-    #[test]
-    fn fill_delta_detects_incremental_size() {
+    fn classify_ws_status_treats_matched_size_as_matched_not_filled() {
         assert_eq!(
-            fill_delta(Some(Decimal::ONE), Some(dec(1.5))),
-            Some(dec(0.5))
+            classify_ws_status("matched", Some("10"), Some("10")),
+            "matched"
         );
-    }
-
-    #[test]
-    fn fill_delta_ignores_size_regression() {
-        assert_eq!(fill_delta(Some(dec(2.0)), Some(Decimal::ONE)), None);
     }
 }

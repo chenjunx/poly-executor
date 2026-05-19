@@ -13,7 +13,6 @@ use crate::order_gateway::{
     OrderEventEnvelope, OrderEventPollError, OrderEventSubscriber, OrderSide,
 };
 use crate::storage::{OrderStore, PositionJournalInsert};
-use crate::strategy::{PositionChangedEvent, StrategyEvent};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionEntrySnapshot {
@@ -772,41 +771,15 @@ impl PositionIngestor {
 
     pub async fn run_until_input_closed(mut self) {
         while let Some(event) = self.rx.recv().await {
-            self.apply_and_publish(event, None).await;
+            self.apply_and_publish(event).await;
         }
         self.status
             .store(PositionEngineStatus::Stopped.as_u8(), Ordering::Release);
     }
 
-    pub async fn run_with_strategy_events(
-        mut self,
-        strategy_tx: tokio::sync::mpsc::Sender<StrategyEvent>,
-    ) {
-        while let Some(event) = self.rx.recv().await {
-            self.apply_and_publish(event, Some(&strategy_tx)).await;
-        }
-        self.status
-            .store(PositionEngineStatus::Stopped.as_u8(), Ordering::Release);
-    }
-
-    async fn apply_and_publish(
-        &mut self,
-        event: PositionEvent,
-        strategy_tx: Option<&tokio::sync::mpsc::Sender<StrategyEvent>>,
-    ) {
+    async fn apply_and_publish(&mut self, event: PositionEvent) {
         let changed = self.keeper.apply_event(event.clone());
         self.publisher.publish_changed(&self.keeper, &changed);
-        if let Some(event) = position_changed_from_keys(&changed) {
-            if let Some(strategy_tx) = strategy_tx {
-                if strategy_tx
-                    .send(StrategyEvent::PositionChanged(event))
-                    .await
-                    .is_err()
-                {
-                    warn!("position engine 广播仓位变化事件失败，策略通道已关闭");
-                }
-            }
-        }
         if self
             .persist_tx
             .try_send(PositionPersistRecord::Journal(event))
@@ -884,25 +857,6 @@ impl PositionSnapshotPublisher {
             }
         }
     }
-}
-
-fn position_changed_from_keys(changed: &[PositionEntryKey]) -> Option<PositionChangedEvent> {
-    let mut changed_assets = changed
-        .iter()
-        .filter_map(|key| match key {
-            PositionEntryKey::Global { token_id } => Some(token_id.clone()),
-            PositionEntryKey::Strategy { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    changed_assets.sort();
-    changed_assets.dedup();
-    if changed_assets.is_empty() {
-        return None;
-    }
-
-    Some(PositionChangedEvent {
-        changed_assets: Arc::from(changed_assets),
-    })
 }
 
 impl PositionReadHandle {
@@ -1572,35 +1526,6 @@ mod tests {
             .entry("strategy-a", "token-1")
             .expect("strategy entry");
         assert_eq!(strategy.working_sell_exposure, dec(5.0));
-    }
-
-    #[test]
-    fn position_changed_from_keys_dedups_global_assets_only() {
-        let event = position_changed_from_keys(&[
-            PositionEntryKey::Strategy {
-                strategy_id: "strategy-a".to_string(),
-                token_id: "token-1".to_string(),
-            },
-            PositionEntryKey::Global {
-                token_id: "token-2".to_string(),
-            },
-            PositionEntryKey::Global {
-                token_id: "token-2".to_string(),
-            },
-            PositionEntryKey::Global {
-                token_id: "token-1".to_string(),
-            },
-        ])
-        .expect("global changes should publish event");
-
-        assert_eq!(event.changed_assets.as_ref(), ["token-1", "token-2"]);
-        assert!(
-            position_changed_from_keys(&[PositionEntryKey::Strategy {
-                strategy_id: "strategy-a".to_string(),
-                token_id: "token-1".to_string(),
-            }])
-            .is_none()
-        );
     }
 
     #[test]

@@ -3,20 +3,84 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Local;
+use dashmap::DashMap;
 use polymarket_client_sdk_v2::types::Decimal;
 use tracing::info;
 
+use crate::strategy::{
+    CleanOrderbook, Filters, PairEntry, Strategy, StrategyKind, StrategyMarketSubscriptions,
+    StrategyRegistration, TopicRegistration, spawn_market_subscription_mux,
+};
+
 const PRICE_SCALE: u32 = 10_000;
 
-use crate::price_store::PriceStore;
-use crate::strategy::{
-    Filters, PairEntry, Strategy, StrategyEvent, StrategyKind, StrategyRegistration,
-    TopicRegistration,
-};
+#[derive(Debug, Clone)]
+struct TokenPrice {
+    asset_id: String,
+    best_bid_price: Option<u16>,
+    best_bid_size: Option<u32>,
+    best_ask_price: Option<u16>,
+    best_ask_size: Option<u32>,
+    updated_at_ms: u64,
+}
+
+impl TokenPrice {
+    fn new(asset_id: String) -> Self {
+        Self {
+            asset_id,
+            best_bid_price: None,
+            best_bid_size: None,
+            best_ask_price: None,
+            best_ask_size: None,
+            updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PriceStore {
+    inner: Arc<DashMap<String, TokenPrice>>,
+}
+
+impl PriceStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(&self, asset_ids: &[String]) {
+        for id in asset_ids {
+            self.inner
+                .entry(id.clone())
+                .or_insert_with(|| TokenPrice::new(id.clone()));
+        }
+    }
+
+    fn apply(&self, asset_id: &str, book: CleanOrderbook) -> Vec<String> {
+        let mut entry = self
+            .inner
+            .entry(asset_id.to_string())
+            .or_insert_with(|| TokenPrice::new(asset_id.to_string()));
+
+        if book.timestamp_ms >= entry.updated_at_ms {
+            entry.best_bid_price = Some(book.best_bid_price);
+            entry.best_bid_size = Some(book.best_bid_size);
+            entry.best_ask_price = Some(book.best_ask_price);
+            entry.best_ask_size = Some(book.best_ask_size);
+            entry.updated_at_ms = book.timestamp_ms;
+            return vec![asset_id.to_string()];
+        }
+
+        vec![]
+    }
+
+    fn get(&self, asset_id: &str) -> Option<TokenPrice> {
+        self.inner.get(asset_id).map(|r| r.clone())
+    }
+}
 
 pub struct PairArbitrageStrategy {
     filters: Arc<Filters>,
-    pairs_by_topic: Arc<HashMap<Arc<str>, Arc<[PairEntry]>>>,
+    pairs_by_token: Arc<HashMap<Arc<str>, Arc<[PairEntry]>>>,
     registration: Arc<StrategyRegistration>,
 }
 
@@ -59,48 +123,41 @@ impl PairArbitrageStrategy {
             anyhow::bail!("资产文件中没有有效的 token 配对: {}", csv_path);
         }
 
-        let mut topic_pairs: HashMap<Arc<str>, Vec<PairEntry>> = HashMap::new();
-        let mut topic_tokens: HashMap<Arc<str>, Vec<String>> = HashMap::new();
+        let mut token_pairs: HashMap<Arc<str>, Vec<PairEntry>> = HashMap::new();
         let mut asset_ids = HashSet::new();
 
         for entry in pair_entries {
-            topic_tokens
-                .entry(entry.topic.clone())
-                .or_default()
-                .extend(entry.tokens.iter().cloned());
             for token in &entry.tokens {
                 asset_ids.insert(token.clone());
+                token_pairs
+                    .entry(Arc::<str>::from(token.as_str()))
+                    .or_default()
+                    .push(entry.clone());
             }
-            topic_pairs
-                .entry(entry.topic.clone())
-                .or_default()
-                .push(entry);
         }
-
-        let mut subscriptions: Vec<Arc<str>> = topic_tokens.keys().cloned().collect();
-        subscriptions.sort();
-
-        let topic_token_regs: Vec<TopicRegistration> = topic_tokens
-            .into_iter()
-            .map(|(topic, mut tokens)| {
-                tokens.sort();
-                tokens.dedup();
-                TopicRegistration {
-                    topic,
-                    tokens: Arc::<[String]>::from(tokens),
-                }
-            })
-            .collect();
-
-        let pairs_by_topic: Arc<HashMap<Arc<str>, Arc<[PairEntry]>>> = Arc::new(
-            topic_pairs
-                .into_iter()
-                .map(|(topic, pairs)| (topic, Arc::<[PairEntry]>::from(pairs)))
-                .collect(),
-        );
 
         let mut asset_ids: Vec<String> = asset_ids.into_iter().collect();
         asset_ids.sort();
+
+        let subscriptions: Vec<Arc<str>> = asset_ids
+            .iter()
+            .map(|token| Arc::<str>::from(token.as_str()))
+            .collect();
+
+        let topic_token_regs: Vec<TopicRegistration> = asset_ids
+            .iter()
+            .map(|token| TopicRegistration {
+                topic: Arc::<str>::from(token.as_str()),
+                tokens: Arc::<[String]>::from(vec![token.clone()]),
+            })
+            .collect();
+
+        let pairs_by_token: Arc<HashMap<Arc<str>, Arc<[PairEntry]>>> = Arc::new(
+            token_pairs
+                .into_iter()
+                .map(|(token, pairs)| (token, Arc::<[PairEntry]>::from(pairs)))
+                .collect(),
+        );
 
         let registration = Arc::new(StrategyRegistration {
             name: Arc::from("pair_arbitrage"),
@@ -112,7 +169,7 @@ impl PairArbitrageStrategy {
 
         Ok(Self {
             filters,
-            pairs_by_topic,
+            pairs_by_token,
             registration,
         })
     }
@@ -129,32 +186,29 @@ impl Strategy for PairArbitrageStrategy {
 
     fn spawn(
         self,
-        mut rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
+        market_subscriptions: StrategyMarketSubscriptions,
         order_gateway: crate::order_gateway::OrderGatewayHandle,
+        _position_read: crate::position_engine::PositionReadHandle,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let store = PriceStore::new();
             store.register(self.registration.related_tokens.as_ref());
+            let mut rx = spawn_market_subscription_mux(market_subscriptions, 256);
 
             while let Some(event) = rx.recv().await {
-                match event {
-                    StrategyEvent::Market(event) => {
-                        let updated = store.apply(event.asset_id.as_ref(), event.book);
-                        if updated.is_empty() {
-                            continue;
-                        }
-
-                        check_pairs(
-                            &store,
-                            &self.pairs_by_topic,
-                            &self.filters,
-                            &event.topic,
-                            &updated,
-                            &order_gateway,
-                        );
-                    }
-                    StrategyEvent::PositionChanged(_) => {}
+                let updated = store.apply(event.asset_id.as_ref(), event.book.as_ref().clone());
+                if updated.is_empty() {
+                    continue;
                 }
+
+                check_pairs(
+                    &store,
+                    &self.pairs_by_token,
+                    &self.filters,
+                    &event.asset_id,
+                    &updated,
+                    &order_gateway,
+                );
             }
         })
     }
@@ -166,13 +220,13 @@ fn price_to_decimal(price: u16) -> Decimal {
 
 fn check_pairs(
     store: &PriceStore,
-    pairs_by_topic: &HashMap<Arc<str>, Arc<[PairEntry]>>,
+    pairs_by_token: &HashMap<Arc<str>, Arc<[PairEntry]>>,
     filters: &Filters,
-    topic: &Arc<str>,
+    token: &Arc<str>,
     updated_assets: &[String],
     _order_gateway: &crate::order_gateway::OrderGatewayHandle,
 ) {
-    let Some(pairs) = pairs_by_topic.get(topic) else {
+    let Some(pairs) = pairs_by_token.get(token) else {
         return;
     };
 
@@ -226,7 +280,7 @@ fn check_pairs(
         let line = format!(
             "[ALERT] {} | topic={} | event_ts={} | 1-(ask0+ask1)={:.4}\n  token0={} bid={} ask={} ts={}\n  token1={} bid={} ask={} ts={}",
             Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            topic,
+            pair.topic,
             event_ts,
             gap,
             &p0.asset_id[..12],
@@ -277,12 +331,13 @@ mod gateway_migration_tests {
         store.apply("token-000000", clean_book(3_900, 4_000));
         store.apply("token-111111", clean_book(4_900, 5_000));
 
-        let topic = Arc::<str>::from("topic");
+        let token = Arc::<str>::from("token-000000");
+        let pair_topic = Arc::<str>::from("topic");
         let pairs = HashMap::from([(
-            topic.clone(),
+            token.clone(),
             Arc::<[PairEntry]>::from(vec![PairEntry {
                 tokens: ["token-000000".to_string(), "token-111111".to_string()],
-                topic: topic.clone(),
+                topic: pair_topic.clone(),
             }]),
         )]);
         let (gateway, mut gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
@@ -314,12 +369,19 @@ mod gateway_migration_tests {
             &store,
             &pairs,
             &filters(),
-            &topic,
+            &token,
             &["token-000000".to_string()],
             &gateway,
         );
 
         assert_eq!(strategy.registration().kind, StrategyKind::PairArbitrage);
+        assert_eq!(
+            strategy.registration().topics.as_ref(),
+            &[
+                Arc::<str>::from("token-000000"),
+                Arc::<str>::from("token-111111"),
+            ]
+        );
         assert!(gateway_rx.try_recv().is_err());
     }
 }

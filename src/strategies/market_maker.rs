@@ -1,16 +1,30 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::str::FromStr;
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{info, warn};
 
+use polymarket_client_sdk_v2::types::Decimal;
+
+use crate::order_gateway::{
+    GatewayOrderType, LocalOrderId, MarketId, OrderRequest, OrderSide, PlaceOrderRequest,
+    StrategyId, TimeInForce, TokenId,
+};
 use crate::storage::ActiveRewardMarketPoolEntry;
 use crate::strategy::{
-    CleanOrderbook, MarketEvent, Strategy, StrategyEvent, StrategyKind, StrategyRegistration,
-    TopicRegistration,
+    CleanOrderbook, MarketEvent, Strategy, StrategyKind, StrategyMarketSubscriptions,
+    StrategyRegistration, TopicRegistration, spawn_market_subscription_mux,
 };
 
-const MARKET_MAKER_TOPIC: &str = "market_maker";
 const MARKET_MAKER_NAME: &str = "market_maker";
+const PRICE_SCALE: u32 = 10_000;
+const MAX_INVENTORY_USD: u32 = 100;
+const OVERWEIGHT_RATIO_NUMERATOR: u32 = 7;
+const OVERWEIGHT_RATIO_DENOMINATOR: u32 = 10;
+const DEFAULT_MAX_SPREAD: &str = "0.03";
+const DEFAULT_TICK_SIZE: &str = "0.01";
+const DEFAULT_MIN_SIZE: u32 = 5;
+const DEFAULT_MAX_SKEW: &str = "0.01";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketMakerRule {
@@ -18,11 +32,188 @@ pub struct MarketMakerRule {
     pub market_slug: Option<String>,
     pub token1: String,
     pub token2: String,
+    pub rewards_max_spread: Option<String>,
+    pub rewards_min_size: Option<String>,
 }
 
 pub struct MarketMakerStrategy {
     rules: Arc<[MarketMakerRule]>,
     registration: Arc<StrategyRegistration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventorySide {
+    LongYes,
+    LongNo,
+    Flat,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryState {
+    pub yes_value_usd: Decimal,
+    pub no_value_usd: Decimal,
+    pub value_usd: Decimal,
+    pub ratio: Decimal,
+    pub side: InventorySide,
+    pub is_overweight: bool,
+}
+
+pub fn compute_inventory_state(
+    yes_token_balance: Decimal,
+    no_token_balance: Decimal,
+    yes_fair_mid: Decimal,
+    no_fair_mid: Decimal,
+    max_inventory_usd: Decimal,
+    overweight_ratio: Decimal,
+) -> InventoryState {
+    let yes_value_usd = yes_token_balance * yes_fair_mid;
+    let no_value_usd = no_token_balance * no_fair_mid;
+    let value_usd = yes_value_usd - no_value_usd;
+    let ratio = if max_inventory_usd > Decimal::ZERO {
+        clamp_decimal(value_usd / max_inventory_usd, -Decimal::ONE, Decimal::ONE)
+    } else {
+        Decimal::ZERO
+    };
+    let side = if value_usd > Decimal::ZERO {
+        InventorySide::LongYes
+    } else if value_usd < Decimal::ZERO {
+        InventorySide::LongNo
+    } else {
+        InventorySide::Flat
+    };
+
+    InventoryState {
+        yes_value_usd,
+        no_value_usd,
+        value_usd,
+        ratio,
+        side,
+        is_overweight: decimal_abs(ratio) > overweight_ratio,
+    }
+}
+
+fn clamp_decimal(value: Decimal, min: Decimal, max: Decimal) -> Decimal {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+fn decimal_abs(value: Decimal) -> Decimal {
+    if value < Decimal::ZERO { -value } else { value }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuoteSkewState {
+    pub yes_skew: Decimal,
+    pub no_skew: Decimal,
+}
+
+pub fn compute_quote_skew(inventory_ratio: Decimal, max_skew: Decimal) -> QuoteSkewState {
+    let ratio = clamp_decimal(inventory_ratio, -Decimal::ONE, Decimal::ONE);
+    let magnitude = ratio * ratio * max_skew;
+    if ratio > Decimal::ZERO {
+        QuoteSkewState {
+            yes_skew: Decimal::ZERO,
+            no_skew: magnitude,
+        }
+    } else if ratio < Decimal::ZERO {
+        QuoteSkewState {
+            yes_skew: magnitude,
+            no_skew: Decimal::ZERO,
+        }
+    } else {
+        QuoteSkewState {
+            yes_skew: Decimal::ZERO,
+            no_skew: Decimal::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetTokenSide {
+    Yes,
+    No,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetQuoteParams {
+    pub max_spread: Decimal,
+    pub tick_size: Decimal,
+    pub min_size: Decimal,
+    pub level_ratios: Vec<Decimal>,
+    pub level_sizes_usd: Vec<Decimal>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetQuote {
+    pub token_side: TargetTokenSide,
+    pub level: usize,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub size_usd: Decimal,
+    pub adjusted_mid: Decimal,
+    pub distance: Decimal,
+    pub raw_bid: Decimal,
+}
+
+pub fn compute_target_buy_quotes_for_token(
+    token_side: TargetTokenSide,
+    fair_mid: Decimal,
+    skew: Decimal,
+    is_overweight: bool,
+    params: &TargetQuoteParams,
+) -> Vec<TargetQuote> {
+    let adjusted_mid = fair_mid + skew;
+    let num_levels = if is_overweight { 2 } else { 3 };
+    params
+        .level_ratios
+        .iter()
+        .zip(params.level_sizes_usd.iter())
+        .take(num_levels)
+        .enumerate()
+        .filter_map(|(index, (&level_ratio, &size_usd))| {
+            let distance = params.max_spread * level_ratio;
+            let raw_bid = adjusted_mid - distance;
+            let price = floor_to_tick(raw_bid, params.tick_size);
+            if price <= Decimal::ZERO {
+                return None;
+            }
+            let size = decimal_max(size_usd / price, params.min_size);
+            Some(TargetQuote {
+                token_side,
+                level: index + 1,
+                price,
+                size,
+                size_usd,
+                adjusted_mid,
+                distance,
+                raw_bid,
+            })
+        })
+        .collect()
+}
+
+fn floor_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
+    if tick_size <= Decimal::ZERO {
+        return price;
+    }
+    (price / tick_size).floor() * tick_size
+}
+
+fn decimal_max(left: Decimal, right: Decimal) -> Decimal {
+    if left > right { left } else { right }
+}
+
+fn price_to_decimal(price: u16) -> Decimal {
+    Decimal::from(price) / Decimal::from(PRICE_SCALE)
+}
+
+fn size_to_decimal(size: u32) -> Decimal {
+    Decimal::from(size) / Decimal::from(PRICE_SCALE)
 }
 
 pub fn compute_fair_midpoint(book: &CleanOrderbook) -> u16 {
@@ -74,14 +265,214 @@ fn log_fair_midpoint(event: &MarketEvent) {
         target: "order",
         topic = %log_event.topic,
         asset_id = %log_event.asset_id,
-        best_bid_price = log_event.best_bid_price,
-        best_ask_price = log_event.best_ask_price,
-        best_bid_size = log_event.best_bid_size,
-        best_ask_size = log_event.best_ask_size,
-        fair_midpoint = log_event.fair_midpoint,
+        best_bid_price = %price_to_decimal(log_event.best_bid_price),
+        best_ask_price = %price_to_decimal(log_event.best_ask_price),
+        best_bid_size = %size_to_decimal(log_event.best_bid_size),
+        best_ask_size = %size_to_decimal(log_event.best_ask_size),
+        fair_midpoint = %price_to_decimal(log_event.fair_midpoint),
+        raw_best_bid_price = log_event.best_bid_price,
+        raw_best_ask_price = log_event.best_ask_price,
+        raw_best_bid_size = log_event.best_bid_size,
+        raw_best_ask_size = log_event.best_ask_size,
+        raw_fair_midpoint = log_event.fair_midpoint,
         timestamp_ms = log_event.timestamp_ms,
         "market_maker fair midpoint"
     );
+}
+
+fn current_inventory_state(
+    rule: &MarketMakerRule,
+    yes_book: &CleanOrderbook,
+    no_book: &CleanOrderbook,
+    position_read: &crate::position_engine::PositionReadHandle,
+) -> (Decimal, Decimal, Decimal, Decimal, InventoryState) {
+    let yes_balance = position_read
+        .get_entry(MARKET_MAKER_NAME, &rule.token1)
+        .map(|entry| entry.filled_position)
+        .unwrap_or(Decimal::ZERO);
+    let no_balance = position_read
+        .get_entry(MARKET_MAKER_NAME, &rule.token2)
+        .map(|entry| entry.filled_position)
+        .unwrap_or(Decimal::ZERO);
+    let yes_fair_mid = price_to_decimal(compute_fair_midpoint(yes_book));
+    let no_fair_mid = price_to_decimal(compute_fair_midpoint(no_book));
+    let inventory = compute_inventory_state(
+        yes_balance,
+        no_balance,
+        yes_fair_mid,
+        no_fair_mid,
+        Decimal::from(MAX_INVENTORY_USD),
+        Decimal::from(OVERWEIGHT_RATIO_NUMERATOR) / Decimal::from(OVERWEIGHT_RATIO_DENOMINATOR),
+    );
+
+    (
+        yes_balance,
+        no_balance,
+        yes_fair_mid,
+        no_fair_mid,
+        inventory,
+    )
+}
+
+fn log_inventory_state(
+    rule: &MarketMakerRule,
+    yes_balance: Decimal,
+    no_balance: Decimal,
+    yes_fair_mid: Decimal,
+    no_fair_mid: Decimal,
+    inventory: &InventoryState,
+) {
+    info!(
+        target: "order",
+        condition_id = %rule.condition_id,
+        market_slug = rule.market_slug.as_deref().unwrap_or(""),
+        yes_token = %rule.token1,
+        no_token = %rule.token2,
+        yes_balance = %yes_balance,
+        no_balance = %no_balance,
+        yes_fair_mid = %yes_fair_mid,
+        no_fair_mid = %no_fair_mid,
+        yes_value_usd = %inventory.yes_value_usd,
+        no_value_usd = %inventory.no_value_usd,
+        inventory_value_usd = %inventory.value_usd,
+        inventory_ratio = %inventory.ratio,
+        inventory_side = ?inventory.side,
+        is_overweight = inventory.is_overweight,
+        "market_maker inventory state"
+    );
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TargetBuyQuoteIntent {
+    token_id: String,
+    quote: TargetQuote,
+}
+
+fn target_buy_quote_intents(
+    rule: &MarketMakerRule,
+    yes_fair_mid: Decimal,
+    no_fair_mid: Decimal,
+    inventory: &InventoryState,
+) -> Vec<TargetBuyQuoteIntent> {
+    let params = target_quote_params(rule);
+    let skew = compute_quote_skew(inventory.ratio, parse_decimal(DEFAULT_MAX_SKEW));
+    let mut intents = Vec::new();
+
+    if inventory.ratio <= Decimal::ZERO {
+        intents.extend(
+            compute_target_buy_quotes_for_token(
+                TargetTokenSide::Yes,
+                yes_fair_mid,
+                skew.yes_skew,
+                inventory.is_overweight,
+                &params,
+            )
+            .into_iter()
+            .map(|quote| TargetBuyQuoteIntent {
+                token_id: rule.token1.clone(),
+                quote,
+            }),
+        );
+    }
+
+    if inventory.ratio >= Decimal::ZERO {
+        intents.extend(
+            compute_target_buy_quotes_for_token(
+                TargetTokenSide::No,
+                no_fair_mid,
+                skew.no_skew,
+                inventory.is_overweight,
+                &params,
+            )
+            .into_iter()
+            .map(|quote| TargetBuyQuoteIntent {
+                token_id: rule.token2.clone(),
+                quote,
+            }),
+        );
+    }
+
+    intents
+}
+
+fn target_quote_params(rule: &MarketMakerRule) -> TargetQuoteParams {
+    TargetQuoteParams {
+        max_spread: reward_max_spread(rule.rewards_max_spread.as_deref()),
+        tick_size: parse_decimal(DEFAULT_TICK_SIZE),
+        min_size: rule
+            .rewards_min_size
+            .as_deref()
+            .map(parse_decimal)
+            .unwrap_or_else(|| Decimal::from(DEFAULT_MIN_SIZE)),
+        level_ratios: vec![dec_percent(40), dec_percent(55), dec_percent(70)],
+        level_sizes_usd: vec![
+            Decimal::from(50u32),
+            Decimal::from(75u32),
+            Decimal::from(100u32),
+        ],
+    }
+}
+
+fn reward_max_spread(value: Option<&str>) -> Decimal {
+    let spread = value
+        .map(parse_decimal)
+        .unwrap_or_else(|| parse_decimal(DEFAULT_MAX_SPREAD));
+    if spread > Decimal::ONE {
+        spread / Decimal::from(100u32)
+    } else {
+        spread
+    }
+}
+
+fn parse_decimal(value: &str) -> Decimal {
+    Decimal::from_str(value).expect("market maker decimal parameter should parse")
+}
+
+fn dec_percent(value: u32) -> Decimal {
+    Decimal::from(value) / Decimal::from(100u32)
+}
+
+fn build_place_order_request(
+    rule: &MarketMakerRule,
+    intent: &TargetBuyQuoteIntent,
+    timestamp_ms: u64,
+) -> PlaceOrderRequest {
+    PlaceOrderRequest {
+        strategy_id: StrategyId::from(MARKET_MAKER_NAME),
+        market_id: (!rule.condition_id.is_empty())
+            .then(|| MarketId::from(rule.condition_id.clone())),
+        token_id: TokenId::from(intent.token_id.clone()),
+        local_id: LocalOrderId::from(local_order_id(rule, intent, timestamp_ms)),
+        side: OrderSide::Buy,
+        order_type: GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtc,
+        },
+        price: Some(intent.quote.price),
+        size: intent.quote.size,
+        reason: Some(Arc::from("market_maker_target_buy_quote")),
+    }
+}
+
+fn local_order_id(
+    rule: &MarketMakerRule,
+    intent: &TargetBuyQuoteIntent,
+    timestamp_ms: u64,
+) -> String {
+    format!(
+        "{MARKET_MAKER_NAME}:{}:{}:L{}:{timestamp_ms}",
+        rule.condition_id, intent.token_id, intent.quote.level
+    )
+}
+
+fn quote_dedupe_key(rule: &MarketMakerRule, intent: &TargetBuyQuoteIntent) -> String {
+    format!(
+        "{}:{}:L{}:{}:{}",
+        rule.condition_id,
+        intent.token_id,
+        intent.quote.level,
+        intent.quote.price,
+        intent.quote.size
+    )
 }
 
 impl MarketMakerStrategy {
@@ -109,6 +500,8 @@ impl MarketMakerStrategy {
                 market_slug: None,
                 token1: token1.to_string(),
                 token2: token2.to_string(),
+                rewards_max_spread: None,
+                rewards_min_size: None,
             });
         }
 
@@ -125,6 +518,8 @@ impl MarketMakerStrategy {
                 market_slug: entry.market_slug,
                 token1: entry.token1,
                 token2: entry.token2,
+                rewards_max_spread: entry.rewards_max_spread,
+                rewards_min_size: entry.rewards_min_size,
             })
             .collect::<Vec<_>>();
         Self::from_rules(rules)
@@ -142,15 +537,22 @@ impl MarketMakerStrategy {
         }
 
         let related_tokens = related_tokens.into_iter().collect::<Vec<_>>();
-        let topic = Arc::<str>::from(MARKET_MAKER_TOPIC);
+        let topics = related_tokens
+            .iter()
+            .map(|token| Arc::<str>::from(token.as_str()))
+            .collect::<Vec<_>>();
+        let topic_token_regs = related_tokens
+            .iter()
+            .map(|token| TopicRegistration {
+                topic: Arc::<str>::from(token.as_str()),
+                tokens: Arc::<[String]>::from(vec![token.clone()]),
+            })
+            .collect::<Vec<_>>();
         let registration = Arc::new(StrategyRegistration {
             name: Arc::from(MARKET_MAKER_NAME),
             kind: StrategyKind::MarketMaker,
-            topics: Arc::<[Arc<str>]>::from(vec![topic.clone()]),
-            topic_tokens: Arc::<[TopicRegistration]>::from(vec![TopicRegistration {
-                topic,
-                tokens: Arc::<[String]>::from(related_tokens.clone()),
-            }]),
+            topics: Arc::<[Arc<str>]>::from(topics),
+            topic_tokens: Arc::<[TopicRegistration]>::from(topic_token_regs),
             related_tokens: Arc::<[String]>::from(related_tokens),
         });
 
@@ -176,14 +578,65 @@ impl Strategy for MarketMakerStrategy {
 
     fn spawn(
         self,
-        mut rx: tokio::sync::mpsc::Receiver<StrategyEvent>,
-        _order_gateway: crate::order_gateway::OrderGatewayHandle,
+        market_subscriptions: StrategyMarketSubscriptions,
+        order_gateway: crate::order_gateway::OrderGatewayHandle,
+        position_read: crate::position_engine::PositionReadHandle,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let mut books: HashMap<String, Arc<CleanOrderbook>> = HashMap::new();
+            let mut submitted_quotes: BTreeSet<String> = BTreeSet::new();
+            let mut rx = spawn_market_subscription_mux(market_subscriptions, 256);
             while let Some(event) = rx.recv().await {
-                match event {
-                    StrategyEvent::Market(event) => log_fair_midpoint(&event),
-                    StrategyEvent::PositionChanged(_) => {}
+                log_fair_midpoint(&event);
+                books.insert(event.asset_id.to_string(), event.book.clone());
+                for rule in self.rules.iter() {
+                    let (Some(yes_book), Some(no_book)) =
+                        (books.get(&rule.token1), books.get(&rule.token2))
+                    else {
+                        continue;
+                    };
+                    let (yes_balance, no_balance, yes_fair_mid, no_fair_mid, inventory) =
+                        current_inventory_state(rule, yes_book, no_book, &position_read);
+                    log_inventory_state(
+                        rule,
+                        yes_balance,
+                        no_balance,
+                        yes_fair_mid,
+                        no_fair_mid,
+                        &inventory,
+                    );
+                    for intent in
+                        target_buy_quote_intents(rule, yes_fair_mid, no_fair_mid, &inventory)
+                    {
+                        let dedupe_key = quote_dedupe_key(rule, &intent);
+                        if submitted_quotes.contains(&dedupe_key) {
+                            continue;
+                        }
+                        let request =
+                            build_place_order_request(rule, &intent, event.book.timestamp_ms);
+                        match order_gateway.try_send(OrderRequest::Place(request)) {
+                            Ok(()) => {
+                                submitted_quotes.insert(dedupe_key);
+                                info!(
+                                    target: "order",
+                                    condition_id = %rule.condition_id,
+                                    token_id = %intent.token_id,
+                                    level = intent.quote.level,
+                                    price = %intent.quote.price,
+                                    size = %intent.quote.size,
+                                    "market_maker 模拟发单请求已投递"
+                                );
+                            }
+                            Err(error) => warn!(
+                                target: "order",
+                                condition_id = %rule.condition_id,
+                                token_id = %intent.token_id,
+                                level = intent.quote.level,
+                                error = ?error,
+                                "market_maker 模拟发单请求投递失败"
+                            ),
+                        }
+                    }
                 }
             }
         })
@@ -223,8 +676,8 @@ mod tests {
             token2: token2.to_string(),
             tokens_json: "[]".to_string(),
             market_competitiveness: None,
-            rewards_min_size: None,
-            rewards_max_spread: None,
+            rewards_min_size: Some("5".to_string()),
+            rewards_max_spread: Some("3".to_string()),
             market_daily_reward: None,
             volume_24hr_clob: None,
             volume_24hr: None,
@@ -239,6 +692,335 @@ mod tests {
             liquidity_reward_halted_at_ms: None,
             liquidity_reward_halt_reason: None,
             liquidity_reward_halted_pool_version: None,
+        }
+    }
+
+    fn dec(numerator: u32, denominator: u32) -> Decimal {
+        Decimal::from(numerator) / Decimal::from(denominator)
+    }
+
+    #[test]
+    fn inventory_state_values_yes_and_no_with_separate_fair_midpoints() {
+        let state = compute_inventory_state(
+            Decimal::from(100u32),
+            Decimal::from(50u32),
+            dec(4, 10),
+            dec(6, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        assert_eq!(state.yes_value_usd, Decimal::from(40u32));
+        assert_eq!(state.no_value_usd, Decimal::from(30u32));
+        assert_eq!(state.value_usd, Decimal::from(10u32));
+        assert_eq!(state.ratio, dec(1, 10));
+        assert_eq!(state.side, InventorySide::LongYes);
+        assert!(!state.is_overweight);
+    }
+
+    #[test]
+    fn inventory_state_uses_no_fair_midpoint_for_no_inventory() {
+        let state = compute_inventory_state(
+            Decimal::ZERO,
+            Decimal::from(200u32),
+            dec(4, 10),
+            dec(6, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        assert_eq!(state.yes_value_usd, Decimal::ZERO);
+        assert_eq!(state.no_value_usd, Decimal::from(120u32));
+        assert_eq!(state.value_usd, Decimal::from(-120));
+        assert_eq!(state.ratio, -Decimal::ONE);
+        assert_eq!(state.side, InventorySide::LongNo);
+        assert!(state.is_overweight);
+    }
+
+    #[test]
+    fn inventory_state_is_flat_when_yes_and_no_values_match() {
+        let state = compute_inventory_state(
+            Decimal::from(100u32),
+            Decimal::from(50u32),
+            dec(3, 10),
+            dec(6, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        assert_eq!(state.yes_value_usd, Decimal::from(30u32));
+        assert_eq!(state.no_value_usd, Decimal::from(30u32));
+        assert_eq!(state.value_usd, Decimal::ZERO);
+        assert_eq!(state.ratio, Decimal::ZERO);
+        assert_eq!(state.side, InventorySide::Flat);
+        assert!(!state.is_overweight);
+    }
+
+    #[test]
+    fn quote_skew_only_moves_no_up_when_inventory_ratio_is_positive() {
+        let skew = compute_quote_skew(dec(4, 10), dec(1, 100));
+
+        assert_eq!(skew.yes_skew, Decimal::ZERO);
+        assert_eq!(skew.no_skew, dec(16, 10000));
+    }
+
+    #[test]
+    fn quote_skew_only_moves_yes_up_when_inventory_ratio_is_negative() {
+        let skew = compute_quote_skew(-dec(4, 10), dec(1, 100));
+
+        assert_eq!(skew.yes_skew, dec(16, 10000));
+        assert_eq!(skew.no_skew, Decimal::ZERO);
+    }
+
+    #[test]
+    fn quote_skew_clamps_inventory_ratio_before_squaring() {
+        let long_yes = compute_quote_skew(Decimal::from(2u32), dec(1, 100));
+        let long_no = compute_quote_skew(Decimal::from(-2), dec(1, 100));
+
+        assert_eq!(long_yes.yes_skew, Decimal::ZERO);
+        assert_eq!(long_yes.no_skew, dec(1, 100));
+        assert_eq!(long_no.yes_skew, dec(1, 100));
+        assert_eq!(long_no.no_skew, Decimal::ZERO);
+    }
+
+    #[test]
+    fn simulate_quote_skew_cases() {
+        let max_skew = dec(1, 100);
+        let yes_fair_mid = dec(5, 10);
+        let no_fair_mid = dec(5, 10);
+        let ratios = [
+            -Decimal::ONE,
+            -dec(7, 10),
+            -dec(4, 10),
+            Decimal::ZERO,
+            dec(4, 10),
+            dec(7, 10),
+            Decimal::ONE,
+        ];
+
+        for ratio in ratios {
+            let ratio_abs = decimal_abs(ratio);
+            let ratio_squared = ratio * ratio;
+            let skew = compute_quote_skew(ratio, max_skew);
+            let yes_adjusted_mid = yes_fair_mid + skew.yes_skew;
+            let no_adjusted_mid = no_fair_mid + skew.no_skew;
+            let inventory_side = if ratio > Decimal::ZERO {
+                "YES 偏多：只让 NO 更容易买到"
+            } else if ratio < Decimal::ZERO {
+                "NO 偏多：只让 YES 更容易买到"
+            } else {
+                "库存平衡"
+            };
+
+            println!(
+                "\n库存偏斜 ratio = {}\n  {}\n  abs(ratio) = {}\n  ratio^2 = {} * {} = {}\n  max_skew = {}\n  YES skew = {}\n  NO skew = {}\n  YES fair_mid 示例 = {}\n  YES adjusted_mid = {} + {} = {}\n  NO fair_mid 示例 = {}\n  NO adjusted_mid = {} + {} = {}",
+                ratio,
+                inventory_side,
+                ratio_abs,
+                ratio,
+                ratio,
+                ratio_squared,
+                max_skew,
+                skew.yes_skew,
+                skew.no_skew,
+                yes_fair_mid,
+                yes_fair_mid,
+                skew.yes_skew,
+                yes_adjusted_mid,
+                no_fair_mid,
+                no_fair_mid,
+                skew.no_skew,
+                no_adjusted_mid,
+            );
+        }
+    }
+
+    #[test]
+    fn simulate_target_buy_quote_cases() {
+        let params = TargetQuoteParams {
+            max_spread: dec(3, 100),
+            tick_size: dec(1, 100),
+            min_size: Decimal::from(5u32),
+            level_ratios: vec![dec(40, 100), dec(55, 100), dec(70, 100)],
+            level_sizes_usd: vec![
+                Decimal::from(50u32),
+                Decimal::from(75u32),
+                Decimal::from(100u32),
+            ],
+        };
+        let max_skew = dec(1, 100);
+        let yes_fair_mid = dec(5, 10);
+        let no_fair_mid = dec(5, 10);
+        let cases = [
+            ("NO 满仓：只买 YES", -Decimal::ONE, true),
+            ("NO 偏多：只买 YES", -dec(7, 10), false),
+            ("库存平衡：YES/NO 都正常买", Decimal::ZERO, false),
+            ("YES 偏多：只买 NO", dec(7, 10), false),
+            ("YES 满仓：只买 NO", Decimal::ONE, true),
+        ];
+
+        for (name, ratio, is_overweight) in cases {
+            let skew = compute_quote_skew(ratio, max_skew);
+            let mut quote_groups = Vec::new();
+            if ratio <= Decimal::ZERO {
+                quote_groups.push((
+                    TargetTokenSide::Yes,
+                    yes_fair_mid,
+                    skew.yes_skew,
+                    compute_target_buy_quotes_for_token(
+                        TargetTokenSide::Yes,
+                        yes_fair_mid,
+                        skew.yes_skew,
+                        is_overweight,
+                        &params,
+                    ),
+                ));
+            }
+            if ratio >= Decimal::ZERO {
+                quote_groups.push((
+                    TargetTokenSide::No,
+                    no_fair_mid,
+                    skew.no_skew,
+                    compute_target_buy_quotes_for_token(
+                        TargetTokenSide::No,
+                        no_fair_mid,
+                        skew.no_skew,
+                        is_overweight,
+                        &params,
+                    ),
+                ));
+            }
+
+            println!(
+                "\n场景: {}\n  inventory_ratio = {}\n  is_overweight = {}\n  max_spread(单边奖励距离) = {}\n  max_skew = {}\n  yes_skew = {}\n  no_skew = {}",
+                name,
+                ratio,
+                is_overweight,
+                params.max_spread,
+                max_skew,
+                skew.yes_skew,
+                skew.no_skew,
+            );
+
+            for (token_side, fair_mid, token_skew, quotes) in quote_groups {
+                println!(
+                    "  {:?}: fair_mid={} adjusted_mid={} + {} = {}",
+                    token_side,
+                    fair_mid,
+                    fair_mid,
+                    token_skew,
+                    fair_mid + token_skew,
+                );
+                for quote in quotes {
+                    println!(
+                        "    L{} BUY: distance=max_spread*ratio={} raw_bid={} price=floor_tick({})={} size=max({}/{}, min {})={}",
+                        quote.level,
+                        quote.distance,
+                        quote.raw_bid,
+                        quote.raw_bid,
+                        quote.price,
+                        quote.size_usd,
+                        quote.price,
+                        params.min_size,
+                        quote.size,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simulate_inventory_skew_cases() {
+        struct Case {
+            name: &'static str,
+            yes_balance: Decimal,
+            no_balance: Decimal,
+            yes_fair_mid: Decimal,
+            no_fair_mid: Decimal,
+        }
+
+        let max_inventory_usd = Decimal::from(100u32);
+        let overweight_ratio = dec(7, 10);
+        let cases = [
+            Case {
+                name: "空仓",
+                yes_balance: Decimal::ZERO,
+                no_balance: Decimal::ZERO,
+                yes_fair_mid: dec(4, 10),
+                no_fair_mid: dec(6, 10),
+            },
+            Case {
+                name: "YES 偏多但未超限",
+                yes_balance: Decimal::from(100u32),
+                no_balance: Decimal::ZERO,
+                yes_fair_mid: dec(4, 10),
+                no_fair_mid: dec(6, 10),
+            },
+            Case {
+                name: "NO 偏多但未超限",
+                yes_balance: Decimal::ZERO,
+                no_balance: Decimal::from(80u32),
+                yes_fair_mid: dec(4, 10),
+                no_fair_mid: dec(5, 10),
+            },
+            Case {
+                name: "YES 超重",
+                yes_balance: Decimal::from(250u32),
+                no_balance: Decimal::ZERO,
+                yes_fair_mid: dec(4, 10),
+                no_fair_mid: dec(6, 10),
+            },
+            Case {
+                name: "NO 超重",
+                yes_balance: Decimal::ZERO,
+                no_balance: Decimal::from(250u32),
+                yes_fair_mid: dec(6, 10),
+                no_fair_mid: dec(4, 10),
+            },
+            Case {
+                name: "YES/NO 价值抵消",
+                yes_balance: Decimal::from(100u32),
+                no_balance: Decimal::from(50u32),
+                yes_fair_mid: dec(3, 10),
+                no_fair_mid: dec(6, 10),
+            },
+        ];
+
+        for case in cases {
+            let state = compute_inventory_state(
+                case.yes_balance,
+                case.no_balance,
+                case.yes_fair_mid,
+                case.no_fair_mid,
+                max_inventory_usd,
+                overweight_ratio,
+            );
+            let raw_ratio = if max_inventory_usd > Decimal::ZERO {
+                state.value_usd / max_inventory_usd
+            } else {
+                Decimal::ZERO
+            };
+
+            println!(
+                "\n场景: {}\n  YES价值 = {} * {} = {} USD\n  NO价值  = {} * {} = {} USD\n  净库存价值 = {} - {} = {} USD\n  原始偏斜比例 = {} / {} = {}\n  截断后偏斜比例 = {}\n  方向 = {:?}\n  是否超重 = {} (阈值: {})",
+                case.name,
+                case.yes_balance,
+                case.yes_fair_mid,
+                state.yes_value_usd,
+                case.no_balance,
+                case.no_fair_mid,
+                state.no_value_usd,
+                state.yes_value_usd,
+                state.no_value_usd,
+                state.value_usd,
+                state.value_usd,
+                max_inventory_usd,
+                raw_ratio,
+                state.ratio,
+                state.side,
+                state.is_overweight,
+                overweight_ratio,
+            );
         }
     }
 
@@ -342,7 +1124,11 @@ mod tests {
         );
         assert_eq!(
             registration.topics.as_ref(),
-            &[Arc::<str>::from("market_maker")]
+            &[
+                Arc::<str>::from("token-a1"),
+                Arc::<str>::from("token-b1"),
+                Arc::<str>::from("token-b2"),
+            ]
         );
         assert_eq!(
             registration.related_tokens.as_ref(),
@@ -352,26 +1138,27 @@ mod tests {
                 "token-b2".to_string(),
             ]
         );
-        assert_eq!(registration.topic_tokens.len(), 1);
-        assert_eq!(registration.topic_tokens[0].topic.as_ref(), "market_maker");
-        assert_eq!(
-            registration.topic_tokens[0].tokens.as_ref(),
-            registration.related_tokens.as_ref()
-        );
+        let regs = registration.topic_tokens.as_ref();
+        assert_eq!(regs.len(), 3);
+        for token in registration.related_tokens.iter() {
+            assert!(regs.iter().any(|reg| {
+                reg.topic.as_ref() == token.as_str() && reg.tokens.as_ref() == &[token.clone()]
+            }));
+        }
     }
 
     #[test]
     fn fair_midpoint_log_event_uses_market_event_book() {
         let event = MarketEvent {
-            topic: Arc::from("market_maker"),
+            topic: Arc::from("maker-token-1"),
             asset_id: Arc::from("maker-token-1"),
-            book: clean_book(40, 60, 300, 100),
+            book: Arc::new(clean_book(40, 60, 300, 100)),
         };
 
         let log_event = fair_midpoint_log_event(&event);
 
         assert_eq!(log_event.asset_id.as_ref(), "maker-token-1");
-        assert_eq!(log_event.topic.as_ref(), "market_maker");
+        assert_eq!(log_event.topic.as_ref(), "maker-token-1");
         assert_eq!(log_event.best_bid_price, 40);
         assert_eq!(log_event.best_ask_price, 60);
         assert_eq!(log_event.best_bid_size, 300);
@@ -381,7 +1168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_consumes_events_without_emitting_order_signals() {
+    async fn spawn_emits_buy_orders_to_gateway() {
         let strategy = MarketMakerStrategy::from_pool_entries(vec![active_entry(
             "0xabc",
             "maker-token-1",
@@ -389,24 +1176,72 @@ mod tests {
         )])
         .expect("market maker should build")
         .expect("non-empty pool should create strategy");
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
-        let (gateway_handle, _gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
-            8,
-            crate::order_gateway::GatewayPhase::Live,
-        );
+        let (topic1_tx, topic1_rx) = tokio::sync::broadcast::channel(8);
+        let (topic2_tx, topic2_rx) = tokio::sync::broadcast::channel(8);
+        let subscriptions = StrategyMarketSubscriptions {
+            topics: vec![
+                (Arc::from("maker-token-1"), topic1_rx),
+                (Arc::from("maker-token-2"), topic2_rx),
+            ],
+        };
+        let (gateway_handle, mut gateway_rx) =
+            crate::order_gateway::OrderGatewayHandle::new_for_test(
+                8,
+                crate::order_gateway::GatewayPhase::Live,
+            );
+        let (_ingestor, ingest_handle, _persist_rx) =
+            crate::position_engine::PositionIngestor::new_for_test(8, 8);
 
-        let handle = strategy.spawn(event_rx, gateway_handle);
-        event_tx
-            .send(StrategyEvent::Market(MarketEvent {
-                topic: Arc::from("market_maker"),
+        let handle = strategy.spawn(subscriptions, gateway_handle, ingest_handle.read_handle());
+        topic1_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-1"),
                 asset_id: Arc::from("maker-token-1"),
-                book: clean_book(40, 60, 300, 100),
-            }))
-            .await
-            .expect("market event should send");
-        drop(event_tx);
+                book: Arc::new(clean_book(4_000, 6_000, 300, 100)),
+            })
+            .expect("yes market event should send");
+        topic2_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-2"),
+                asset_id: Arc::from("maker-token-2"),
+                book: Arc::new(clean_book(4_000, 6_000, 100, 300)),
+            })
+            .expect("no market event should send");
+        drop(topic1_tx);
+        drop(topic2_tx);
         handle
             .await
             .expect("market maker task should exit when event channel closes");
+
+        let mut orders = Vec::new();
+        while let Ok(request) = gateway_rx.try_recv() {
+            orders.push(request);
+        }
+
+        assert_eq!(orders.len(), 6);
+        for request in orders {
+            let crate::order_gateway::OrderRequest::Place(request) = request else {
+                panic!("market maker should only place orders");
+            };
+            assert_eq!(request.strategy_id.as_str(), "market_maker");
+            assert_eq!(request.market_id.as_ref().unwrap().as_str(), "0xabc");
+            assert!(
+                request.token_id.as_str() == "maker-token-1"
+                    || request.token_id.as_str() == "maker-token-2"
+            );
+            assert_eq!(request.side, crate::order_gateway::OrderSide::Buy);
+            assert!(matches!(
+                request.order_type,
+                crate::order_gateway::GatewayOrderType::Limit {
+                    time_in_force: crate::order_gateway::TimeInForce::Gtc
+                }
+            ));
+            assert!(request.price.unwrap() > Decimal::ZERO);
+            assert!(request.size >= Decimal::from(5u32));
+            assert_eq!(
+                request.reason.as_deref(),
+                Some("market_maker_target_buy_quote")
+            );
+        }
     }
 }

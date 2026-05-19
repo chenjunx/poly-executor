@@ -9,8 +9,9 @@ use polymarket_client_sdk_v2::types::Decimal;
 use tracing::{info, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
-use crate::config::{AccountConfig, AuthConfig};
-use crate::storage::MarketStore;
+use crate::config::AuthConfig;
+
+pub const ACCOUNT_MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountFundSnapshot {
@@ -19,8 +20,37 @@ pub struct AccountFundSnapshot {
     pub allowances_json: String,
 }
 
-pub async fn run(auth: AuthConfig, config: AccountConfig, store: MarketStore) {
-    let refresh_interval = Duration::from_secs(config.refresh_interval_secs.max(1));
+#[derive(Debug, Clone)]
+pub struct AccountReadHandle {
+    rx: tokio::sync::watch::Receiver<Option<AccountFundSnapshot>>,
+}
+
+impl AccountReadHandle {
+    pub fn latest(&self) -> Option<AccountFundSnapshot> {
+        self.rx.borrow().clone()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<AccountFundSnapshot>> {
+        self.rx.clone()
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> (
+        Self,
+        tokio::sync::watch::Sender<Option<AccountFundSnapshot>>,
+    ) {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        (Self { rx }, tx)
+    }
+}
+
+pub fn spawn_account_monitor(auth: AuthConfig) -> AccountReadHandle {
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(run(auth, tx));
+    AccountReadHandle { rx }
+}
+
+async fn run(auth: AuthConfig, tx: tokio::sync::watch::Sender<Option<AccountFundSnapshot>>) {
     let client = match build_authenticated_clob_client(&auth).await {
         Ok(client) => client,
         Err(error) => {
@@ -39,21 +69,13 @@ pub async fn run(auth: AuthConfig, config: AccountConfig, store: MarketStore) {
                     allowances_json = %snapshot.allowances_json,
                     "account_monitor 账户资金快照同步完成"
                 );
-                if config.store_enabled {
-                    if let Err(error) = store.insert_account_fund_snapshot(
-                        snapshot.checked_at_ms,
-                        &snapshot.balance.to_string(),
-                        &snapshot.allowances_json,
-                    ) {
-                        warn!(target: "order", error = %error, "account_monitor 账户资金快照入库失败");
-                    }
-                }
+                tx.send_replace(Some(snapshot));
             }
             Err(error) => {
                 warn!(target: "order", error = %error, "account_monitor 查询账户资金快照失败");
             }
         }
-        tokio::time::sleep(refresh_interval).await;
+        tokio::time::sleep(ACCOUNT_MONITOR_POLL_INTERVAL).await;
     }
 }
 
@@ -99,6 +121,45 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    #[test]
+    fn account_read_handle_returns_latest_snapshot() {
+        let (handle, tx) = AccountReadHandle::new_for_test();
+        assert!(handle.latest().is_none());
+
+        let snapshot = AccountFundSnapshot {
+            checked_at_ms: 42,
+            balance: Decimal::from(100u32),
+            allowances_json: r#"{"0xabc":"123"}"#.to_string(),
+        };
+        tx.send_replace(Some(snapshot.clone()));
+
+        assert_eq!(handle.latest(), Some(snapshot));
+    }
+
+    #[tokio::test]
+    async fn account_read_handle_subscriber_receives_latest_snapshot() {
+        let (handle, tx) = AccountReadHandle::new_for_test();
+        let mut subscriber = handle.subscribe();
+
+        let snapshot = AccountFundSnapshot {
+            checked_at_ms: 100,
+            balance: Decimal::from(200u32),
+            allowances_json: r#"{"0xdef":"456"}"#.to_string(),
+        };
+        tx.send_replace(Some(snapshot.clone()));
+
+        subscriber
+            .changed()
+            .await
+            .expect("watch sender should stay alive");
+        assert_eq!(subscriber.borrow().clone(), Some(snapshot));
+    }
+
+    #[test]
+    fn account_monitor_poll_interval_is_one_second() {
+        assert_eq!(ACCOUNT_MONITOR_POLL_INTERVAL, Duration::from_secs(1));
+    }
 
     #[test]
     fn snapshot_from_balance_response_serializes_allowances_as_json() {

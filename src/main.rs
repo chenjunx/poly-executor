@@ -1,21 +1,21 @@
 mod account;
 mod clob_client;
 mod config;
-mod dispatcher;
 mod logging;
 mod market;
-mod monitor;
 mod notification;
+#[path = "order/order_gateway.rs"]
 mod order_gateway;
+#[path = "order/order_ws.rs"]
 mod order_ws;
-mod polymarket_rewards;
+#[path = "position/position_engine.rs"]
 mod position_engine;
-mod price_store;
 mod proxy_ws;
-mod recovery;
+#[path = "risk/risk.rs"]
 mod risk;
 mod storage;
 mod strategies;
+#[path = "strategies/strategy.rs"]
 mod strategy;
 mod tick_size;
 
@@ -26,17 +26,15 @@ use std::sync::Arc;
 use polymarket_client_sdk_v2::types::Decimal;
 use tracing::info;
 
-use config::{AccountConfig, AppConfig, load_app_config};
-use dispatcher::Dispatcher;
+use config::{AppConfig, load_app_config};
 use order_gateway::{OrderGateway, OrderGatewayConfig};
-use recovery::{RecoveryArtifacts, RecoveryCoordinator};
 use risk::{GatewayRiskEngine, NoopMarketRiskReader, RiskConfig, StrategyKindRegistry};
 use storage::{MarketStore, OrderStore};
 use strategies::market_maker::MarketMakerStrategy;
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
-    CleanOrderbook, Filters, Strategy, StrategyEvent, StrategyHandle, StrategyRegistration,
-    build_token_topics, merge_topic_tokens,
+    CleanOrderbook, Filters, Strategy, StrategyRegistration, build_token_topics,
+    build_topic_broadcasts, merge_topic_tokens, subscribe_strategy_topics,
 };
 
 type WsMessage = polymarket_client_sdk_v2::clob::ws::types::response::WsMessage;
@@ -44,10 +42,11 @@ type TopicTokens = Arc<HashMap<Arc<str>, Vec<String>>>;
 type TokenTopics = Arc<HashMap<String, Arc<[Arc<str>]>>>;
 type WsSender = tokio::sync::mpsc::Sender<WsMessage>;
 type WsReceiver = tokio::sync::mpsc::Receiver<WsMessage>;
-type StrategySender = tokio::sync::mpsc::Sender<StrategyEvent>;
-type StrategyReceiver = tokio::sync::mpsc::Receiver<StrategyEvent>;
+type TopicBroadcasts =
+    Arc<HashMap<Arc<str>, tokio::sync::broadcast::Sender<strategy::MarketEvent>>>;
 type TickRecorderSender = tokio::sync::mpsc::Sender<(Arc<str>, CleanOrderbook)>;
 type RawRecorderSender = tokio::sync::mpsc::Sender<market::RawStoreEvent>;
+type MarketFirehoseSender = tokio::sync::mpsc::Sender<strategy::MarketAssetEvent>;
 
 struct StrategyBootstrap {
     pair_strategy: PairArbitrageStrategy,
@@ -72,7 +71,9 @@ struct MarketRuntime {
     token_topics: TokenTopics,
     ws_tx: WsSender,
     ws_rx: WsReceiver,
-    strategy_tx: StrategySender,
+    firehose_tx: MarketFirehoseSender,
+    topic_txs: TopicBroadcasts,
+    book_publisher: market::MarketBookPublisher,
     recorder_senders: RecorderSenders,
     tick_size_map: tick_size::TickSizeMap,
     proxy: Option<proxy_ws::Proxy>,
@@ -88,10 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let _log_guards = logging::init_logging(&log_path)?;
     let (order_store, market_store) = init_stores(&app_config)?;
 
-    let recovery = recover_orders(&app_config, order_store.clone()).await?;
-    let order_correlations = recovery.order_correlations;
-    let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
-    spawn_account_monitor(&app_config, market_store.clone());
+    let _account_read_handle = account::spawn_account_monitor(app_config.auth.clone());
     let strategy_bootstrap = build_strategies(&app_config, market_store.clone()).await?;
     let StrategyBootstrap {
         pair_strategy,
@@ -107,13 +105,16 @@ async fn main() -> anyhow::Result<()> {
     info!("正在连接 Polymarket WebSocket...");
     info!(routing.token_count, "开始监听 token 价格变动");
 
-    // ws_tx 承载公开行情；strategy_tx 承载行情、持仓、成交和奖励池事件。
+    // ws_tx 承载公开行情 raw message。
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * routing.topic_tokens.len().max(1));
-    let (strategy_tx, strategy_rx) = tokio::sync::mpsc::channel(1024);
+    let (firehose_tx, firehose_rx) = tokio::sync::mpsc::channel(16_384);
+    let topic_txs = Arc::new(build_topic_broadcasts(routing.topic_tokens.as_ref(), 1024));
+    let book_publisher = market::MarketBookPublisher::new();
     let position_keeper = position_engine::recover_keeper(&order_store)?;
     let (position_ingestor, position_ingest_handle, position_persist_rx) =
         position_engine::PositionIngestor::new(16_384, 16_384, position_keeper);
     let position_read_handle = position_ingest_handle.read_handle();
+    let strategy_position_read_handle = position_read_handle.clone();
     let position_status_handle = position_ingest_handle.status_handle();
     let risk_engine = GatewayRiskEngine::new(
         RiskConfig::default(),
@@ -129,7 +130,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let (mut order_gateway, order_gateway_handle, order_event_ring, order_observation_tx) =
         OrderGateway::new(gateway_config, Arc::new(risk_engine), order_store.clone());
-    tokio::spawn(position_ingestor.run_with_strategy_events(strategy_tx.clone()));
+    let pending_settlement_rx = order_gateway.subscribe_pending_settlements();
+    tokio::spawn(position_ingestor.run_until_input_closed());
     tokio::spawn(position_engine::run_persist_task(
         order_store.clone(),
         position_persist_rx,
@@ -139,8 +141,8 @@ async fn main() -> anyhow::Result<()> {
         position_ingest_handle,
     ));
     order_gateway
-        .complete_recovery(0, 0, 0)
-        .expect("order gateway recovery completion should publish");
+        .complete_startup_recovery()
+        .expect("order gateway startup recovery should complete");
     tokio::spawn(order_gateway.run_until_request_channel_closed());
 
     spawn_strategy_tasks(
@@ -148,8 +150,10 @@ async fn main() -> anyhow::Result<()> {
         pair_registration,
         market_maker,
         order_gateway_handle,
-        strategy_rx,
-    );
+        strategy_position_read_handle,
+        topic_txs.as_ref(),
+    )?;
+    tokio::spawn(drain_market_firehose(firehose_rx));
     let recorder_senders = spawn_recorders(&app_config, market_store.clone());
     spawn_market_and_positions(
         &app_config,
@@ -158,39 +162,29 @@ async fn main() -> anyhow::Result<()> {
             token_topics: routing.token_topics,
             ws_tx,
             ws_rx,
-            strategy_tx: strategy_tx.clone(),
+            firehose_tx,
+            topic_txs,
+            book_publisher,
             recorder_senders,
             tick_size_map,
             proxy,
         },
     );
     if !app_config.simulation.enabled {
-        tokio::spawn(order_ws::run(
+        OrderGateway::spawn_private_order_ws(
             app_config.auth.clone(),
-            order_correlations,
             order_store,
+            order_observation_tx.clone(),
+        );
+        OrderGateway::spawn_settlement_activity_poller(
+            order_gateway::DataApiSettlementActivityReader::new(app_config.auth.funder.parse()?),
+            pending_settlement_rx,
             order_observation_tx,
-            notifier,
-        ));
+        );
     }
 
     futures::future::pending::<()>().await;
     Ok(())
-}
-
-async fn recover_orders(
-    app_config: &AppConfig,
-    order_store: OrderStore,
-) -> anyhow::Result<RecoveryArtifacts> {
-    // 启动恢复先对账本地 active 订单和远端状态，再把可恢复状态交给策略。
-    RecoveryCoordinator::new(
-        order_store,
-        app_config.auth.clone(),
-        app_config.simulation.enabled,
-    )
-    .recover()
-    .await
-    .map_err(|e| anyhow::anyhow!("启动恢复订单失败: {e:#}"))
 }
 
 async fn build_strategies(
@@ -199,7 +193,7 @@ async fn build_strategies(
 ) -> anyhow::Result<StrategyBootstrap> {
     let pair_strategy = build_pair_strategy(app_config)?;
     let pair_registration = pair_strategy.registration().clone();
-    let market_maker = build_market_maker_strategy(&market_store)?;
+    let market_maker = build_market_maker_strategy(app_config, &market_store)?;
     let tick_size_map = tick_size::new_tick_size_map();
 
     Ok(StrategyBootstrap {
@@ -227,6 +221,7 @@ fn build_pair_strategy(app_config: &AppConfig) -> anyhow::Result<PairArbitrageSt
 }
 
 fn build_market_maker_strategy(
+    _app_config: &AppConfig,
     _market_store: &MarketStore,
 ) -> anyhow::Result<Option<MarketMakerStrategy>> {
     let csv_file = resolve_path("market_maker.csv");
@@ -289,64 +284,32 @@ fn build_routing(registrations: &[StrategyRegistration]) -> RoutingBootstrap {
     }
 }
 
-fn account_monitor_enabled(config: &AccountConfig) -> bool {
-    config.enabled
-}
-
-fn spawn_account_monitor(app_config: &AppConfig, market_store: MarketStore) {
-    if !account_monitor_enabled(&app_config.account) {
-        return;
-    }
-
-    tokio::spawn(account::run(
-        app_config.auth.clone(),
-        app_config.account.clone(),
-        market_store,
-    ));
-}
-
-fn market_maker_strategy_handle(
-    market_maker: &MarketMakerStrategy,
-) -> Option<(StrategyHandle, tokio::sync::mpsc::Receiver<StrategyEvent>)> {
-    let registration = market_maker.registration().clone();
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
-    Some((
-        StrategyHandle {
-            name: registration.name.clone(),
-            topics: registration.topics.clone(),
-            related_tokens: registration.related_tokens.clone(),
-            tx,
-        },
-        rx,
-    ))
-}
-
 fn spawn_strategy_tasks(
     pair_strategy: PairArbitrageStrategy,
     pair_registration: StrategyRegistration,
     market_maker: Option<MarketMakerStrategy>,
     order_gateway_handle: order_gateway::OrderGatewayHandle,
-    strategy_rx: StrategyReceiver,
-) {
-    let (pair_tx, pair_rx) = tokio::sync::mpsc::channel(256);
-    let mut strategy_handles = vec![StrategyHandle {
-        name: pair_registration.name.clone(),
-        topics: pair_registration.topics.clone(),
-        related_tokens: pair_registration.related_tokens.clone(),
-        tx: pair_tx,
-    }];
-
-    pair_strategy.spawn(pair_rx, order_gateway_handle.clone());
+    position_read: position_engine::PositionReadHandle,
+    topic_txs: &HashMap<Arc<str>, tokio::sync::broadcast::Sender<strategy::MarketEvent>>,
+) -> anyhow::Result<()> {
+    let pair_subscriptions = subscribe_strategy_topics(&pair_registration, topic_txs)?;
+    pair_strategy.spawn(
+        pair_subscriptions,
+        order_gateway_handle.clone(),
+        position_read.clone(),
+    );
 
     if let Some(market_maker_strategy) = market_maker {
-        if let Some((handle, market_maker_rx)) =
-            market_maker_strategy_handle(&market_maker_strategy)
-        {
-            strategy_handles.push(handle);
-            market_maker_strategy.spawn(market_maker_rx, order_gateway_handle.clone());
-        }
+        let market_maker_subscriptions =
+            subscribe_strategy_topics(market_maker_strategy.registration(), topic_txs)?;
+        market_maker_strategy.spawn(
+            market_maker_subscriptions,
+            order_gateway_handle,
+            position_read,
+        );
     }
-    tokio::spawn(Dispatcher::new(strategy_handles).run(strategy_rx));
+
+    Ok(())
 }
 
 fn spawn_recorders(app_config: &AppConfig, market_store: MarketStore) -> RecorderSenders {
@@ -372,25 +335,32 @@ fn spawn_recorders(app_config: &AppConfig, market_store: MarketStore) -> Recorde
     }
 }
 
+async fn drain_market_firehose(mut rx: tokio::sync::mpsc::Receiver<strategy::MarketAssetEvent>) {
+    while rx.recv().await.is_some() {}
+}
+
 fn spawn_market_and_positions(app_config: &AppConfig, runtime: MarketRuntime) {
     let MarketRuntime {
         topic_tokens,
         token_topics,
         ws_tx,
         ws_rx,
-        strategy_tx,
+        firehose_tx,
+        topic_txs,
+        book_publisher,
         recorder_senders,
         tick_size_map,
         proxy,
     } = runtime;
     let default_threads = app_config.app.default_threads.max(1);
 
-    // market::run 汇总公开行情并按 token/topic 分发给策略、奖励估算和持久化 recorder。
+    // market::run 汇总公开行情并按 token/topic 分发给策略和持久化 recorder。
     tokio::spawn(market::run(
         token_topics,
         ws_rx,
-        strategy_tx.clone(),
-        None,
+        book_publisher,
+        firehose_tx,
+        topic_txs,
         recorder_senders.tick_tx,
         recorder_senders.raw_store_tx,
         tick_size_map,
@@ -435,7 +405,7 @@ fn init_stores(app_config: &AppConfig) -> anyhow::Result<(OrderStore, MarketStor
     } else {
         derive_market_sqlite_path(&sqlite_path)
     };
-    // market.db 保存行情、奖励估算和每日奖励市场池状态。
+    // market.db 保存行情和每日奖励市场池状态。
     let market_store = MarketStore::open(&market_sqlite_path)?;
     market_store.init_schema()?;
 
@@ -482,12 +452,16 @@ mod tests {
     }
 
     #[test]
-    fn account_monitor_enabled_respects_account_config() {
-        let mut config = AccountConfig::default();
-        assert!(!account_monitor_enabled(&config));
+    fn account_monitor_starts_without_config_gate() {
+        let _spawn_fn: fn(config::AuthConfig) -> account::AccountReadHandle =
+            account::spawn_account_monitor;
+    }
 
-        config.enabled = true;
-        assert!(account_monitor_enabled(&config));
+    #[test]
+    fn order_gateway_exposes_settlement_activity_poller_entrypoint() {
+        let _spawn_fn = OrderGateway::spawn_settlement_activity_poller::<
+            order_gateway::DataApiSettlementActivityReader,
+        >;
     }
 
     #[test]
@@ -495,9 +469,9 @@ mod tests {
         let pair_registration = StrategyRegistration {
             name: Arc::from("pair_arbitrage"),
             kind: strategy::StrategyKind::PairArbitrage,
-            topics: Arc::<[Arc<str>]>::from(vec![Arc::from("pair")]),
+            topics: Arc::<[Arc<str>]>::from(vec![Arc::from("pair-token")]),
             topic_tokens: Arc::<[TopicRegistration]>::from(vec![TopicRegistration {
-                topic: Arc::from("pair"),
+                topic: Arc::from("pair-token"),
                 tokens: Arc::<[String]>::from(vec!["pair-token".to_string()]),
             }]),
             related_tokens: Arc::<[String]>::from(vec!["pair-token".to_string()]),
@@ -545,26 +519,6 @@ mod tests {
                 "csv-maker-token-1".to_string(),
                 "csv-maker-token-2".to_string()
             ]
-        );
-    }
-
-    #[test]
-    fn market_maker_strategy_handle_is_created_when_strategy_exists() {
-        let market_maker = MarketMakerStrategy::from_pool_entries(vec![active_pool_entry(
-            "0xabc",
-            "maker-token-1",
-            "maker-token-2",
-        )])
-        .expect("market maker should build")
-        .expect("non-empty pool should create market maker");
-
-        let (handle, _rx) =
-            market_maker_strategy_handle(&market_maker).expect("market maker handle should exist");
-
-        assert_eq!(handle.name.as_ref(), "market_maker");
-        assert_eq!(
-            handle.related_tokens.as_ref(),
-            &["maker-token-1".to_string(), "maker-token-2".to_string()]
         );
     }
 }

@@ -10,8 +10,6 @@ use crate::proxy_ws;
 use crate::storage::{ActiveRewardMarketPoolEntry, MarketStore};
 use crate::strategy::{CleanOrderbook, RewardPoolRemovalEvent, StrategyEvent};
 
-const PRICE_SCALE: f64 = 10_000.0;
-
 pub struct RewardMarketPoolMonitorConfig {
     pub refresh_interval: Duration,
     pub token1_spread_threshold: f64,
@@ -249,6 +247,8 @@ fn notify_pool_removal(
         ));
     }
 }
+
+const PRICE_SCALE: f64 = 10_000.0;
 
 fn scaled_price_to_f64(price: u16) -> f64 {
     price as f64 / PRICE_SCALE

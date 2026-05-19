@@ -14,8 +14,6 @@ pub(crate) struct AppConfig {
     #[serde(default, alias = "mid_requote")]
     pub(crate) liquidity_reward: LiquidityRewardConfig,
     #[serde(default)]
-    pub(crate) account: AccountConfig,
-    #[serde(default)]
     pub(crate) notification: NotificationConfig,
     #[serde(default)]
     pub(crate) topic_threads: HashMap<String, usize>,
@@ -39,8 +37,6 @@ pub(crate) struct AppSettings {
     pub(crate) min_price: f64,
     pub(crate) max_price: f64,
     pub(crate) default_threads: usize,
-    #[serde(default = "default_monitor_interval_secs")]
-    pub(crate) monitor_interval_secs: u64,
     #[serde(default)]
     pub(crate) tick_store_enabled: bool,
     #[serde(default)]
@@ -83,8 +79,6 @@ pub(crate) struct LiquidityRewardConfig {
     pub(crate) monitor_enabled: bool,
     #[serde(default)]
     pub(crate) simulation: bool,
-    #[serde(default = "default_true")]
-    pub(crate) reward_estimator_enabled: bool,
     #[serde(default = "default_liquidity_reward_balance_cooldown_secs")]
     pub(crate) balance_cooldown_secs: u64,
 }
@@ -99,28 +93,7 @@ impl Default for LiquidityRewardConfig {
             pool_max_rewards_min_size: None,
             monitor_enabled: false,
             simulation: false,
-            reward_estimator_enabled: default_true(),
             balance_cooldown_secs: default_liquidity_reward_balance_cooldown_secs(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub(crate) struct AccountConfig {
-    #[serde(default)]
-    pub(crate) enabled: bool,
-    #[serde(default = "default_account_refresh_interval_secs")]
-    pub(crate) refresh_interval_secs: u64,
-    #[serde(default)]
-    pub(crate) store_enabled: bool,
-}
-
-impl Default for AccountConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            refresh_interval_secs: default_account_refresh_interval_secs(),
-            store_enabled: false,
         }
     }
 }
@@ -155,14 +128,6 @@ impl Default for DingtalkConfig {
             queue_size: default_dingtalk_queue_size(),
         }
     }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_account_refresh_interval_secs() -> u64 {
-    60
 }
 
 fn default_liquidity_reward_source() -> String {
@@ -213,20 +178,43 @@ pub(crate) fn load_app_config() -> anyhow::Result<AppConfig> {
     Ok(settings.try_deserialize()?)
 }
 
-fn default_monitor_interval_secs() -> u64 {
-    30
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::FileFormat;
 
     #[test]
-    fn account_config_defaults_to_disabled_read_only_monitor() {
-        let config = AccountConfig::default();
+    fn app_config_does_not_require_account_section() {
+        let toml = r#"
+[proxy]
+url = ""
 
-        assert!(!config.enabled);
-        assert_eq!(config.refresh_interval_secs, 60);
-        assert!(!config.store_enabled);
+[app]
+log_file = ""
+assets_file = ""
+min_diff = 0.0
+max_spread = 0.0
+min_price = 0.0
+max_price = 1.0
+default_threads = 1
+
+[auth]
+api_key = ""
+api_secret = ""
+passphrase = ""
+private_key = ""
+funder = ""
+
+[order]
+size_usdc = 1.0
+"#;
+
+        let config: AppConfig = Config::builder()
+            .add_source(config::File::from_str(toml, FileFormat::Toml))
+            .build()
+            .expect("minimal config source should build")
+            .try_deserialize()
+            .expect("minimal config should parse without account section");
+        assert!(config.app.assets_file.is_empty());
     }
 }

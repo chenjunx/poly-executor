@@ -412,7 +412,7 @@ mod tests {
         StrategyRegistration {
             name: Arc::from(name),
             kind,
-            topics: Arc::from([Arc::from("topic")]),
+            topics: Arc::from([Arc::from("token-1")]),
             topic_tokens: Arc::from([]),
             related_tokens: Arc::from(["token-1".to_string()]),
         }

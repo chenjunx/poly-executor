@@ -25,22 +25,21 @@ Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流
 | 模拟模式 | 全局或策略级模拟开关，本地模拟成交与仓位，不发送真实订单 |
 | 故障恢复 | 启动时从 SQLite 自动恢复订单关联关系和做市挂单状态 |
 | 行情录制 | 可选将 best tick / 全量订单簿快照 / 成交事件异步写入 SQLite |
-| 奖励监控 | 实时估算做市奖励得分并落盘；定期轮询 Polymarket 奖励 API |
 | 代理支持 | 支持 SOCKS5 / HTTP 代理连接 WebSocket |
 
 ---
 
 ## 当前整体情况
 
-当前工程以 Polymarket 自动化交易为主，主流程由 `main.rs` 串起：加载配置，初始化订单库和行情库，启动恢复流程，创建策略，连接公开行情 WebSocket、私有订单 WebSocket、持仓刷新、订单执行和可选的奖励市场池任务。
+当前工程以 Polymarket 自动化交易为主，主流程由 `main.rs` 串起：加载配置，初始化订单库和行情库，创建并恢复 OrderGateway，创建策略，连接公开行情 WebSocket、私有订单 WebSocket、持仓刷新、订单执行和可选的奖励市场池任务。
 
 ### 运行链路
 
 ```text
-公开行情 WS -> market.rs 本地订单簿 -> dispatcher.rs -> 策略
-策略 OrderSignal -> order.rs -> Polymarket CLOB / 模拟成交 -> orders.db
-私有订单 WS -> order_ws.rs -> orders.db / 策略成交事件 / 钉钉通知
-启动恢复 -> recovery.rs -> orders.db + 远端 open/trades -> OrderCorrelationMap + 策略状态
+公开行情 WS -> market.rs 本地订单簿 -> topic broadcast -> 策略
+策略 OrderRequest -> order_gateway.rs -> Polymarket CLOB / 模拟成交 -> orders.db
+私有订单 WS -> order_gateway.rs -> OrderEventRing -> position_engine.rs
+启动恢复 -> order_gateway.rs -> orders.db gateway 表 -> OrderEventRing
 奖励市场加载/监听 -> reward_market_cache.rs / reward_market_pool_monitor.rs -> market.db
 ```
 
@@ -82,7 +81,7 @@ Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流
 ### 数据库边界
 
 - `orders.db` 是订单恢复真相来源，保存本地订单、远端订单 ID、订单事件、策略 active/pending 状态。
-- `market.db` 是行情、奖励估算和奖励市场池来源，保存 tick/raw book、Q-score 估算和 pool 状态。
+- `market.db` 是行情和奖励市场池来源，保存 tick/raw book 和 pool 状态。
 - 启动恢复只会基于本地非终结订单去远端 reconcile；它不会在本地 DB 为空时反向导入所有远端 open orders。
 - 真实模式排障时必须同时确认：运行进程、实际配置路径、实际 `sqlite_path`、远端 open orders、本地订单库和订单日志。
 
@@ -171,9 +170,8 @@ cargo build --release
 | `file` | String | `"liquidity_reward.csv"` | CSV 来源下的做市规则文件路径 |
 | `source` | String | `"csv"` | 做市市场来源：`csv` 从文件读取；`db_pool` 从 `market.db.reward_market_pool_state` 的 selected 市场读取 |
 | `pool_market_count` | usize | `6` | 每日奖励市场池中标记给 liquidity reward 策略使用的市场数量 |
-| `monitor_enabled` | bool | `false` | 是否启动奖励监控、奖励市场 loader 和 pool monitor（非模拟模式下生效） |
-| `reward_estimator_enabled` | bool | `true` | 是否启用本地 Q-score 奖励估算；开启后写入行情库 `liquidity_reward_scores` 表 |
-| `simulation` | bool | `false` | 做市策略内部模拟开关，独立于全局 `[simulation]`；模拟模式下奖励得分写入时会打 `simulation=1` 标记 |
+| `monitor_enabled` | bool | `false` | 是否启动奖励市场 loader 和 pool monitor（非模拟模式下生效） |
+| `simulation` | bool | `false` | 做市策略内部模拟开关，独立于全局 `[simulation]` |
 | `balance_cooldown_secs` | u64 | `60` | 余额或 allowance 不足时暂停新买单和 pending promote 的秒数 |
 
 > 注：`[liquidity_reward]` 在代码中兼容历史别名 `[mid_requote]`。
@@ -194,7 +192,6 @@ cargo build --release
 | `min_price` | f64 | — | 有效价格区间下限，低于此值跳过 |
 | `max_price` | f64 | — | 有效价格区间上限，超过此值跳过 |
 | `default_threads` | usize | — | 未在 `[topic_threads]` 中单独配置的 topic 使用的 WebSocket 连接数 |
-| `monitor_interval_secs` | u64 | `30` | 做市奖励 API 轮询间隔（秒） |
 | `tick_store_enabled` | bool | `false` | 是否将 best bid/ask 变化时的 tick 写入 `market_ticks` 表 |
 | `raw_store_enabled` | bool | `false` | 是否将全量订单簿快照写入 `book_snapshots` 表、成交事件写入 `trade_events` 表 |
 
@@ -280,7 +277,7 @@ token0,token1,topic
 | 3 | `reward_min_orders` | u32 | 否 | 奖励达标所需的最少挂单数量（用于 monitor 评估） |
 | 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（**单位：cents**，如 `4` 表示 4 cents，即 offset = 0.04）。挂单价格和奖励区间均由此字段计算，建议填整数如 `3` 或 `4`。 |
 | 5 | `reward_min_size` | f64 | 否 | 奖励有效的最小单笔挂单金额（USDC） |
-| 6 | `reward_daily_pool` | f64 | 否 | 该市场每日奖励总池（USDC），用于估算预期日收益份额 |
+| 6 | `reward_daily_pool` | f64 | 否 | 该市场每日奖励总池（USDC） |
 | 7 | `fixed_price` | bool | 否 | 报价模式开关：`true` = FixedPrice 模式；空或 `false` = CompetitorBased 模式（默认）。详见下方说明。 |
 
 示例：
@@ -318,7 +315,7 @@ min_reward_price = mid - spread
 ```
 
 - `target_price`：理想挂单价，位于奖励区间内靠近 mid 的一侧。
-- `min_reward_price`：奖励有效的最低买单价，低于此值通常不计入 Q-score。
+- `min_reward_price`：奖励有效的最低买单价，低于此值通常不计入官方奖励。
 
 ---
 
@@ -443,13 +440,12 @@ replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacemen
 
 | 表名 | 写入时机 | 说明 |
 |---|---|---|
-| `liquidity_reward_scores` | `reward_estimator_enabled=true` | 做市奖励得分记录；`my_orders` 为评估时刻内存中关联挂单数量（本地估算值，非 API 数据）；`competitors_qmin=0` 通常表示无竞争者订单满足 `reward_max_spread_cents` 门槛 |
 | `market_ticks` | `tick_store_enabled=true` | best bid/ask 变化时的 tick 记录；price/size 精度为 1/10000 的整数 |
 | `book_snapshots` | `raw_store_enabled=true` | 全量订单簿快照；`bids`/`asks` 为 BLOB，格式：每档 6 字节 = `price(u16 LE)` + `size(u32 LE)` |
 | `trade_events` | `raw_store_enabled=true` | `last_trade_price` 成交事件；字段：`token`、`market`、`price`、`side`、`size`、`fee_rate`、`ts_ms` |
 | `reward_market_pool_state` | `monitor_enabled=true` 且非模拟模式 | 每日奖励市场池状态；包含 token1/token2、competitiveness、奖励参数、是否仍在池、踢出原因、是否被选入 liquidity reward 策略，以及当前池子版本内是否已被 halt |
 
-旧版本已经写在订单库里的行情表不会自动迁移或删除；新版本只保证新增行情/模拟/奖励估算数据写入行情库。
+旧版本已经写在订单库里的行情表不会自动迁移或删除；新版本只保证新增行情/模拟数据写入行情库。
 
 `book_snapshots` BLOB 解析（Python 示例）：
 
@@ -471,15 +467,11 @@ def parse_levels(blob: bytes) -> list[tuple[float, float]]:
 
 | 模块 | 说明 |
 |---|---|
-| `market.rs` | WebSocket 行情订阅；维护每个 token 的本地 BTreeMap 订单簿；驱动行情事件分发 |
-| `dispatcher.rs` | 将行情事件按 topic/token 路由到各策略 channel |
-| `order.rs` | 接收策略的 `OrderSignal`，真实或模拟下单，写订单日志和 SQLite |
-| `order_ws.rs` | 连接 Polymarket 私有订单频道，实时回写订单状态 |
-| `positions.rs` | 真实模式拉取持仓；模拟模式维护内存仓位 |
-| `monitor.rs` | 实时估算做市奖励得分；监控 liquidity reward 相关订单和行情 |
+| `market.rs` | WebSocket 行情订阅；维护每个 token 的本地 BTreeMap 订单簿；按 topic broadcast 分发行情事件，并提供 firehose 全量行情流 |
+| `order_gateway.rs` | 接收策略请求，经过风控后真实或模拟下单；统一处理启动恢复、私有订单 WS observation、订单事件和 SQLite 持久化 |
+| `order_ws.rs` | Polymarket 私有订单频道网络适配层，把订单更新转换为 OrderGateway observation |
+| `position_engine.rs` | 单写者维护成交仓位，提供同步读取接口并异步持久化 |
 | `reward_market_cache.rs` | 拉取 Polymarket 当前奖励市场和市场详情，按规则构建每日奖励市场池并写入行情库 |
 | `reward_market_pool_monitor.rs` | 动态订阅奖励市场池行情，按 token1 spread 和 bid 区间把不合格市场踢出池 |
-| `recovery.rs` | 启动时从 SQLite 恢复订单关联关系和做市挂单状态，并和远端订单/成交保守对账 |
 | `storage.rs` | SQLite 封装；订单库与行情库分离，使用 WAL + NORMAL sync 模式 |
 | `proxy_ws.rs` | SOCKS5 / HTTP 代理 WebSocket 连接层 |
-| `polymarket_rewards.rs` | Polymarket 官方 Q-score 做市奖励积分计算算法 |

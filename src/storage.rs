@@ -77,13 +77,6 @@ pub struct RemovedLiquidityRewardPoolEntry {
     pub token2: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredAccountFundSnapshot {
-    pub checked_at_ms: u64,
-    pub balance: String,
-    pub allowances_json: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct RewardMarketPoolReplaceResult {
     pub selected_count: usize,
@@ -1470,24 +1463,6 @@ impl MarketStore {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "
-                CREATE TABLE IF NOT EXISTS liquidity_reward_scores (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    token TEXT NOT NULL,
-                    mid TEXT NOT NULL,
-                    my_orders INTEGER NOT NULL,
-                    my_qone TEXT NOT NULL,
-                    my_qtwo TEXT NOT NULL,
-                    my_qmin TEXT NOT NULL,
-                    competitors_qmin TEXT NOT NULL,
-                    my_share TEXT NOT NULL,
-                    estimated_daily_reward TEXT NOT NULL,
-                    simulation INTEGER NOT NULL DEFAULT 0,
-                    recorded_at_ms INTEGER NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_lr_scores_token_ts
-                    ON liquidity_reward_scores (token, recorded_at_ms DESC);
-
                 CREATE TABLE IF NOT EXISTS market_ticks (
                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
                     token     TEXT    NOT NULL,
@@ -1649,90 +1624,6 @@ impl MarketStore {
                 "reward_market_pool_state",
                 "liquidity_reward_halted_pool_version",
                 "INTEGER",
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn insert_account_fund_snapshot(
-        &self,
-        checked_at_ms: u64,
-        balance: &str,
-        allowances_json: &str,
-    ) -> anyhow::Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "
-                INSERT INTO account_fund_snapshots (checked_at_ms, balance, allowances_json)
-                VALUES (?1, ?2, ?3)
-                ",
-                params![checked_at_ms as i64, balance, allowances_json],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn load_latest_account_fund_snapshot(
-        &self,
-    ) -> anyhow::Result<Option<StoredAccountFundSnapshot>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "
-                SELECT checked_at_ms, balance, allowances_json
-                FROM account_fund_snapshots
-                ORDER BY checked_at_ms DESC, id DESC
-                LIMIT 1
-                ",
-                [],
-                |row| {
-                    Ok(StoredAccountFundSnapshot {
-                        checked_at_ms: row.get::<_, i64>(0)? as u64,
-                        balance: row.get(1)?,
-                        allowances_json: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-    }
-
-    pub fn insert_liquidity_reward_score(
-        &self,
-        token: &str,
-        mid: f64,
-        my_orders: usize,
-        my_qone: f64,
-        my_qtwo: f64,
-        my_qmin: f64,
-        competitors_qmin: f64,
-        my_share: f64,
-        estimated_daily_reward: f64,
-        simulation: bool,
-    ) -> anyhow::Result<()> {
-        let now = now_ms()?;
-        self.with_conn(|conn| {
-            conn.execute(
-                "
-                INSERT INTO liquidity_reward_scores (
-                    token, mid, my_orders, my_qone, my_qtwo, my_qmin,
-                    competitors_qmin, my_share, estimated_daily_reward,
-                    simulation, recorded_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                ",
-                params![
-                    token,
-                    mid.to_string(),
-                    my_orders as i64,
-                    my_qone.to_string(),
-                    my_qtwo.to_string(),
-                    my_qmin.to_string(),
-                    competitors_qmin.to_string(),
-                    my_share.to_string(),
-                    estimated_daily_reward.to_string(),
-                    if simulation { 1_i64 } else { 0_i64 },
-                    now,
-                ],
             )?;
             Ok(())
         })
@@ -2500,28 +2391,6 @@ mod tests {
         assert_eq!(journal.len(), 1);
         assert_eq!(journal[0].seq, 10);
         assert_eq!(journal[0].event_type, "OrderFillApplied");
-    }
-
-    #[test]
-    fn account_fund_snapshot_round_trips_latest_snapshot() {
-        let store = MarketStore::open(":memory:").expect("store should open");
-        store.init_schema().expect("schema should initialize");
-
-        store
-            .insert_account_fund_snapshot(100, "12.34", r#"{"0xabc":"999"}"#)
-            .expect("first snapshot should insert");
-        store
-            .insert_account_fund_snapshot(200, "56.78", r#"{"0xdef":"888"}"#)
-            .expect("second snapshot should insert");
-
-        let snapshot = store
-            .load_latest_account_fund_snapshot()
-            .expect("latest snapshot query should work")
-            .expect("latest snapshot should exist");
-
-        assert_eq!(snapshot.checked_at_ms, 200);
-        assert_eq!(snapshot.balance, "56.78");
-        assert_eq!(snapshot.allowances_json, r#"{"0xdef":"888"}"#);
     }
 
     #[test]

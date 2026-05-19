@@ -1,10 +1,12 @@
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use polymarket_client_sdk_v2::types::Decimal;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::config::AuthConfig;
 use crate::storage::{OrderGatewayEventInsert, OrderGatewayOrderSnapshot, OrderStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -335,7 +337,180 @@ pub struct OrderRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PrivateWsOrderUpdate {
+    pub exch_id: ExchangeOrderId,
+    pub token_id: TokenId,
+    pub market_id: MarketId,
+    pub fill_price: Decimal,
+    pub previous_size_matched: Option<Decimal>,
+    pub current_size_matched: Option<Decimal>,
+    pub original_size: Option<Decimal>,
+    pub remote_status_code: Option<Arc<str>>,
+    pub ts_ns: u64,
+    pub recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SettlementKey {
+    pub transaction_hash: Arc<str>,
+    pub exch_id: ExchangeOrderId,
+}
+
+pub trait SettlementActivityReader: Send + Sync {
+    fn is_trade_activity_confirmed<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+        exch_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
+}
+
+pub struct DataApiSettlementActivityReader {
+    client: polymarket_client_sdk_v2::data::Client,
+    user: polymarket_client_sdk_v2::types::Address,
+}
+
+impl DataApiSettlementActivityReader {
+    pub fn new(user: polymarket_client_sdk_v2::types::Address) -> Self {
+        Self {
+            client: polymarket_client_sdk_v2::data::Client::default(),
+            user,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_activities_for_test(
+        activities: Vec<polymarket_client_sdk_v2::data::types::response::Activity>,
+    ) -> TestDataApiSettlementActivityReader {
+        TestDataApiSettlementActivityReader { activities }
+    }
+}
+
+impl SettlementActivityReader for DataApiSettlementActivityReader {
+    fn is_trade_activity_confirmed<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+        _exch_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let target_hash: polymarket_client_sdk_v2::types::B256 = transaction_hash.parse()?;
+            let request =
+                polymarket_client_sdk_v2::data::types::request::ActivityRequest::builder()
+                    .user(self.user)
+                    .activity_types(vec![
+                        polymarket_client_sdk_v2::data::types::ActivityType::Trade,
+                    ])
+                    .limit(500)?
+                    .build();
+            let activities = self.client.activity(&request).await?;
+            Ok(activity_entries_confirm_trade_transaction(
+                activities.iter(),
+                &target_hash,
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+struct TestDataApiSettlementActivityReader {
+    activities: Vec<polymarket_client_sdk_v2::data::types::response::Activity>,
+}
+
+#[cfg(test)]
+impl SettlementActivityReader for TestDataApiSettlementActivityReader {
+    fn is_trade_activity_confirmed<'a>(
+        &'a self,
+        transaction_hash: &'a str,
+        _exch_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let target_hash: polymarket_client_sdk_v2::types::B256 = transaction_hash.parse()?;
+            Ok(activity_entries_confirm_trade_transaction(
+                self.activities.iter(),
+                &target_hash,
+            ))
+        })
+    }
+}
+
+fn activity_entries_confirm_trade_transaction<'a, I>(
+    activities: I,
+    transaction_hash: &polymarket_client_sdk_v2::types::B256,
+) -> bool
+where
+    I: IntoIterator<Item = &'a polymarket_client_sdk_v2::data::types::response::Activity>,
+{
+    activities.into_iter().any(|activity| {
+        activity.transaction_hash == *transaction_hash
+            && activity.activity_type == polymarket_client_sdk_v2::data::types::ActivityType::Trade
+    })
+}
+
+pub struct NoopSettlementActivityReader;
+
+impl SettlementActivityReader for NoopSettlementActivityReader {
+    fn is_trade_activity_confirmed<'a>(
+        &'a self,
+        _transaction_hash: &'a str,
+        _exch_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(false) })
+    }
+}
+
+pub async fn poll_settlement_activity_once<R>(
+    reader: &R,
+    pending: Vec<SettlementKey>,
+    observation_tx: mpsc::Sender<GatewayObservation>,
+) -> anyhow::Result<()>
+where
+    R: SettlementActivityReader,
+{
+    for key in pending {
+        if reader
+            .is_trade_activity_confirmed(key.transaction_hash.as_ref(), key.exch_id.as_str())
+            .await?
+        {
+            let _ = observation_tx
+                .send(GatewayObservation::SettlementActivityConfirmed {
+                    exch_id: key.exch_id,
+                    transaction_hash: key.transaction_hash,
+                    ts_ns: now_ns(),
+                    recovery: false,
+                })
+                .await;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSettlementTrade {
+    pub fill_qty: Decimal,
+    pub fill_price: Decimal,
+    pub ts_ns: u64,
+    pub recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum GatewayObservation {
+    PrivateWsOrderUpdate(PrivateWsOrderUpdate),
+    SettlementTradeObserved {
+        exch_id: ExchangeOrderId,
+        transaction_hash: Arc<str>,
+        fill_qty: Decimal,
+        fill_price: Decimal,
+        ts_ns: u64,
+        recovery: bool,
+    },
+    SettlementActivityConfirmed {
+        exch_id: ExchangeOrderId,
+        transaction_hash: Arc<str>,
+        ts_ns: u64,
+        recovery: bool,
+    },
     RestAccepted {
         local_id: LocalOrderId,
         exch_id: Option<ExchangeOrderId>,
@@ -365,15 +540,6 @@ pub enum GatewayObservation {
         ts_ns: u64,
         recovery: bool,
     },
-    WsFill {
-        exch_id: Option<ExchangeOrderId>,
-        local_id: Option<LocalOrderId>,
-        token_id: TokenId,
-        side: OrderSide,
-        fill_delta: Decimal,
-        fill_price: Decimal,
-        trade_id: Arc<str>,
-    },
     Timeout {
         local_id: LocalOrderId,
         operation: GatewayOperation,
@@ -389,6 +555,9 @@ pub struct GatewayState {
     orders: std::collections::HashMap<LocalOrderId, OrderRecord>,
     local_by_exch: std::collections::HashMap<ExchangeOrderId, LocalOrderId>,
     pending_by_exch: std::collections::HashMap<ExchangeOrderId, Vec<GatewayObservation>>,
+    pending_settlements: std::collections::HashMap<SettlementKey, PendingSettlementTrade>,
+    applied_settlements: std::collections::HashSet<SettlementKey>,
+    confirmed_unapplied_settlements: std::collections::HashSet<SettlementKey>,
 }
 
 impl GatewayState {
@@ -419,6 +588,10 @@ impl GatewayState {
         self.orders.get(local_id)
     }
 
+    pub fn pending_settlement_keys(&self) -> Vec<SettlementKey> {
+        self.pending_settlements.keys().cloned().collect()
+    }
+
     pub fn apply_observation(
         &mut self,
         observation: GatewayObservation,
@@ -436,20 +609,36 @@ impl GatewayState {
                 ts_ns,
                 recovery,
             } => self.apply_rest_cancel_accepted(local_id, reason, ts_ns, recovery),
+            GatewayObservation::PrivateWsOrderUpdate(update) => {
+                self.apply_private_ws_order_update(update)
+            }
+            GatewayObservation::SettlementTradeObserved {
+                exch_id,
+                transaction_hash,
+                fill_qty,
+                fill_price,
+                ts_ns,
+                recovery,
+            } => self.apply_settlement_trade_observed(
+                exch_id,
+                transaction_hash,
+                fill_qty,
+                fill_price,
+                ts_ns,
+                recovery,
+            ),
+            GatewayObservation::SettlementActivityConfirmed {
+                exch_id,
+                transaction_hash,
+                ts_ns,
+                recovery,
+            } => {
+                self.apply_settlement_activity_confirmed(exch_id, transaction_hash, ts_ns, recovery)
+            }
             GatewayObservation::WsOpen { ref exch_id, .. }
             | GatewayObservation::WsPartialFill { ref exch_id, .. }
                 if !self.local_by_exch.contains_key(exch_id) =>
             {
-                self.pending_by_exch
-                    .entry(exch_id.clone())
-                    .or_default()
-                    .push(observation);
-                Vec::new()
-            }
-            GatewayObservation::WsFill {
-                exch_id: Some(ref exch_id),
-                ..
-            } if !self.local_by_exch.contains_key(exch_id) => {
                 self.pending_by_exch
                     .entry(exch_id.clone())
                     .or_default()
@@ -479,13 +668,6 @@ impl GatewayState {
                 ts_ns,
                 recovery,
             ),
-            GatewayObservation::WsFill {
-                exch_id,
-                local_id,
-                fill_delta,
-                fill_price,
-                ..
-            } => self.apply_ws_fill(exch_id, local_id, fill_delta, fill_price),
             GatewayObservation::Timeout {
                 local_id,
                 operation,
@@ -528,6 +710,22 @@ impl GatewayState {
             let pending = self.pending_by_exch.remove(&exch_id).unwrap_or_default();
             for observation in pending {
                 events.extend(self.apply_observation(observation));
+            }
+
+            let settlement_keys = self
+                .confirmed_unapplied_settlements
+                .iter()
+                .filter(|key| key.exch_id == exch_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in settlement_keys {
+                self.confirmed_unapplied_settlements.remove(&key);
+                events.extend(self.apply_settlement_activity_confirmed(
+                    key.exch_id.clone(),
+                    key.transaction_hash.clone(),
+                    ts_ns,
+                    recovery,
+                ));
             }
         }
         events
@@ -618,39 +816,132 @@ impl GatewayState {
         )]
     }
 
-    fn apply_ws_fill(
+    pub fn apply_private_ws_order_update(
         &mut self,
-        exch_id: Option<ExchangeOrderId>,
-        local_id: Option<LocalOrderId>,
-        fill_delta: Decimal,
-        fill_price: Decimal,
+        update: PrivateWsOrderUpdate,
     ) -> Vec<OrderEventEnvelope> {
-        let local_id = match (local_id, exch_id) {
-            (Some(local_id), _) => local_id,
-            (None, Some(exch_id)) => {
-                let Some(local_id) = self.local_by_exch.get(&exch_id) else {
-                    return Vec::new();
-                };
-                local_id.clone()
-            }
-            (None, None) => return Vec::new(),
+        self.apply_observation(GatewayObservation::WsOpen {
+            exch_id: update.exch_id,
+            token_id: update.token_id,
+            market_id: update.market_id,
+            remote_status_code: update.remote_status_code,
+            ts_ns: update.ts_ns,
+            recovery: update.recovery,
+        })
+    }
+
+    fn apply_settlement_trade_observed(
+        &mut self,
+        exch_id: ExchangeOrderId,
+        transaction_hash: Arc<str>,
+        fill_qty: Decimal,
+        fill_price: Decimal,
+        ts_ns: u64,
+        recovery: bool,
+    ) -> Vec<OrderEventEnvelope> {
+        let key = SettlementKey {
+            transaction_hash,
+            exch_id,
         };
-        let Some(record) = self.orders.get(&local_id) else {
+        if self.applied_settlements.contains(&key) {
+            return Vec::new();
+        }
+        self.pending_settlements
+            .entry(key)
+            .or_insert(PendingSettlementTrade {
+                fill_qty,
+                fill_price,
+                ts_ns,
+                recovery,
+            });
+        Vec::new()
+    }
+
+    fn apply_settlement_activity_confirmed(
+        &mut self,
+        exch_id: ExchangeOrderId,
+        transaction_hash: Arc<str>,
+        ts_ns: u64,
+        recovery: bool,
+    ) -> Vec<OrderEventEnvelope> {
+        let key = SettlementKey {
+            transaction_hash,
+            exch_id: exch_id.clone(),
+        };
+        if self.applied_settlements.contains(&key) {
+            return Vec::new();
+        }
+        let Some(trade) = self.pending_settlements.remove(&key) else {
             return Vec::new();
         };
-        let cum_qty = record.filled_size_total + fill_delta;
-        self.apply_ws_partial_fill(
-            record
-                .exch_id
-                .clone()
-                .unwrap_or_else(|| ExchangeOrderId::from("")),
-            fill_delta,
-            fill_price,
-            cum_qty,
-            Some(fill_price),
-            0,
-            false,
-        )
+        let Some(local_id) = self.local_by_exch.get(&exch_id).cloned() else {
+            self.confirmed_unapplied_settlements.insert(key.clone());
+            self.pending_settlements.insert(key, trade);
+            return Vec::new();
+        };
+
+        let record = {
+            let Some(record) = self.orders.get_mut(&local_id) else {
+                return Vec::new();
+            };
+            let fill_qty = if trade.fill_qty > record.remaining_size {
+                record.remaining_size
+            } else {
+                trade.fill_qty
+            };
+            if fill_qty <= Decimal::ZERO {
+                self.applied_settlements.insert(key);
+                return Vec::new();
+            }
+            record.filled_size_total += fill_qty;
+            record.remaining_size -= fill_qty;
+            record.avg_fill_price = Some(trade.fill_price);
+            let is_terminal = record.remaining_size <= Decimal::ZERO;
+            if is_terminal {
+                record.remaining_size = Decimal::ZERO;
+                record.local_state = LocalOrderState::Filled;
+            } else {
+                record.local_state = LocalOrderState::PartiallyFilled;
+            }
+            (record.clone(), fill_qty, is_terminal)
+        };
+
+        self.applied_settlements.insert(key);
+        let (record, fill_qty, is_terminal) = record;
+        let payload = if is_terminal {
+            OrderEventPayload::Fill {
+                fill_qty,
+                fill_price: trade.fill_price,
+                cum_qty: record.filled_size_total,
+                avg_fill_price: Some(trade.fill_price),
+            }
+        } else {
+            OrderEventPayload::PartialFill {
+                fill_qty,
+                fill_price: trade.fill_price,
+                cum_qty: record.filled_size_total,
+                avg_fill_price: Some(trade.fill_price),
+            }
+        };
+        vec![self.envelope_from_record(
+            record,
+            ts_ns.max(trade.ts_ns),
+            recovery || trade.recovery,
+            if is_terminal {
+                OrderEventKind::Fill
+            } else {
+                OrderEventKind::PartialFill
+            },
+            payload,
+        )]
+    }
+
+    #[cfg(test)]
+    fn has_pending_settlement_for_test(&self, transaction_hash: &str, exch_id: &str) -> bool {
+        self.pending_settlements.contains_key(&SettlementKey {
+            transaction_hash: Arc::from(transaction_hash),
+            exch_id: ExchangeOrderId::from(exch_id),
+        })
     }
 
     fn apply_timeout(
@@ -746,6 +1037,7 @@ pub struct OrderGateway {
     risk: Arc<dyn OrderRiskCheck>,
     config: OrderGatewayConfig,
     order_store: Option<OrderStore>,
+    pending_settlement_tx: tokio::sync::watch::Sender<Vec<SettlementKey>>,
 }
 
 impl OrderGateway {
@@ -802,6 +1094,8 @@ impl OrderGateway {
             GatewayPhase::Recovering,
         );
         let (observation_tx, observation_rx) = mpsc::channel(config.request_ring_capacity);
+        let (pending_settlement_tx, _pending_settlement_rx) =
+            tokio::sync::watch::channel(Vec::new());
         let event_ring = OrderEventRing::new(config.event_ring_capacity);
         let gateway = Self {
             rx,
@@ -812,6 +1106,7 @@ impl OrderGateway {
             risk,
             config,
             order_store,
+            pending_settlement_tx,
         };
         (gateway, handle, event_ring, observation_tx)
     }
@@ -832,6 +1127,110 @@ impl OrderGateway {
             },
         );
         self.event_ring.publish(event)
+    }
+
+    pub fn complete_startup_recovery(&mut self) -> anyhow::Result<()> {
+        self.recover_from_gateway_store()
+    }
+
+    pub fn recover_from_gateway_store(&mut self) -> anyhow::Result<()> {
+        let store = self
+            .order_store
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("order store is required for gateway recovery"))?;
+        let snapshots = store.load_order_gateway_recoverable_orders()?;
+        let mut recovered_order_count = 0;
+        let mut failed_unrecoverable_count = 0;
+
+        for snapshot in snapshots {
+            self.state.next_seq = self.state.next_seq.max(snapshot.last_event_seq);
+            let missing_signed_payload = snapshot.exch_id.is_none()
+                && store
+                    .load_latest_order_gateway_submission(&snapshot.local_id)?
+                    .is_none();
+            let mut record = order_record_from_gateway_snapshot(snapshot);
+            if missing_signed_payload {
+                record.local_state = LocalOrderState::Failed;
+                record.remaining_size = Decimal::try_from(0_f64).expect("zero decimal");
+                failed_unrecoverable_count += 1;
+                self.state
+                    .orders
+                    .insert(record.local_id.clone(), record.clone());
+                let event = self.state.envelope_from_record(
+                    record,
+                    0,
+                    true,
+                    OrderEventKind::Failed,
+                    OrderEventPayload::Failed {
+                        kind: FailureKind::MissingSignedPayloadAfterRestart,
+                    },
+                );
+                self.publish_and_persist(event);
+                continue;
+            }
+
+            let exch_id = record.exch_id.clone();
+            if let Some(exch_id) = exch_id.clone() {
+                self.state
+                    .local_by_exch
+                    .insert(exch_id, record.local_id.clone());
+            }
+            let current_state = record.local_state;
+            self.state
+                .orders
+                .insert(record.local_id.clone(), record.clone());
+            recovered_order_count += 1;
+            let event = self.state.envelope_from_record(
+                record,
+                0,
+                true,
+                OrderEventKind::Recovered,
+                OrderEventPayload::Recovered { current_state },
+            );
+            self.publish_and_persist(event);
+            if let Some(exch_id) = exch_id {
+                let pending = self
+                    .state
+                    .pending_by_exch
+                    .remove(&exch_id)
+                    .unwrap_or_default();
+                for observation in pending {
+                    for event in self.state.apply_observation(observation) {
+                        self.publish_and_persist(event);
+                    }
+                }
+            }
+        }
+
+        self.complete_recovery(recovered_order_count, 0, failed_unrecoverable_count)
+            .map_err(|error| anyhow::anyhow!("publish recovery completion failed: {error:?}"))
+    }
+
+    pub fn spawn_private_order_ws(
+        auth: AuthConfig,
+        order_store: OrderStore,
+        observation_tx: mpsc::Sender<GatewayObservation>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(crate::order_ws::run(auth, order_store, observation_tx))
+    }
+
+    pub fn spawn_settlement_activity_poller<R>(
+        reader: R,
+        pending_rx: tokio::sync::watch::Receiver<Vec<SettlementKey>>,
+        observation_tx: mpsc::Sender<GatewayObservation>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        R: SettlementActivityReader + 'static,
+    {
+        tokio::spawn(async move {
+            run_settlement_activity_poller(reader, pending_rx, observation_tx).await;
+        })
+    }
+
+    pub fn subscribe_pending_settlements(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Vec<SettlementKey>> {
+        self.pending_settlement_tx.subscribe()
     }
 
     pub async fn run_until_request_channel_closed(mut self) {
@@ -864,6 +1263,8 @@ impl OrderGateway {
         for event in self.state.apply_observation(observation) {
             self.publish_and_persist(event);
         }
+        self.pending_settlement_tx
+            .send_replace(self.state.pending_settlement_keys());
     }
 
     async fn handle_request(&mut self, request: OrderRequest) {
@@ -1260,6 +1661,90 @@ fn event_fill_total(event: &OrderEventEnvelope) -> Option<String> {
     }
 }
 
+fn order_record_from_gateway_snapshot(snapshot: OrderGatewayOrderSnapshot) -> OrderRecord {
+    let local_id = LocalOrderId::from(snapshot.local_id);
+    OrderRecord {
+        strategy_id: StrategyId::from(snapshot.strategy_id),
+        market_id: snapshot
+            .market_id
+            .map(MarketId::from)
+            .unwrap_or_else(|| MarketId::from("")),
+        token_id: TokenId::from(snapshot.token_id),
+        local_id,
+        exch_id: snapshot.exch_id.map(ExchangeOrderId::from),
+        side: order_side_from_label(&snapshot.side).unwrap_or(OrderSide::Buy),
+        order_type: gateway_order_type_from_label(&snapshot.order_type),
+        price: snapshot
+            .price
+            .as_deref()
+            .and_then(|value| Decimal::from_str(value).ok()),
+        original_size: Decimal::from_str(&snapshot.size)
+            .unwrap_or_else(|_| Decimal::try_from(0_f64).expect("zero decimal")),
+        local_state: local_order_state_from_label(&snapshot.local_state),
+        filled_size_total: Decimal::from_str(&snapshot.filled_size_total)
+            .unwrap_or_else(|_| Decimal::try_from(0_f64).expect("zero decimal")),
+        remaining_size: Decimal::from_str(&snapshot.remaining_size)
+            .unwrap_or_else(|_| Decimal::try_from(0_f64).expect("zero decimal")),
+        avg_fill_price: snapshot
+            .avg_fill_price
+            .as_deref()
+            .and_then(|value| Decimal::from_str(value).ok()),
+    }
+}
+
+async fn run_settlement_activity_poller<R>(
+    reader: R,
+    mut pending_rx: tokio::sync::watch::Receiver<Vec<SettlementKey>>,
+    observation_tx: mpsc::Sender<GatewayObservation>,
+) where
+    R: SettlementActivityReader,
+{
+    loop {
+        let pending = pending_rx.borrow().clone();
+        if !pending.is_empty() {
+            if let Err(error) =
+                poll_settlement_activity_once(&reader, pending, observation_tx.clone()).await
+            {
+                tracing::warn!(target: "order", error = %error, "settlement activity poll failed");
+            }
+        }
+        tokio::select! {
+            changed = pending_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn local_order_state_from_label(value: &str) -> LocalOrderState {
+    match value {
+        "Accepted" => LocalOrderState::Accepted,
+        "Rejected" => LocalOrderState::Rejected,
+        "SubmitPending" => LocalOrderState::SubmitPending,
+        "Submitted" => LocalOrderState::Submitted,
+        "Open" => LocalOrderState::Open,
+        "PartiallyFilled" => LocalOrderState::PartiallyFilled,
+        "Filled" => LocalOrderState::Filled,
+        "CancelRequested" => LocalOrderState::CancelRequested,
+        "CancelPending" => LocalOrderState::CancelPending,
+        "Cancelled" => LocalOrderState::Cancelled,
+        "CancelRejected" => LocalOrderState::CancelRejected,
+        "Failed" => LocalOrderState::Failed,
+        "UnknownTerminal" => LocalOrderState::UnknownTerminal,
+        _ => LocalOrderState::UnknownPending,
+    }
+}
+
 pub fn recover_gateway_orders_for_test(
     store: &OrderStore,
     state: &mut GatewayState,
@@ -1272,30 +1757,10 @@ pub fn recover_gateway_orders_for_test(
                 .load_latest_order_gateway_submission(&snapshot.local_id)?
                 .is_none()
         {
-            let local_id = LocalOrderId::from(snapshot.local_id.clone());
-            let record = OrderRecord {
-                strategy_id: StrategyId::from(snapshot.strategy_id),
-                market_id: snapshot
-                    .market_id
-                    .map(MarketId::from)
-                    .unwrap_or_else(|| MarketId::from("")),
-                token_id: TokenId::from(snapshot.token_id),
-                local_id: local_id.clone(),
-                exch_id: None,
-                side: order_side_from_label(&snapshot.side).unwrap_or(OrderSide::Buy),
-                order_type: gateway_order_type_from_label(&snapshot.order_type),
-                price: snapshot
-                    .price
-                    .as_deref()
-                    .and_then(|value| Decimal::from_str(value).ok()),
-                original_size: Decimal::from_str(&snapshot.size)
-                    .unwrap_or_else(|_| Decimal::try_from(0_f64).expect("zero decimal")),
-                local_state: LocalOrderState::Failed,
-                filled_size_total: Decimal::try_from(0_f64).expect("zero decimal"),
-                remaining_size: Decimal::try_from(0_f64).expect("zero decimal"),
-                avg_fill_price: None,
-            };
-            state.orders.insert(local_id, record.clone());
+            let mut record = order_record_from_gateway_snapshot(snapshot);
+            record.local_state = LocalOrderState::Failed;
+            record.remaining_size = Decimal::try_from(0_f64).expect("zero decimal");
+            state.orders.insert(record.local_id.clone(), record.clone());
             events.push(state.envelope_from_record(
                 record,
                 0,
@@ -1442,6 +1907,115 @@ mod tests {
 
     fn dec(value: f64) -> Decimal {
         Decimal::try_from(value).expect("decimal")
+    }
+
+    fn activity_for_test(
+        transaction_hash: &str,
+        activity_type: polymarket_client_sdk_v2::data::types::ActivityType,
+    ) -> polymarket_client_sdk_v2::data::types::response::Activity {
+        serde_json::from_str(&format!(
+            r#"{{
+                "proxyWallet":"0x0000000000000000000000000000000000000000",
+                "timestamp":1,
+                "conditionId":"0x0000000000000000000000000000000000000000000000000000000000000001",
+                "type":"{}",
+                "size":"3",
+                "usdcSize":"1.26",
+                "transactionHash":"{}",
+                "price":"0.42",
+                "asset":"1",
+                "side":"BUY",
+                "outcomeIndex":0
+            }}"#,
+            activity_type, transaction_hash
+        ))
+        .expect("activity fixture should parse")
+    }
+
+    struct FakeSettlementActivityReader {
+        confirmed: Vec<(String, String)>,
+    }
+
+    impl SettlementActivityReader for FakeSettlementActivityReader {
+        fn is_trade_activity_confirmed<'a>(
+            &'a self,
+            transaction_hash: &'a str,
+            exch_id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                Ok(self
+                    .confirmed
+                    .iter()
+                    .any(|(tx, order)| tx == transaction_hash && order == exch_id))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn data_api_activity_reader_confirms_trade_by_transaction_hash() {
+        let transaction_hash = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+        let reader =
+            DataApiSettlementActivityReader::from_activities_for_test(vec![activity_for_test(
+                transaction_hash,
+                polymarket_client_sdk_v2::data::types::ActivityType::Trade,
+            )]);
+
+        assert!(
+            reader
+                .is_trade_activity_confirmed(transaction_hash, "exch-1")
+                .await
+                .expect("reader should check fixture")
+        );
+    }
+
+    async fn settlement_activity_poller_sends_confirmation_for_trade_activity() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let reader = FakeSettlementActivityReader {
+            confirmed: vec![("0xabc".to_string(), "exch-1".to_string())],
+        };
+        let pending = vec![SettlementKey {
+            transaction_hash: Arc::from("0xabc"),
+            exch_id: ExchangeOrderId::from("exch-1"),
+        }];
+
+        poll_settlement_activity_once(&reader, pending, tx)
+            .await
+            .expect("poll should succeed");
+
+        let observation = rx.recv().await.expect("confirmation should be sent");
+        assert!(matches!(
+            observation,
+            GatewayObservation::SettlementActivityConfirmed { ref transaction_hash, ref exch_id, .. }
+                if transaction_hash.as_ref() == "0xabc" && exch_id.as_str() == "exch-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn gateway_publishes_pending_settlement_snapshot_after_observation() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: true,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, _handle, _ring, _observation_tx) =
+            OrderGateway::new_for_test(config, Arc::new(AllowAllRiskCheck));
+        let mut pending_rx = gateway.subscribe_pending_settlements();
+
+        gateway.handle_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            fill_qty: dec(3.0),
+            fill_price: dec(0.42),
+            ts_ns: 1,
+            recovery: false,
+        });
+
+        pending_rx.changed().await.expect("pending snapshot update");
+        assert_eq!(pending_rx.borrow().len(), 1);
+        assert!(pending_rx.borrow().iter().any(|key| {
+            key.transaction_hash.as_ref() == "0xabc" && key.exch_id.as_str() == "exch-1"
+        }));
     }
 
     #[test]
@@ -1677,6 +2251,546 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].local_id, "runtime-persist-1");
         assert_eq!(active[0].local_state, "Open");
+    }
+
+    fn upsert_recoverable_gateway_order(
+        store: &crate::storage::OrderStore,
+        local_id: &str,
+        exch_id: &str,
+    ) {
+        store
+            .upsert_order_gateway_order(&crate::storage::OrderGatewayOrderSnapshot {
+                strategy_id: "liquidity_reward".to_string(),
+                market_id: Some("market-1".to_string()),
+                token_id: "token-1".to_string(),
+                local_id: local_id.to_string(),
+                exch_id: Some(exch_id.to_string()),
+                side: "Buy".to_string(),
+                order_type: "LimitGtc".to_string(),
+                price: Some("0.42".to_string()),
+                size: "10".to_string(),
+                local_state: "Open".to_string(),
+                remote_status_code: Some("open".to_string()),
+                filled_size_total: "0".to_string(),
+                remaining_size: "10".to_string(),
+                avg_fill_price: None,
+                last_submission_attempt: Some(1),
+                last_event_seq: 7,
+                terminal_at_ms: None,
+            })
+            .expect("snapshot should write");
+    }
+
+    #[tokio::test]
+    async fn gateway_startup_recovery_restores_orders_and_enters_live_phase() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        upsert_recoverable_gateway_order(&store, "recover-startup", "exch-recover-startup");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store(config, Arc::new(AllowAllRiskCheck), store);
+        let mut system_subscriber = ring.subscribe_for_strategy(StrategyId::from("SYSTEM"));
+
+        gateway
+            .complete_startup_recovery()
+            .expect("startup recovery should run");
+
+        assert!(
+            gateway
+                .state
+                .order(&LocalOrderId::from("recover-startup"))
+                .is_some()
+        );
+        let completed = system_subscriber
+            .try_recv_relevant()
+            .expect("recovery completion should publish");
+        assert_eq!(completed.kind, OrderEventKind::RecoveryCompleted);
+        handle
+            .try_send(place_request("live-after-startup-recovery"))
+            .expect("gateway should be live after startup recovery");
+    }
+
+    #[tokio::test]
+    async fn gateway_recovery_restores_open_order_and_publishes_completion() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        upsert_recoverable_gateway_order(&store, "recover-open", "exch-recover-open");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store(config, Arc::new(AllowAllRiskCheck), store);
+        let mut strategy_subscriber =
+            ring.subscribe_for_strategy(StrategyId::from("liquidity_reward"));
+        let mut system_subscriber = ring.subscribe_for_strategy(StrategyId::from("SYSTEM"));
+
+        gateway
+            .recover_from_gateway_store()
+            .expect("gateway recovery should run");
+
+        let record = gateway
+            .state
+            .order(&LocalOrderId::from("recover-open"))
+            .expect("recovered order should be in state");
+        assert_eq!(record.local_state, LocalOrderState::Open);
+        assert_eq!(
+            record.exch_id,
+            Some(ExchangeOrderId::from("exch-recover-open"))
+        );
+        assert_eq!(
+            gateway
+                .state
+                .local_by_exch
+                .get(&ExchangeOrderId::from("exch-recover-open")),
+            Some(&LocalOrderId::from("recover-open"))
+        );
+
+        let recovered = strategy_subscriber
+            .try_recv_relevant()
+            .expect("recovered event should publish");
+        assert_eq!(recovered.kind, OrderEventKind::Recovered);
+        assert!(recovered.recovery);
+        assert!(matches!(
+            recovered.payload,
+            OrderEventPayload::Recovered {
+                current_state: LocalOrderState::Open
+            }
+        ));
+
+        let completed = system_subscriber
+            .try_recv_relevant()
+            .expect("recovery completion should publish");
+        assert_eq!(completed.kind, OrderEventKind::RecoveryCompleted);
+        assert!(matches!(
+            completed.payload,
+            OrderEventPayload::RecoveryCompleted {
+                recovered_order_count: 1,
+                unresolved_order_count: 0,
+                failed_unrecoverable_count: 0,
+            }
+        ));
+        handle
+            .try_send(place_request("live-after-gateway-recovery"))
+            .expect("gateway should be live after recovery");
+    }
+
+    #[tokio::test]
+    async fn gateway_recovery_replays_pending_ws_observation_after_exchange_correlation() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        upsert_recoverable_gateway_order(&store, "recover-pending", "exch-recover-pending");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, _handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store(config, Arc::new(AllowAllRiskCheck), store);
+        let mut strategy_subscriber =
+            ring.subscribe_for_strategy(StrategyId::from("liquidity_reward"));
+
+        let pending_events = gateway
+            .state
+            .apply_observation(GatewayObservation::WsPartialFill {
+                exch_id: ExchangeOrderId::from("exch-recover-pending"),
+                fill_qty: dec(2.0),
+                fill_price: dec(0.42),
+                cum_qty: dec(2.0),
+                avg_fill_price: Some(dec(0.42)),
+                ts_ns: 9,
+                recovery: true,
+            });
+        assert!(pending_events.is_empty());
+
+        gateway
+            .recover_from_gateway_store()
+            .expect("gateway recovery should run");
+
+        let recovered = strategy_subscriber
+            .try_recv_relevant()
+            .expect("recovered event should publish");
+        let fill = strategy_subscriber
+            .try_recv_relevant()
+            .expect("pending fill should replay after recovery correlation");
+        assert_eq!(recovered.kind, OrderEventKind::Recovered);
+        assert_eq!(fill.kind, OrderEventKind::PartialFill);
+        assert!(fill.recovery);
+        let record = gateway
+            .state
+            .order(&LocalOrderId::from("recover-pending"))
+            .expect("recovered order should be in state");
+        assert_eq!(record.local_state, LocalOrderState::PartiallyFilled);
+        assert_eq!(record.filled_size_total, dec(2.0));
+        assert_eq!(record.remaining_size, dec(8.0));
+    }
+
+    #[test]
+    fn settlement_trade_observed_is_stored_pending_without_fill_event() {
+        let mut state = GatewayState::default();
+        let request = match place_request("local-1") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("local-1"),
+            exch_id: Some(ExchangeOrderId::from("exch-1")),
+            ts_ns: 1,
+            recovery: false,
+        });
+
+        let events = state.apply_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            fill_qty: dec(3.0),
+            fill_price: dec(0.42),
+            ts_ns: 2,
+            recovery: false,
+        });
+
+        assert!(events.is_empty());
+        assert!(state.has_pending_settlement_for_test("0xabc", "exch-1"));
+    }
+
+    #[test]
+    fn settlement_activity_confirmation_publishes_partial_fill_for_pending_trade() {
+        let mut state = GatewayState::default();
+        let request = match place_request("settlement-partial") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("settlement-partial"),
+            exch_id: Some(ExchangeOrderId::from("exch-1")),
+            ts_ns: 1,
+            recovery: false,
+        });
+        state.apply_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            fill_qty: dec(3.0),
+            fill_price: dec(0.42),
+            ts_ns: 2,
+            recovery: false,
+        });
+
+        let events = state.apply_observation(GatewayObservation::SettlementActivityConfirmed {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            ts_ns: 3,
+            recovery: false,
+        });
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, OrderEventKind::PartialFill);
+        assert!(matches!(
+            events[0].payload,
+            OrderEventPayload::PartialFill { fill_qty, cum_qty, .. }
+                if fill_qty == dec(3.0) && cum_qty == dec(3.0)
+        ));
+        let order = state
+            .order(&LocalOrderId::from("settlement-partial"))
+            .unwrap();
+        assert_eq!(order.local_state, LocalOrderState::PartiallyFilled);
+        assert_eq!(order.filled_size_total, dec(3.0));
+        assert_eq!(order.remaining_size, dec(7.0));
+    }
+
+    #[test]
+    fn settlement_activity_confirmation_publishes_fill_when_order_remaining_is_consumed() {
+        let mut state = GatewayState::default();
+        let request = match place_request("settlement-fill") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("settlement-fill"),
+            exch_id: Some(ExchangeOrderId::from("exch-1")),
+            ts_ns: 1,
+            recovery: false,
+        });
+        state.apply_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xdef"),
+            fill_qty: dec(10.0),
+            fill_price: dec(0.42),
+            ts_ns: 2,
+            recovery: false,
+        });
+
+        let events = state.apply_observation(GatewayObservation::SettlementActivityConfirmed {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xdef"),
+            ts_ns: 3,
+            recovery: false,
+        });
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, OrderEventKind::Fill);
+        assert!(matches!(
+            events[0].payload,
+            OrderEventPayload::Fill { fill_qty, cum_qty, .. }
+                if fill_qty == dec(10.0) && cum_qty == dec(10.0)
+        ));
+        let order = state.order(&LocalOrderId::from("settlement-fill")).unwrap();
+        assert_eq!(order.local_state, LocalOrderState::Filled);
+        assert_eq!(order.filled_size_total, dec(10.0));
+        assert_eq!(order.remaining_size, Decimal::ZERO);
+    }
+
+    #[test]
+    fn settlement_activity_confirmation_is_idempotent_for_same_transaction_and_order() {
+        let mut state = GatewayState::default();
+        let request = match place_request("settlement-idempotent") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("settlement-idempotent"),
+            exch_id: Some(ExchangeOrderId::from("exch-1")),
+            ts_ns: 1,
+            recovery: false,
+        });
+        state.apply_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            fill_qty: dec(3.0),
+            fill_price: dec(0.42),
+            ts_ns: 2,
+            recovery: false,
+        });
+
+        let first = state.apply_observation(GatewayObservation::SettlementActivityConfirmed {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            ts_ns: 3,
+            recovery: false,
+        });
+        let second = state.apply_observation(GatewayObservation::SettlementActivityConfirmed {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            ts_ns: 4,
+            recovery: false,
+        });
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        let order = state
+            .order(&LocalOrderId::from("settlement-idempotent"))
+            .unwrap();
+        assert_eq!(order.filled_size_total, dec(3.0));
+    }
+
+    #[test]
+    fn settlement_trade_before_rest_correlation_applies_after_rest_accepted() {
+        let mut state = GatewayState::default();
+        let request = match place_request("settlement-before-rest") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            fill_qty: dec(3.0),
+            fill_price: dec(0.42),
+            ts_ns: 1,
+            recovery: false,
+        });
+        state.apply_observation(GatewayObservation::SettlementActivityConfirmed {
+            exch_id: ExchangeOrderId::from("exch-1"),
+            transaction_hash: Arc::from("0xabc"),
+            ts_ns: 2,
+            recovery: false,
+        });
+
+        let events = state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("settlement-before-rest"),
+            exch_id: Some(ExchangeOrderId::from("exch-1")),
+            ts_ns: 3,
+            recovery: false,
+        });
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == OrderEventKind::PartialFill)
+        );
+        let order = state
+            .order(&LocalOrderId::from("settlement-before-rest"))
+            .unwrap();
+        assert_eq!(order.filled_size_total, dec(3.0));
+    }
+
+    #[test]
+    fn pending_private_ws_full_match_does_not_replay_fill_after_rest_acceptance() {
+        let mut state = GatewayState::default();
+        let request = match place_request("ws-pending-fill") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+
+        let pending_events = state.apply_private_ws_order_update(PrivateWsOrderUpdate {
+            exch_id: ExchangeOrderId::from("exch-ws-pending-fill"),
+            token_id: TokenId::from("token-1"),
+            market_id: MarketId::from("market-1"),
+            fill_price: dec(0.42),
+            previous_size_matched: Some(dec(4.0)),
+            current_size_matched: Some(dec(10.0)),
+            original_size: Some(dec(10.0)),
+            remote_status_code: Some(Arc::from("matched")),
+            ts_ns: 10,
+            recovery: false,
+        });
+        assert!(pending_events.is_empty());
+
+        let events = state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("ws-pending-fill"),
+            exch_id: Some(ExchangeOrderId::from("exch-ws-pending-fill")),
+            ts_ns: 11,
+            recovery: false,
+        });
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, OrderEventKind::Accepted);
+        assert_ne!(events[1].kind, OrderEventKind::Fill);
+        let record = state.order(&LocalOrderId::from("ws-pending-fill")).unwrap();
+        assert_ne!(record.local_state, LocalOrderState::Filled);
+        assert_eq!(record.filled_size_total, Decimal::ZERO);
+        assert_eq!(record.remaining_size, dec(10.0));
+    }
+
+    #[test]
+    fn private_ws_full_match_does_not_publish_fill_before_settlement_confirmation() {
+        let mut state = GatewayState::default();
+        let request = match place_request("local-1") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("local-1"),
+            exch_id: Some(ExchangeOrderId::from("exch-1")),
+            ts_ns: 1,
+            recovery: false,
+        });
+
+        let events = state.apply_observation(GatewayObservation::PrivateWsOrderUpdate(
+            PrivateWsOrderUpdate {
+                exch_id: ExchangeOrderId::from("exch-1"),
+                token_id: TokenId::from("token-1"),
+                market_id: MarketId::from("market-1"),
+                fill_price: dec(0.42),
+                previous_size_matched: Some(Decimal::ZERO),
+                current_size_matched: Some(dec(10.0)),
+                original_size: Some(dec(10.0)),
+                remote_status_code: Some(Arc::from("matched")),
+                ts_ns: 2,
+                recovery: false,
+            },
+        ));
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != OrderEventKind::Fill)
+        );
+        let order = state
+            .order(&LocalOrderId::from("local-1"))
+            .expect("order should stay tracked");
+        assert_ne!(order.local_state, LocalOrderState::Filled);
+        assert_eq!(order.filled_size_total, Decimal::ZERO);
+        assert_eq!(order.remaining_size, dec(10.0));
+    }
+
+    #[test]
+    fn private_ws_order_update_does_not_publish_partial_fill_before_settlement_confirmation() {
+        let mut state = GatewayState::default();
+        let request = match place_request("ws-partial") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("ws-partial"),
+            exch_id: Some(ExchangeOrderId::from("exch-ws-partial")),
+            ts_ns: 1,
+            recovery: false,
+        });
+
+        let events = state.apply_private_ws_order_update(PrivateWsOrderUpdate {
+            exch_id: ExchangeOrderId::from("exch-ws-partial"),
+            token_id: TokenId::from("token-1"),
+            market_id: MarketId::from("market-1"),
+            fill_price: dec(0.42),
+            previous_size_matched: Some(dec(1.0)),
+            current_size_matched: Some(dec(3.0)),
+            original_size: Some(dec(10.0)),
+            remote_status_code: Some(Arc::from("matched")),
+            ts_ns: 9,
+            recovery: false,
+        });
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != OrderEventKind::PartialFill
+                    && event.kind != OrderEventKind::Fill)
+        );
+        let record = state.order(&LocalOrderId::from("ws-partial")).unwrap();
+        assert_ne!(record.local_state, LocalOrderState::PartiallyFilled);
+        assert_ne!(record.local_state, LocalOrderState::Filled);
+        assert_eq!(record.filled_size_total, Decimal::ZERO);
+        assert_eq!(record.remaining_size, dec(10.0));
+    }
+
+    #[test]
+    fn private_ws_order_update_does_not_publish_fill_before_settlement_confirmation() {
+        let mut state = GatewayState::default();
+        let request = match place_request("ws-fill") {
+            OrderRequest::Place(request) => request,
+            OrderRequest::Cancel(_) => unreachable!(),
+        };
+        state.record_submitted(request);
+        state.apply_observation(GatewayObservation::RestAccepted {
+            local_id: LocalOrderId::from("ws-fill"),
+            exch_id: Some(ExchangeOrderId::from("exch-ws-fill")),
+            ts_ns: 1,
+            recovery: false,
+        });
+
+        let events = state.apply_private_ws_order_update(PrivateWsOrderUpdate {
+            exch_id: ExchangeOrderId::from("exch-ws-fill"),
+            token_id: TokenId::from("token-1"),
+            market_id: MarketId::from("market-1"),
+            fill_price: dec(0.42),
+            previous_size_matched: Some(dec(4.0)),
+            current_size_matched: Some(dec(10.0)),
+            original_size: Some(dec(10.0)),
+            remote_status_code: Some(Arc::from("matched")),
+            ts_ns: 10,
+            recovery: false,
+        });
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != OrderEventKind::Fill)
+        );
+        let record = state.order(&LocalOrderId::from("ws-fill")).unwrap();
+        assert_ne!(record.local_state, LocalOrderState::Filled);
+        assert_eq!(record.filled_size_total, Decimal::ZERO);
+        assert_eq!(record.remaining_size, dec(10.0));
     }
 
     #[test]
