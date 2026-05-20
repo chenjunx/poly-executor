@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -25,6 +25,12 @@ const DEFAULT_MAX_SPREAD: &str = "0.03";
 const DEFAULT_TICK_SIZE: &str = "0.01";
 const DEFAULT_MIN_SIZE: u32 = 5;
 const DEFAULT_MAX_SKEW: &str = "0.01";
+const VOLATILITY_WINDOW_MS: u64 = 5 * 60 * 1000;
+const VOLATILITY_MIN_SAMPLES: usize = 5;
+
+fn volatility_threshold() -> Decimal {
+    Decimal::from(2u32) / Decimal::from(100u32)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketMakerRule {
@@ -214,6 +220,135 @@ fn price_to_decimal(price: u16) -> Decimal {
 
 fn size_to_decimal(size: u32) -> Decimal {
     Decimal::from(size) / Decimal::from(PRICE_SCALE)
+}
+
+fn record_fair_midpoint_history(
+    history: &mut VecDeque<(u64, Decimal)>,
+    timestamp_ms: u64,
+    fair_mid: Decimal,
+    window_ms: u64,
+) {
+    history.push_back((timestamp_ms, fair_mid));
+    while let Some((oldest_timestamp_ms, _)) = history.front() {
+        if timestamp_ms.saturating_sub(*oldest_timestamp_ms) > window_ms {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn price_history_is_volatile(
+    history: &VecDeque<(u64, Decimal)>,
+    threshold: Decimal,
+    min_samples: usize,
+) -> bool {
+    if history.len() < min_samples {
+        return false;
+    }
+
+    let mut min_price = history[0].1;
+    let mut max_price = history[0].1;
+    for (_, price) in history.iter().skip(1) {
+        if *price < min_price {
+            min_price = *price;
+        }
+        if *price > max_price {
+            max_price = *price;
+        }
+    }
+
+    max_price - min_price > threshold
+}
+
+fn token_price_is_volatile(
+    price_history: &HashMap<String, VecDeque<(u64, Decimal)>>,
+    token_id: &str,
+) -> bool {
+    price_history.get(token_id).is_some_and(|history| {
+        price_history_is_volatile(history, volatility_threshold(), VOLATILITY_MIN_SAMPLES)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarketMakerRiskDecision {
+    Allow,
+    Skip { code: &'static str, reason: String },
+}
+
+impl MarketMakerRiskDecision {
+    fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+struct MarketMakerQuoteRiskContext<'a> {
+    rule: &'a MarketMakerRule,
+    intent: &'a TargetBuyQuoteIntent,
+    books: &'a HashMap<String, Arc<CleanOrderbook>>,
+    price_history: &'a HashMap<String, VecDeque<(u64, Decimal)>>,
+}
+
+fn check_market_maker_quote_risk(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
+    let checks: [fn(&MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision; 3] = [
+        check_abnormal_market_spread,
+        check_fair_midpoint_safe_range,
+        check_quote_volatility,
+    ];
+    for check in checks {
+        let decision = check(ctx);
+        if !decision.is_allow() {
+            return decision;
+        }
+    }
+
+    MarketMakerRiskDecision::Allow
+}
+
+fn check_abnormal_market_spread(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
+    let Some(book) = ctx.books.get(&ctx.intent.token_id) else {
+        return MarketMakerRiskDecision::Allow;
+    };
+    let market_spread =
+        price_to_decimal(book.best_ask_price) - price_to_decimal(book.best_bid_price);
+    if market_spread
+        > reward_max_spread(ctx.rule.rewards_max_spread.as_deref()) * Decimal::from(2u32)
+    {
+        MarketMakerRiskDecision::Skip {
+            code: "abnormal_market_spread",
+            reason: "abnormal market spread".to_string(),
+        }
+    } else {
+        MarketMakerRiskDecision::Allow
+    }
+}
+
+fn check_fair_midpoint_safe_range(
+    ctx: &MarketMakerQuoteRiskContext<'_>,
+) -> MarketMakerRiskDecision {
+    let Some(book) = ctx.books.get(&ctx.intent.token_id) else {
+        return MarketMakerRiskDecision::Allow;
+    };
+    let fair_mid = price_to_decimal(compute_fair_midpoint(book));
+    if fair_mid < dec_percent(15) || fair_mid > dec_percent(85) {
+        MarketMakerRiskDecision::Skip {
+            code: "fair_midpoint_out_of_range",
+            reason: "fair midpoint out of safe range".to_string(),
+        }
+    } else {
+        MarketMakerRiskDecision::Allow
+    }
+}
+
+fn check_quote_volatility(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
+    if token_price_is_volatile(ctx.price_history, &ctx.intent.token_id) {
+        MarketMakerRiskDecision::Skip {
+            code: "price_volatility",
+            reason: "price volatility too high".to_string(),
+        }
+    } else {
+        MarketMakerRiskDecision::Allow
+    }
 }
 
 pub fn compute_fair_midpoint(book: &CleanOrderbook) -> u16 {
@@ -584,11 +719,19 @@ impl Strategy for MarketMakerStrategy {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut books: HashMap<String, Arc<CleanOrderbook>> = HashMap::new();
+            let mut price_history: HashMap<String, VecDeque<(u64, Decimal)>> = HashMap::new();
             let mut submitted_quotes: BTreeSet<String> = BTreeSet::new();
             let mut rx = spawn_market_subscription_mux(market_subscriptions, 256);
             while let Some(event) = rx.recv().await {
                 log_fair_midpoint(&event);
-                books.insert(event.asset_id.to_string(), event.book.clone());
+                let asset_id = event.asset_id.to_string();
+                record_fair_midpoint_history(
+                    price_history.entry(asset_id.clone()).or_default(),
+                    event.book.timestamp_ms,
+                    price_to_decimal(compute_fair_midpoint(&event.book)),
+                    VOLATILITY_WINDOW_MS,
+                );
+                books.insert(asset_id, event.book.clone());
                 for rule in self.rules.iter() {
                     let (Some(yes_book), Some(no_book)) =
                         (books.get(&rule.token1), books.get(&rule.token2))
@@ -608,6 +751,26 @@ impl Strategy for MarketMakerStrategy {
                     for intent in
                         target_buy_quote_intents(rule, yes_fair_mid, no_fair_mid, &inventory)
                     {
+                        let risk_ctx = MarketMakerQuoteRiskContext {
+                            rule,
+                            intent: &intent,
+                            books: &books,
+                            price_history: &price_history,
+                        };
+                        match check_market_maker_quote_risk(&risk_ctx) {
+                            MarketMakerRiskDecision::Allow => {}
+                            MarketMakerRiskDecision::Skip { code, reason } => {
+                                warn!(
+                                    target: "order",
+                                    condition_id = %risk_ctx.rule.condition_id,
+                                    token_id = %risk_ctx.intent.token_id,
+                                    risk_code = code,
+                                    reason = %reason,
+                                    "market_maker 跳过报价"
+                                );
+                                continue;
+                            }
+                        }
                         let dedupe_key = quote_dedupe_key(rule, &intent);
                         if submitted_quotes.contains(&dedupe_key) {
                             continue;
@@ -645,7 +808,7 @@ impl Strategy for MarketMakerStrategy {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
 
     use super::*;
     use crate::strategy::{CleanOrderbook, MarketEvent};
@@ -656,12 +819,28 @@ mod tests {
         best_bid_size: u32,
         best_ask_size: u32,
     ) -> CleanOrderbook {
+        clean_book_at(
+            best_bid_price,
+            best_ask_price,
+            best_bid_size,
+            best_ask_size,
+            100,
+        )
+    }
+
+    fn clean_book_at(
+        best_bid_price: u16,
+        best_ask_price: u16,
+        best_bid_size: u32,
+        best_ask_size: u32,
+        timestamp_ms: u64,
+    ) -> CleanOrderbook {
         CleanOrderbook {
             best_bid_price,
             best_bid_size,
             best_ask_price,
             best_ask_size,
-            timestamp_ms: 100,
+            timestamp_ms,
             bids: Arc::new(BTreeMap::new()),
             asks: Arc::new(BTreeMap::new()),
         }
@@ -1025,6 +1204,191 @@ mod tests {
     }
 
     #[test]
+    fn volatility_guard_requires_minimum_samples() {
+        let history = VecDeque::from([
+            (1, dec(50, 100)),
+            (2, dec(51, 100)),
+            (3, dec(52, 100)),
+            (4, dec(53, 100)),
+        ]);
+
+        assert!(!price_history_is_volatile(&history, dec(2, 100), 5));
+    }
+
+    #[test]
+    fn volatility_guard_rejects_when_price_range_exceeds_threshold() {
+        let history = VecDeque::from([
+            (1, dec(50, 100)),
+            (2, dec(51, 100)),
+            (3, dec(52, 100)),
+            (4, dec(53, 100)),
+            (5, dec(521, 1000)),
+        ]);
+
+        assert!(price_history_is_volatile(&history, dec(2, 100), 5));
+    }
+
+    #[test]
+    fn fair_midpoint_history_prunes_prices_outside_window() {
+        let mut history = VecDeque::new();
+        record_fair_midpoint_history(&mut history, 1, dec(40, 100), 100);
+        record_fair_midpoint_history(&mut history, 50, dec(50, 100), 100);
+        record_fair_midpoint_history(&mut history, 102, dec(60, 100), 100);
+
+        assert_eq!(
+            history,
+            VecDeque::from([(50, dec(50, 100)), (102, dec(60, 100))])
+        );
+    }
+
+    #[test]
+    fn quote_risk_chain_skips_volatile_token_with_reason_code() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "maker-token-1".to_string(),
+            token2: "maker-token-2".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+        let intent = TargetBuyQuoteIntent {
+            token_id: "maker-token-1".to_string(),
+            quote: TargetQuote {
+                token_side: TargetTokenSide::Yes,
+                level: 1,
+                price: dec(49, 100),
+                size: Decimal::from(100u32),
+                size_usd: Decimal::from(49u32),
+                adjusted_mid: dec(50, 100),
+                distance: dec(1, 100),
+                raw_bid: dec(49, 100),
+            },
+        };
+        let price_history = HashMap::from([(
+            "maker-token-1".to_string(),
+            VecDeque::from([
+                (1, dec(50, 100)),
+                (2, dec(51, 100)),
+                (3, dec(52, 100)),
+                (4, dec(53, 100)),
+                (5, dec(521, 1000)),
+            ]),
+        )]);
+        let books = HashMap::from([(
+            "maker-token-1".to_string(),
+            Arc::new(clean_book(4_900, 5_100, 100, 100)),
+        )]);
+        let ctx = MarketMakerQuoteRiskContext {
+            rule: &rule,
+            intent: &intent,
+            books: &books,
+            price_history: &price_history,
+        };
+
+        let decision = check_market_maker_quote_risk(&ctx);
+
+        assert_eq!(
+            decision,
+            MarketMakerRiskDecision::Skip {
+                code: "price_volatility",
+                reason: "price volatility too high".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn quote_risk_chain_skips_when_market_spread_is_abnormally_wide() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "maker-token-1".to_string(),
+            token2: "maker-token-2".to_string(),
+            rewards_max_spread: Some("0.03".to_string()),
+            rewards_min_size: None,
+        };
+        let intent = TargetBuyQuoteIntent {
+            token_id: "maker-token-1".to_string(),
+            quote: TargetQuote {
+                token_side: TargetTokenSide::Yes,
+                level: 1,
+                price: dec(44, 100),
+                size: Decimal::from(100u32),
+                size_usd: Decimal::from(44u32),
+                adjusted_mid: dec(45, 100),
+                distance: dec(1, 100),
+                raw_bid: dec(44, 100),
+            },
+        };
+        let price_history = HashMap::new();
+        let books = HashMap::from([(
+            "maker-token-1".to_string(),
+            Arc::new(clean_book(4_000, 5_000, 100, 100)),
+        )]);
+        let ctx = MarketMakerQuoteRiskContext {
+            rule: &rule,
+            intent: &intent,
+            books: &books,
+            price_history: &price_history,
+        };
+
+        let decision = check_market_maker_quote_risk(&ctx);
+
+        assert_eq!(
+            decision,
+            MarketMakerRiskDecision::Skip {
+                code: "abnormal_market_spread",
+                reason: "abnormal market spread".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn quote_risk_chain_skips_when_fair_midpoint_is_out_of_safe_range() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "maker-token-1".to_string(),
+            token2: "maker-token-2".to_string(),
+            rewards_max_spread: Some("0.03".to_string()),
+            rewards_min_size: None,
+        };
+        let intent = TargetBuyQuoteIntent {
+            token_id: "maker-token-1".to_string(),
+            quote: TargetQuote {
+                token_side: TargetTokenSide::Yes,
+                level: 1,
+                price: dec(1, 100),
+                size: Decimal::from(100u32),
+                size_usd: Decimal::from(1u32),
+                adjusted_mid: dec(2, 100),
+                distance: dec(1, 100),
+                raw_bid: dec(1, 100),
+            },
+        };
+        let price_history = HashMap::new();
+        let books = HashMap::from([(
+            "maker-token-1".to_string(),
+            Arc::new(clean_book(900, 1_100, 100, 100)),
+        )]);
+        let ctx = MarketMakerQuoteRiskContext {
+            rule: &rule,
+            intent: &intent,
+            books: &books,
+            price_history: &price_history,
+        };
+
+        let decision = check_market_maker_quote_risk(&ctx);
+
+        assert_eq!(
+            decision,
+            MarketMakerRiskDecision::Skip {
+                code: "fair_midpoint_out_of_range",
+                reason: "fair midpoint out of safe range".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn fair_midpoint_returns_mid_when_best_sizes_are_equal() {
         let book = clean_book(40, 60, 100, 100);
 
@@ -1168,6 +1532,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_skips_quotes_for_volatile_token() {
+        let strategy = MarketMakerStrategy::from_pool_entries(vec![active_entry(
+            "0xabc",
+            "maker-token-1",
+            "maker-token-2",
+        )])
+        .expect("market maker should build")
+        .expect("non-empty pool should create strategy");
+        let (topic1_tx, topic1_rx) = tokio::sync::broadcast::channel(16);
+        let (topic2_tx, topic2_rx) = tokio::sync::broadcast::channel(16);
+        let subscriptions = StrategyMarketSubscriptions {
+            topics: vec![
+                (Arc::from("maker-token-1"), topic1_rx),
+                (Arc::from("maker-token-2"), topic2_rx),
+            ],
+        };
+        let (gateway_handle, mut gateway_rx) =
+            crate::order_gateway::OrderGatewayHandle::new_for_test(
+                8,
+                crate::order_gateway::GatewayPhase::Live,
+            );
+        let (_ingestor, ingest_handle, _persist_rx) =
+            crate::position_engine::PositionIngestor::new_for_test(8, 8);
+
+        let handle = strategy.spawn(subscriptions, gateway_handle, ingest_handle.read_handle());
+        for (timestamp_ms, bid, ask) in [
+            (1_000, 4_900, 5_100),
+            (2_000, 4_950, 5_150),
+            (3_000, 5_000, 5_200),
+            (4_000, 5_050, 5_250),
+            (5_000, 5_200, 5_400),
+        ] {
+            topic1_tx
+                .send(MarketEvent {
+                    topic: Arc::from("maker-token-1"),
+                    asset_id: Arc::from("maker-token-1"),
+                    book: Arc::new(clean_book_at(bid, ask, 100, 100, timestamp_ms)),
+                })
+                .expect("yes market event should send");
+        }
+        topic2_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-2"),
+                asset_id: Arc::from("maker-token-2"),
+                book: Arc::new(clean_book_at(4_900, 5_100, 100, 300, 6_000)),
+            })
+            .expect("no market event should send");
+        drop(topic1_tx);
+        drop(topic2_tx);
+        handle
+            .await
+            .expect("market maker task should exit when event channel closes");
+
+        let mut orders = Vec::new();
+        while let Ok(request) = gateway_rx.try_recv() {
+            orders.push(request);
+        }
+
+        assert_eq!(orders.len(), 3);
+        for request in orders {
+            let crate::order_gateway::OrderRequest::Place(request) = request else {
+                panic!("market maker should only place orders");
+            };
+            assert_eq!(request.token_id.as_str(), "maker-token-2");
+        }
+    }
+
+    #[tokio::test]
     async fn spawn_emits_buy_orders_to_gateway() {
         let strategy = MarketMakerStrategy::from_pool_entries(vec![active_entry(
             "0xabc",
@@ -1197,14 +1629,14 @@ mod tests {
             .send(MarketEvent {
                 topic: Arc::from("maker-token-1"),
                 asset_id: Arc::from("maker-token-1"),
-                book: Arc::new(clean_book(4_000, 6_000, 300, 100)),
+                book: Arc::new(clean_book(4_900, 5_100, 300, 100)),
             })
             .expect("yes market event should send");
         topic2_tx
             .send(MarketEvent {
                 topic: Arc::from("maker-token-2"),
                 asset_id: Arc::from("maker-token-2"),
-                book: Arc::new(clean_book(4_000, 6_000, 100, 300)),
+                book: Arc::new(clean_book(4_900, 5_100, 100, 300)),
             })
             .expect("no market event should send");
         drop(topic1_tx);

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use polymarket_client_sdk_v2::types::Decimal;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::config::AuthConfig;
 use crate::storage::{OrderGatewayEventInsert, OrderGatewayOrderSnapshot, OrderStore};
@@ -108,10 +108,30 @@ pub struct CancelOrderRequest {
     pub reason: Option<Arc<str>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderQueryLookup {
+    LocalId(LocalOrderId),
+    ExchangeId(ExchangeOrderId),
+}
+
+#[derive(Debug)]
+pub enum OrderQueryRequest {
+    ActiveOrders {
+        strategy_id: StrategyId,
+        reply_tx: oneshot::Sender<Vec<OrderRecord>>,
+    },
+    Order {
+        strategy_id: StrategyId,
+        lookup: OrderQueryLookup,
+        reply_tx: oneshot::Sender<Option<OrderRecord>>,
+    },
+}
+
+#[derive(Debug)]
 pub enum OrderRequest {
     Place(PlaceOrderRequest),
     Cancel(CancelOrderRequest),
+    Query(OrderQueryRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +161,18 @@ pub enum OrderRequestError {
     RingFull,
     GatewayRecovering,
     Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderQueryError {
+    Request(OrderRequestError),
+    ResponseDropped,
+}
+
+impl From<OrderRequestError> for OrderQueryError {
+    fn from(error: OrderRequestError) -> Self {
+        Self::Request(error)
+    }
 }
 
 #[derive(Clone)]
@@ -184,6 +216,15 @@ pub enum LocalOrderState {
     Failed,
     UnknownPending,
     UnknownTerminal,
+}
+
+impl LocalOrderState {
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Cancelled | Self::Rejected | Self::Failed | Self::UnknownTerminal
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,6 +627,31 @@ impl GatewayState {
 
     pub fn order(&self, local_id: &LocalOrderId) -> Option<&OrderRecord> {
         self.orders.get(local_id)
+    }
+
+    fn query_order(
+        &self,
+        strategy_id: &StrategyId,
+        lookup: &OrderQueryLookup,
+    ) -> Option<OrderRecord> {
+        let record = match lookup {
+            OrderQueryLookup::LocalId(local_id) => self.orders.get(local_id),
+            OrderQueryLookup::ExchangeId(exch_id) => self
+                .local_by_exch
+                .get(exch_id)
+                .and_then(|local_id| self.orders.get(local_id)),
+        }?;
+        (record.strategy_id == *strategy_id).then(|| record.clone())
+    }
+
+    fn active_orders_for_strategy(&self, strategy_id: &StrategyId) -> Vec<OrderRecord> {
+        self.orders
+            .values()
+            .filter(|record| {
+                record.strategy_id == *strategy_id && !record.local_state.is_terminal()
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn pending_settlement_keys(&self) -> Vec<SettlementKey> {
@@ -1271,6 +1337,25 @@ impl OrderGateway {
         match request {
             OrderRequest::Place(request) => self.handle_place_request(request).await,
             OrderRequest::Cancel(request) => self.handle_cancel_request(request).await,
+            OrderRequest::Query(request) => self.handle_query_request(request),
+        }
+    }
+
+    fn handle_query_request(&self, request: OrderQueryRequest) {
+        match request {
+            OrderQueryRequest::ActiveOrders {
+                strategy_id,
+                reply_tx,
+            } => {
+                let _ = reply_tx.send(self.state.active_orders_for_strategy(&strategy_id));
+            }
+            OrderQueryRequest::Order {
+                strategy_id,
+                lookup,
+                reply_tx,
+            } => {
+                let _ = reply_tx.send(self.state.query_order(&strategy_id, &lookup));
+            }
         }
     }
 
@@ -1801,6 +1886,32 @@ impl OrderGatewayHandle {
         })
     }
 
+    pub async fn query_active_orders(
+        &self,
+        strategy_id: StrategyId,
+    ) -> Result<Vec<OrderRecord>, OrderQueryError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.try_send(OrderRequest::Query(OrderQueryRequest::ActiveOrders {
+            strategy_id,
+            reply_tx,
+        }))?;
+        reply_rx.await.map_err(|_| OrderQueryError::ResponseDropped)
+    }
+
+    pub async fn query_order(
+        &self,
+        strategy_id: StrategyId,
+        lookup: OrderQueryLookup,
+    ) -> Result<Option<OrderRecord>, OrderQueryError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.try_send(OrderRequest::Query(OrderQueryRequest::Order {
+            strategy_id,
+            lookup,
+            reply_tx,
+        }))?;
+        reply_rx.await.map_err(|_| OrderQueryError::ResponseDropped)
+    }
+
     pub fn set_phase(&self, phase: GatewayPhase) {
         self.phase.store(phase.as_u8(), Ordering::Release);
     }
@@ -1814,10 +1925,18 @@ mod tests {
     use polymarket_client_sdk_v2::types::Decimal;
 
     fn place_request(local_id: &str) -> OrderRequest {
+        place_request_for_strategy("liquidity_reward", "token-1", local_id)
+    }
+
+    fn place_request_for_strategy(
+        strategy_id: &str,
+        token_id: &str,
+        local_id: &str,
+    ) -> OrderRequest {
         OrderRequest::Place(PlaceOrderRequest {
-            strategy_id: StrategyId::from("liquidity_reward"),
-            market_id: Some(MarketId::from("liquidity_reward")),
-            token_id: TokenId::from("token-1"),
+            strategy_id: StrategyId::from(strategy_id),
+            market_id: Some(MarketId::from(strategy_id)),
+            token_id: TokenId::from(token_id),
             local_id: LocalOrderId::from(local_id),
             side: OrderSide::Buy,
             order_type: GatewayOrderType::Limit {
@@ -2023,7 +2142,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("local-1") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         let exch_id = ExchangeOrderId::from("exch-1");
 
@@ -2059,7 +2178,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("local-timeout") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
 
@@ -2087,7 +2206,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("local-cancel") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2199,7 +2318,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("persist-1") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         let accepted = state
@@ -2251,6 +2370,147 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].local_id, "runtime-persist-1");
         assert_eq!(active[0].local_state, "Open");
+    }
+
+    #[tokio::test]
+    async fn query_active_orders_returns_only_matching_strategy_non_terminal_orders() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: true,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, _ring, _observation_tx) =
+            OrderGateway::new_for_test(config, Arc::new(AllowAllRiskCheck));
+        handle.set_phase(GatewayPhase::Live);
+
+        handle
+            .try_send(place_request_for_strategy(
+                "strategy-a",
+                "token-a-open",
+                "a-open",
+            ))
+            .expect("send should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+        handle
+            .try_send(place_request_for_strategy(
+                "strategy-a",
+                "token-a-filled",
+                "a-filled",
+            ))
+            .expect("send should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+        handle
+            .try_send(place_request_for_strategy(
+                "strategy-b",
+                "token-b-open",
+                "b-open",
+            ))
+            .expect("send should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        gateway.handle_observation(GatewayObservation::SettlementTradeObserved {
+            exch_id: ExchangeOrderId::from("sim-token-a-filled"),
+            transaction_hash: Arc::from("0xabc"),
+            fill_qty: dec(10.0),
+            fill_price: dec(0.42),
+            ts_ns: 10,
+            recovery: false,
+        });
+        gateway.handle_observation(GatewayObservation::SettlementActivityConfirmed {
+            exch_id: ExchangeOrderId::from("sim-token-a-filled"),
+            transaction_hash: Arc::from("0xabc"),
+            ts_ns: 11,
+            recovery: false,
+        });
+
+        let query_handle = handle.clone();
+        let query_task = tokio::spawn(async move {
+            query_handle
+                .query_active_orders(StrategyId::from("strategy-a"))
+                .await
+        });
+        assert!(gateway.run_one_request_for_test().await);
+        let active_orders = query_task
+            .await
+            .expect("query task should finish")
+            .expect("query should return records");
+
+        assert_eq!(active_orders.len(), 1);
+        assert_eq!(active_orders[0].local_id, LocalOrderId::from("a-open"));
+        assert_eq!(active_orders[0].strategy_id, StrategyId::from("strategy-a"));
+        assert_eq!(active_orders[0].local_state, LocalOrderState::Open);
+    }
+
+    #[tokio::test]
+    async fn query_order_is_strategy_scoped_and_supports_local_and_exchange_ids() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: true,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, _ring, _observation_tx) =
+            OrderGateway::new_for_test(config, Arc::new(AllowAllRiskCheck));
+        handle.set_phase(GatewayPhase::Live);
+
+        handle
+            .try_send(place_request_for_strategy(
+                "strategy-a",
+                "token-a",
+                "a-local",
+            ))
+            .expect("send should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let local_query_handle = handle.clone();
+        let local_query = tokio::spawn(async move {
+            local_query_handle
+                .query_order(
+                    StrategyId::from("strategy-a"),
+                    OrderQueryLookup::LocalId(LocalOrderId::from("a-local")),
+                )
+                .await
+        });
+        assert!(gateway.run_one_request_for_test().await);
+        let by_local = local_query
+            .await
+            .expect("query task should finish")
+            .expect("query should return response")
+            .expect("matching local id should find order");
+        assert_eq!(by_local.local_id, LocalOrderId::from("a-local"));
+        assert_eq!(by_local.exch_id, Some(ExchangeOrderId::from("sim-token-a")));
+
+        let exchange_query_handle = handle.clone();
+        let exchange_query = tokio::spawn(async move {
+            exchange_query_handle
+                .query_order(
+                    StrategyId::from("strategy-a"),
+                    OrderQueryLookup::ExchangeId(ExchangeOrderId::from("sim-token-a")),
+                )
+                .await
+        });
+        assert!(gateway.run_one_request_for_test().await);
+        let by_exchange = exchange_query
+            .await
+            .expect("query task should finish")
+            .expect("query should return response")
+            .expect("matching exchange id should find order");
+        assert_eq!(by_exchange.local_id, LocalOrderId::from("a-local"));
+
+        let mismatched_strategy_handle = handle.clone();
+        let mismatched_strategy_query = tokio::spawn(async move {
+            mismatched_strategy_handle
+                .query_order(
+                    StrategyId::from("strategy-b"),
+                    OrderQueryLookup::LocalId(LocalOrderId::from("a-local")),
+                )
+                .await
+        });
+        assert!(gateway.run_one_request_for_test().await);
+        let mismatched_strategy_result = mismatched_strategy_query
+            .await
+            .expect("query task should finish")
+            .expect("query should return response");
+        assert!(mismatched_strategy_result.is_none());
     }
 
     fn upsert_recoverable_gateway_order(
@@ -2435,7 +2695,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("local-1") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2463,7 +2723,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("settlement-partial") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2508,7 +2768,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("settlement-fill") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2551,7 +2811,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("settlement-idempotent") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2595,7 +2855,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("settlement-before-rest") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::SettlementTradeObserved {
@@ -2636,7 +2896,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("ws-pending-fill") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
 
@@ -2675,7 +2935,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("local-1") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2718,7 +2978,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("ws-partial") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
@@ -2759,7 +3019,7 @@ mod tests {
         let mut state = GatewayState::default();
         let request = match place_request("ws-fill") {
             OrderRequest::Place(request) => request,
-            OrderRequest::Cancel(_) => unreachable!(),
+            _ => unreachable!(),
         };
         state.record_submitted(request);
         state.apply_observation(GatewayObservation::RestAccepted {
