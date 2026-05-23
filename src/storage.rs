@@ -70,6 +70,19 @@ pub struct StoredRewardMarketPoolState {
     pub kick_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredDailyLossState {
+    pub trading_day: String,
+    pub day_start_total_pnl: Decimal,
+    pub day_start_equity: Decimal,
+    pub loss_limit_ratio: Decimal,
+    pub loss_limit_amount: Decimal,
+    pub halted: bool,
+    pub halt_reason: Option<String>,
+    pub halted_at_ms: Option<u64>,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedLiquidityRewardPoolEntry {
     pub condition_id: String,
@@ -532,6 +545,18 @@ impl OrderStore {
                     summary_json TEXT NOT NULL,
                     alert_message TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS risk_daily_loss_state (
+                    trading_day TEXT PRIMARY KEY,
+                    day_start_total_pnl TEXT NOT NULL,
+                    day_start_equity TEXT NOT NULL,
+                    loss_limit_ratio TEXT NOT NULL,
+                    loss_limit_amount TEXT NOT NULL,
+                    halted INTEGER NOT NULL,
+                    halt_reason TEXT,
+                    halted_at_ms INTEGER,
+                    updated_at_ms INTEGER NOT NULL
+                );
 ",
             )?;
             ensure_column(
@@ -805,6 +830,99 @@ impl OrderStore {
                     now,
                 ],
             )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_daily_loss_state(
+        &self,
+        trading_day: &str,
+    ) -> anyhow::Result<Option<StoredDailyLossState>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "
+                SELECT trading_day, day_start_total_pnl, day_start_equity, loss_limit_ratio,
+                       loss_limit_amount, halted, halt_reason, halted_at_ms, updated_at_ms
+                FROM risk_daily_loss_state
+                WHERE trading_day = ?1
+                ",
+                params![trading_day],
+                |row| {
+                    Ok(StoredDailyLossState {
+                        trading_day: row.get(0)?,
+                        day_start_total_pnl: decimal_from_str(&row.get::<_, String>(1)?)
+                            .map_err(to_sql_error)?,
+                        day_start_equity: decimal_from_str(&row.get::<_, String>(2)?)
+                            .map_err(to_sql_error)?,
+                        loss_limit_ratio: decimal_from_str(&row.get::<_, String>(3)?)
+                            .map_err(to_sql_error)?,
+                        loss_limit_amount: decimal_from_str(&row.get::<_, String>(4)?)
+                            .map_err(to_sql_error)?,
+                        halted: row.get::<_, i64>(5)? != 0,
+                        halt_reason: row.get(6)?,
+                        halted_at_ms: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                        updated_at_ms: row.get::<_, i64>(8)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn upsert_daily_loss_state(&self, state: &StoredDailyLossState) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO risk_daily_loss_state (
+                    trading_day, day_start_total_pnl, day_start_equity, loss_limit_ratio,
+                    loss_limit_amount, halted, halt_reason, halted_at_ms, updated_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(trading_day) DO UPDATE SET
+                    day_start_total_pnl = excluded.day_start_total_pnl,
+                    day_start_equity = excluded.day_start_equity,
+                    loss_limit_ratio = excluded.loss_limit_ratio,
+                    loss_limit_amount = excluded.loss_limit_amount,
+                    halted = excluded.halted,
+                    halt_reason = excluded.halt_reason,
+                    halted_at_ms = excluded.halted_at_ms,
+                    updated_at_ms = excluded.updated_at_ms
+                ",
+                params![
+                    state.trading_day.as_str(),
+                    state.day_start_total_pnl.to_string(),
+                    state.day_start_equity.to_string(),
+                    state.loss_limit_ratio.to_string(),
+                    state.loss_limit_amount.to_string(),
+                    if state.halted { 1_i64 } else { 0_i64 },
+                    state.halt_reason.as_deref(),
+                    state.halted_at_ms.map(|value| value as i64),
+                    state.updated_at_ms as i64,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn halt_daily_loss_state(
+        &self,
+        trading_day: &str,
+        reason: &str,
+        halted_at_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.with_conn(|conn| {
+            let affected = conn.execute(
+                "
+                UPDATE risk_daily_loss_state
+                SET halted = 1, halt_reason = ?2, halted_at_ms = ?3, updated_at_ms = ?3
+                WHERE trading_day = ?1
+                ",
+                params![trading_day, reason, halted_at_ms as i64],
+            )?;
+            anyhow::ensure!(
+                affected == 1,
+                "daily loss state not found for trading day {trading_day}"
+            );
             Ok(())
         })
     }
@@ -1193,6 +1311,17 @@ impl OrderStore {
                 rows,
                 open_orders,
             }))
+        })
+    }
+
+    pub fn load_max_order_gateway_event_seq(&self) -> anyhow::Result<u64> {
+        self.with_conn(|conn| {
+            let seq = conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM order_gateway_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(seq as u64)
         })
     }
 
@@ -2223,6 +2352,55 @@ fn side_from_str(value: &str) -> anyhow::Result<QuoteSide> {
 mod tests {
     use super::*;
 
+    fn dec(value: &str) -> Decimal {
+        Decimal::from_str(value).expect("decimal should parse")
+    }
+
+    #[test]
+    fn daily_loss_state_roundtrips_and_halts() {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let state = StoredDailyLossState {
+            trading_day: "2026-05-22".to_string(),
+            day_start_total_pnl: dec("1.5"),
+            day_start_equity: dec("1000"),
+            loss_limit_ratio: dec("0.03"),
+            loss_limit_amount: dec("30"),
+            halted: false,
+            halt_reason: None,
+            halted_at_ms: None,
+            updated_at_ms: 100,
+        };
+
+        store
+            .upsert_daily_loss_state(&state)
+            .expect("state should upsert");
+        let loaded = store
+            .load_daily_loss_state("2026-05-22")
+            .expect("state should load")
+            .expect("state should exist");
+        assert_eq!(loaded.day_start_total_pnl, dec("1.5"));
+        assert_eq!(loaded.day_start_equity, dec("1000"));
+        assert!(!loaded.halted);
+
+        store
+            .halt_daily_loss_state("2026-05-22", "loss reached", 200)
+            .expect("state should halt");
+        let halted = store
+            .load_daily_loss_state("2026-05-22")
+            .expect("state should load")
+            .expect("state should exist");
+        assert!(halted.halted);
+        assert_eq!(halted.halt_reason, Some("loss reached".to_string()));
+        assert_eq!(halted.halted_at_ms, Some(200));
+        assert_eq!(halted.updated_at_ms, 200);
+
+        let missing = store
+            .halt_daily_loss_state("2099-01-01", "missing", 300)
+            .expect_err("missing state should not halt");
+        assert!(missing.to_string().contains("daily loss state not found"));
+    }
+
     #[test]
     fn order_gateway_schema_persists_snapshot_event_and_submission() {
         let store = OrderStore::open(":memory:").expect("store should open");
@@ -2304,6 +2482,50 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].local_id, "local-1");
         assert_eq!(active[0].exch_id.as_deref(), Some("exch-1"));
+    }
+
+    #[test]
+    fn load_max_order_gateway_event_seq_reads_latest_event_seq() {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        assert_eq!(
+            store
+                .load_max_order_gateway_event_seq()
+                .expect("empty max seq should load"),
+            0
+        );
+
+        store
+            .append_order_gateway_event(&OrderGatewayEventInsert {
+                seq: 33,
+                strategy_id: "market_maker",
+                token_id: "token-1",
+                market_id: Some("market-1"),
+                local_id: Some("local-1"),
+                exch_id: Some("exch-1"),
+                event_kind: "Open",
+                local_state: "Open",
+                remote_status_code: Some("open"),
+                remote_reject_code: None,
+                remote_reject_reason: None,
+                fill_delta: None,
+                fill_total: Some("0"),
+                remaining_size: Some("10"),
+                avg_fill_price: None,
+                error_code: None,
+                error_message: None,
+                raw_json: "{}",
+                recovery: false,
+            })
+            .expect("event should persist");
+
+        assert_eq!(
+            store
+                .load_max_order_gateway_event_seq()
+                .expect("max seq should load"),
+            33
+        );
     }
 
     #[test]

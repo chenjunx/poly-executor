@@ -1,128 +1,337 @@
 # poly-executor
 
-Polymarket 预测市场自动化交易执行器，支持**配对套利**和**流动性奖励做市**两种策略，通过 WebSocket 实时订阅行情，并将真实订单状态与行情/模拟分析数据分库存储到 SQLite。
+Polymarket 自动化交易执行器。当前项目以 **公开行情订阅、策略计算、订单网关、仓位管理、全局风控** 为核心链路，支持配对套利告警、做市策略模拟/发单、订单恢复、仓位估值、单日亏损停止和行情录制。
 
 ---
 
 ## 目录
 
-- [功能概览](#功能概览)
 - [当前整体情况](#当前整体情况)
+- [运行链路](#运行链路)
+- [策略](#策略)
+- [订单网关](#订单网关)
+- [仓位与估值](#仓位与估值)
+- [风控](#风控)
+- [行情订阅与存储](#行情订阅与存储)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [CSV 文件格式](#csv-文件格式)
-- [数据库表结构](#数据库表结构)
+- [数据库与持久化](#数据库与持久化)
+- [工具命令](#工具命令)
 - [模块说明](#模块说明)
-
----
-
-## 功能概览
-
-| 功能 | 说明 |
-|---|---|
-| 配对套利（PairArbitrage） | 监听 YES/NO token 对，当 `1 - (ask_YES + ask_NO) > min_diff` 时发出套利信号 |
-| 流动性奖励做市（LiquidityReward） | 围绕 mid 价持续挂 limit 单，赚取 Polymarket 官方做市奖励 |
-| 模拟模式 | 全局或策略级模拟开关，本地模拟成交与仓位，不发送真实订单 |
-| 故障恢复 | 启动时从 SQLite 自动恢复订单关联关系和做市挂单状态 |
-| 行情录制 | 可选将 best tick / 全量订单簿快照 / 成交事件异步写入 SQLite |
-| 代理支持 | 支持 SOCKS5 / HTTP 代理连接 WebSocket |
+- [已知限制](#已知限制)
 
 ---
 
 ## 当前整体情况
 
-当前工程以 Polymarket 自动化交易为主，主流程由 `main.rs` 串起：加载配置，初始化订单库和行情库，创建并恢复 OrderGateway，创建策略，连接公开行情 WebSocket、私有订单 WebSocket、持仓刷新、订单执行和可选的奖励市场池任务。
+项目当前围绕 Polymarket 的 YES/NO token 运行：
 
-### 运行链路
+- 行情层按 **token = topic** 分发，策略只订阅自己关心的 token。
+- 策略层当前包含 `pair_arbitrage` 和 `market_maker`。
+- 订单统一通过 `OrderGateway`，策略不直接访问交易所。
+- 仓位由订单事件驱动，维护全局和策略级 token 仓位。
+- 风控在 gateway 层统一拦截新下单，并允许撤单继续执行。
+- 模拟模式由 `[simulation].enabled` 控制；开启后不启动真实私有订单 WS 和 settlement poller。
+- 配置文件从 `config.toml` 读取，再由 `config.local.toml` 覆盖，敏感配置应放在本地覆盖文件。
+
+---
+
+## 运行链路
 
 ```text
-公开行情 WS -> market.rs 本地订单簿 -> topic broadcast -> 策略
-策略 OrderRequest -> order_gateway.rs -> Polymarket CLOB / 模拟成交 -> orders.db
-私有订单 WS -> order_gateway.rs -> OrderEventRing -> position_engine.rs
-启动恢复 -> order_gateway.rs -> orders.db gateway 表 -> OrderEventRing
-奖励市场加载/监听 -> reward_market_cache.rs / reward_market_pool_monitor.rs -> market.db
+config.toml + config.local.toml
+        |
+        v
+main.rs 初始化日志、SQLite、账户监控、策略、风控、OrderGateway
+        |
+        +--> market.rs 公开行情 WS
+        |        |
+        |        +--> 本地订单簿 / MarketBookReadHandle
+        |        +--> token topic broadcast -> 策略
+        |        +--> tick/raw recorder -> market.db
+        |
+        +--> strategy::{pair_arbitrage, market_maker}
+        |        |
+        |        +--> OrderRequest::{Place, Cancel, Query}
+        |
+        +--> order::order_gateway
+        |        |
+        |        +--> GatewayRiskEngine
+        |        +--> simulation 或真实 CLOB 下单
+        |        +--> OrderEventRing
+        |        +--> orders.db gateway 快照和事件
+        |
+        +--> order::order_ws / settlement activity poller（非 simulation）
+        |        |
+        |        +--> GatewayObservation -> OrderGateway
+        |
+        +--> position::position_engine
+                 |
+                 +--> position journal/snapshot
+                 +--> position read handle -> 策略和风控
 ```
 
-### 当前策略
+---
 
-- `PairArbitrage`：读取 `assets.csv`，发现 `1 - (ask0 + ask1) > min_diff` 后发出配对套利信号。
-- `LiquidityReward`：读取 CSV 或 DB selected pool，按 token pair 做流动性奖励挂单。策略只主动挂买单；任一侧成交后会 halt 整对 token，撤掉未成交买单，并尝试用 FAK 卖单 unwind 已成交仓位。
+## 策略
 
-### LiquidityReward 当前状态机重点
+### PairArbitrage
 
-- 每个 token 正常只允许一张 active 买单。
-- 换价采用两阶段：先写 `pending_replacement` 并请求撤 active，收到旧单 `canceled` 后才 promote 新单。
-- `token1/token2` 必须属于同一市场 pair；配错会导致 halt、unwind 和单边状态串到错误市场。
-- 成交由私有订单 WS 或下单即成交状态驱动；如果远端订单没有本地 `orders` 记录和 correlation，系统无法自动发钉钉、无法触发 halt/unwind。
-- 删除本地 `orders.db` 不会取消远端 open orders；远端孤儿单仍可能占用余额并继续成交。
-- 遇到 `not enough balance / allowance` 后，策略进入账户级余额冷却，暂停新买单和 pending promote；撤单和 unwind 不受冷却影响。
+`PairArbitrageStrategy` 从 `assets.csv` 读取 token 对，维护每个 token 最新 best bid/ask：
 
-### 当前流动性奖励市场来源
+```text
+套利空间 = 1 - (ask_token0 + ask_token1)
+```
 
-`[liquidity_reward] source` 控制策略市场来源：
+当套利空间大于 `[app].min_diff`，且价格区间和 bid/ask spread 满足配置过滤条件时，当前只输出套利信号日志，不直接发真实订单。
 
-- `csv`：默认值，从 `liquidity_reward.csv` 读取固定市场。
-- `db_pool`：从行情库 `reward_market_pool_state` 中读取 `liquidity_reward_selected=1`、仍在池内、且当前 `pool_version` 未被 halt 的市场。
+### MarketMaker
 
-即使策略来源仍是 `csv`，当 `liquidity_reward.enabled=true`、`monitor_enabled=true` 且非全局模拟模式时，奖励市场 loader/monitor 仍会启动并维护 `market.db` 中的奖励市场池；它不一定会被策略采用，除非 `source="db_pool"`。
+`MarketMakerStrategy` 从 `market_maker.csv` 读取 YES/NO token pair。每个市场会同时观察 YES 和 NO 两边订单簿，并生成买单报价。
 
-### 奖励市场池当前规则
+当前核心计算：
 
-奖励市场池每天按 UTC 日期构建一次，成功后等待下一个 UTC 零点；失败会保留旧数据并按监控间隔重试。当前默认筛选规则：
+1. 对每个 token 从订单簿计算 fair midpoint。
+2. 用 YES/NO 各自 fair midpoint 对当前仓位估值。
+3. 计算库存偏斜：
+   - YES 偏多时，让 NO 更容易买到。
+   - NO 偏多时，让 YES 更容易买到。
+4. 生成多档目标买单。
+5. 通过策略内风控检查后，向 `OrderGateway` 投递 `PlaceOrderRequest`。
 
-1. 每日奖励 `market_daily_reward > 50`。
-2. 距离市场结束时间大于 48 小时。
-3. 按 `market_competitiveness` 排序，去掉前 20% 和后 20%。
-4. 从剩余市场中选择可配置数量 `pool_market_count`：头部一半和尾部一半写入 `liquidity_reward_selected=1`。
-5. pool monitor 订阅 selected/active 市场 token；只检查 `token1`，若 spread 大于 `0.1` 或 best bid 不在 `[0.1, 0.9]`，则把市场标记踢出池，通知策略 halt/cancel/unwind，并发送钉钉剔除通知。
-6. UTC 重建池子时，旧 selected 市场如果不在新池子中，会通知策略停止该 token pair；新 selected 市场不会热加入，需等进程下次从 DB pool 构建策略。
-7. loader 启动时会读取 DB 中最新 `build_date_utc/pool_version`；如果当天 UTC 池子已构建，则不会因为进程重启立即重刷。
+报价参数来自 `[market_maker]` 配置；其中 CSV 的 `rewards_max_spread` 和 `reward_min_size` 是市场级参数，会优先覆盖全局默认值。
 
-### 数据库边界
+### MarketMaker 策略内风控和冷静期
 
-- `orders.db` 是订单恢复真相来源，保存本地订单、远端订单 ID、订单事件、策略 active/pending 状态。
-- `market.db` 是行情和奖励市场池来源，保存 tick/raw book 和 pool 状态。
-- 启动恢复只会基于本地非终结订单去远端 reconcile；它不会在本地 DB 为空时反向导入所有远端 open orders。
-- 真实模式排障时必须同时确认：运行进程、实际配置路径、实际 `sqlite_path`、远端 open orders、本地订单库和订单日志。
+做市策略下单前会执行内部 quote risk：
+
+| 风控码 | 触发条件 | 冷静期 |
+|---|---|---:|
+| `abnormal_market_spread` | YES/NO 组合盘口 spread 异常 | 1 分钟 |
+| `fair_midpoint_out_of_range` | fair midpoint 超出安全价格区间 | 10 分钟 |
+| `price_volatility` | 5 分钟窗口内 fair midpoint 波动超过阈值 | 5 分钟 |
+
+触发任一规则后：
+
+1. 市场进入冷静期。
+2. 立即向 `OrderGateway` 投递撤单请求。
+3. 冷静期内跳过该市场所有新报价。
+4. 冷静期结束后重新评估；如果风险仍存在，会再次进入冷静期并再次撤单。
+
+撤单范围：
+
+- `market_maker.csv` 中有 `condition_id`：按 `CancelScope::Market` 撤掉该市场订单。
+- 没有 `condition_id`：退化为按 `token1` 和 `token2` 分别发送 `CancelScope::Token`。
+
+---
+
+## 订单网关
+
+`OrderGateway` 是策略和交易所之间的唯一入口。
+
+策略只投递：
+
+- `OrderRequest::Place`
+- `OrderRequest::Cancel`
+- `OrderRequest::Query`
+
+gateway 负责：
+
+- 启动恢复本地未终结订单。
+- 统一调用 `GatewayRiskEngine`。
+- 在 simulation 模式下生成本地模拟订单事件。
+- 在真实模式下执行 CLOB 下单。
+- 接收私有订单 WS observation。
+- 接收 Data API settlement activity confirmation。
+- 发布 `OrderEventRing` 事件给仓位引擎。
+- 将 gateway 快照、事件和提交记录写入 SQLite。
+
+当前 cancel scope：
+
+| Scope | 说明 |
+|---|---|
+| `LocalOrderId` | 撤单个本地订单 |
+| `Token` | 撤某个 token 下该策略的非终结订单 |
+| `Market` | 撤某个 market/condition 下该策略的非终结订单 |
+| `AllForStrategy` | 撤该策略全部非终结订单 |
+
+注意：当前 gateway 已有本地取消状态处理；真实 Polymarket REST 撤单接口仍需要继续接入。
+
+---
+
+## 仓位与估值
+
+`position::position_engine` 是单写者仓位引擎，通过 `OrderEventRing` 消费订单事件，维护：
+
+- strategy + token 仓位
+- global + token 仓位
+- working buy exposure
+- filled position
+- cost basis
+- realized pnl
+- degraded 状态
+
+估值位于 `position::valuation`：
+
+```text
+market_value   = filled_position * mark_price
+unrealized_pnl = market_value - cost_basis
+total_pnl      = realized_pnl + unrealized_pnl
+```
+
+当前只做 token 级和 portfolio 汇总估值，不做 YES/NO 配对 matched/unmatched 估值。
+
+`PortfolioValuation` 会汇总：
+
+- `market_value`
+- `cost_basis`
+- `realized_pnl`
+- `unrealized_pnl`
+- `total_pnl`
+- `missing_price_tokens`
+- `degraded`
+
+全局风控使用 `MarkPriceKind::BestBid` 作为 mark price，偏保守。
+
+---
+
+## 风控
+
+风控位于 `risk::risk`，由 `GatewayRiskEngine` 在下单前执行。
+
+当前已有规则：
+
+| 规则 | 说明 |
+|---|---|
+| PositionEngineHealthRule | 仓位引擎未 live 时拒绝新下单，允许撤单 |
+| DailyLossLimitRule | 单日亏损达到阈值后拒绝当天所有新下单 |
+| BasicOrderSanityRule | 基础订单参数检查 |
+| StrategyKindOrderSizeRule | 按策略类型限制单笔订单大小 |
+| GlobalTokenExposureRule | 按 token 限制全局风险暴露 |
+| StrategyKindTokenExposureRule | 按策略类型限制 token 暴露 |
+
+### 单日亏损停止
+
+默认开启：
+
+```text
+loss_limit_ratio = 0.03
+```
+
+第一版账户权益定义为账户 collateral balance。当天第一次有可用估值和账户权益时，风控持久化：
+
+```text
+day_start_total_pnl
+day_start_equity
+loss_limit_amount = day_start_equity * 0.03
+```
+
+之后每次新下单计算：
+
+```text
+daily_pnl = current_total_pnl - day_start_total_pnl
+```
+
+如果：
+
+```text
+daily_pnl <= -loss_limit_amount
+```
+
+则写入 `risk_daily_loss_state.halted = 1`，并拒绝当天所有新下单。
+
+重启保护：
+
+- 当天已经 halted：重启后仍拒绝新下单。
+- 估值缺价格或 degraded：保守拒绝新下单。
+- 账户权益不可用或非正数：保守拒绝新下单。
+- cancel 请求不受 daily loss halt 影响。
+
+---
+
+## 行情订阅与存储
+
+`market.rs` 连接 Polymarket 公开行情 WS，维护每个 token 的本地订单簿。
+
+当前分发模型：
+
+```text
+token_id == topic
+```
+
+策略注册自己关心的 token，`main.rs` 为每个 token 创建 broadcast channel。公开行情收到某个 asset/token 的更新后：
+
+1. 更新本地 `MarketBookPublisher`。
+2. 发送 firehose 事件。
+3. 发送该 token topic 的策略事件。
+
+行情内部仍使用固定精度整数：
+
+| 字段 | 类型 | 精度 |
+|---|---|---|
+| price | `u16` | 除以 `10000` 得到实际价格 |
+| size | `u32` | 除以 `10000` 得到实际数量 |
+
+策略计算层当前仍沿用固定精度数据；只有日志、下单、存储、展示等边界会转换成实际精度。
+
+可选 recorder：
+
+- `tick_store_enabled=true`：写入 best bid/ask tick。
+- `raw_store_enabled=true`：写入全量订单簿快照和 trade event。
 
 ---
 
 ## 快速开始
 
-1. 复制并填写配置文件：
+1. 准备配置：
 
 ```bash
 cp config.toml config.local.toml
-# 编辑 config.local.toml，填写 auth / order 等敏感配置
 ```
 
-2. 准备 CSV 文件（参见 [CSV 文件格式](#csv-文件格式)）：
+在 `config.local.toml` 填写真实 `auth`、代理、数据库路径等本地配置。不要提交真实密钥。
 
-```
-assets.csv              # 配对套利的 token 对
-liquidity_reward.csv    # 做市规则
+2. 准备 CSV：
+
+```text
+assets.csv          # pair_arbitrage token 对
+market_maker.csv    # market_maker YES/NO token 对
 ```
 
-3. 编译并运行：
+3. 编译：
 
 ```bash
 cargo build --release
+```
+
+4. 运行：
+
+```bash
 ./target/release/poly-executor
 ```
 
-> 配置文件查找优先级：先读取可执行文件同目录的 `config.toml`，再用 `config.local.toml` 叠加覆盖（`config.local.toml` 建议加入 `.gitignore`，存放密钥等敏感配置）。
+Windows PowerShell 下通常是：
+
+```powershell
+.\target\release\poly-executor.exe
+```
 
 ---
 
 ## 配置说明
 
+### `[chain]`
+
+| 配置项 | 类型 | 默认/示例 | 说明 |
+|---|---|---|---|
+| `rpc_url` | String | `https://polygon-rpc.com` | Polygon RPC，用于 `merge` 工具等链上操作 |
+
 ### `[proxy]`
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `url` | String | `""` | 代理地址，支持 `socks5://host:port` 或 `http://host:port`；为空时自动读取 `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` 环境变量 |
-
----
+| 配置项 | 类型 | 说明 |
+|---|---|---|
+| `url` | String | 代理地址，例如 `socks5://127.0.0.1:7890`；为空时按代码路径使用直连或环境代理能力 |
 
 ### `[auth]`
 
@@ -131,130 +340,104 @@ cargo build --release
 | `api_key` | String | Polymarket CLOB API Key |
 | `api_secret` | String | Polymarket CLOB API Secret |
 | `passphrase` | String | Polymarket CLOB API Passphrase |
-| `private_key` | String | EIP-712 签名私钥（`0x` 开头），用于链上订单签名 |
+| `private_key` | String | EIP-712 签名私钥 |
 | `funder` | String | 钱包地址 |
-
----
 
 ### `[order]`
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `size_usdc` | f64 | `10.0` | 配对套利每次投入的 USDC 总量 |
-
----
-
-### `[chain]`
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `rpc_url` | String | `"https://polygon-rpc.com"` | Polygon 主网 RPC 地址，用于 `merge` 工具等链上操作；建议换成 Alchemy/Infura 专用节点提高稳定性 |
-
----
+| 配置项 | 类型 | 说明 |
+|---|---|---|
+| `size_usdc` | f64 | pair arbitrage 每次套利信号对应的 USDC 尺寸参数 |
 
 ### `[simulation]`
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `enabled` | bool | `false` | 全局模拟开关。`true` 时跳过所有与交易所的真实交互（真实订单 WebSocket、持仓 API、下单请求），改为本地模拟成交与仓位。**这是控制是否真实交易的唯一开关。** |
-
-> 注：原 `[order] enabled` 字段已移除，统一由 `[simulation] enabled` 控制。
-
----
-
-### `[liquidity_reward]`
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `enabled` | bool | `false` | 是否启用流动性奖励做市策略 |
-| `file` | String | `"liquidity_reward.csv"` | CSV 来源下的做市规则文件路径 |
-| `source` | String | `"csv"` | 做市市场来源：`csv` 从文件读取；`db_pool` 从 `market.db.reward_market_pool_state` 的 selected 市场读取 |
-| `pool_market_count` | usize | `6` | 每日奖励市场池中标记给 liquidity reward 策略使用的市场数量 |
-| `monitor_enabled` | bool | `false` | 是否启动奖励市场 loader 和 pool monitor（非模拟模式下生效） |
-| `simulation` | bool | `false` | 做市策略内部模拟开关，独立于全局 `[simulation]` |
-| `balance_cooldown_secs` | u64 | `60` | 余额或 allowance 不足时暂停新买单和 pending promote 的秒数 |
-
-> 注：`[liquidity_reward]` 在代码中兼容历史别名 `[mid_requote]`。
-
----
+|---|---|---:|---|
+| `enabled` | bool | `false` | 是否启用全局模拟模式。`true` 时不走真实私有订单 WS、settlement poller 和真实下单链路 |
 
 ### `[app]`
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `log_file` | String | `"alerts.log"` | 告警/策略日志文件名 |
-| `order_log_file` | String | `"orders.log"` | 订单专用日志文件名 |
-| `assets_file` | String | `"assets.csv"` | 配对套利 token 对配置文件路径 |
-| `sqlite_path` | String | `"orders.db"` | 订单库路径，保存真实订单、订单事件和策略恢复状态 |
-| `market_sqlite_path` | String | `""` | 行情/模拟库路径；为空时默认使用订单库同目录下的 `market.db` |
-| `min_diff` | f64 | — | 套利触发阈值：`1 - (ask_YES + ask_NO) > min_diff` |
-| `max_spread` | f64 | — | 单 token 最大 bid/ask 价差上限，超过则跳过 |
-| `min_price` | f64 | — | 有效价格区间下限，低于此值跳过 |
-| `max_price` | f64 | — | 有效价格区间上限，超过此值跳过 |
-| `default_threads` | usize | — | 未在 `[topic_threads]` 中单独配置的 topic 使用的 WebSocket 连接数 |
-| `tick_store_enabled` | bool | `false` | 是否将 best bid/ask 变化时的 tick 写入 `market_ticks` 表 |
-| `raw_store_enabled` | bool | `false` | 是否将全量订单簿快照写入 `book_snapshots` 表、成交事件写入 `trade_events` 表 |
+| 配置项 | 类型 | 说明 |
+|---|---|---|
+| `log_file` | String | 日志文件路径 |
+| `assets_file` | String | `assets.csv` 路径 |
+| `sqlite_path` | String | 订单库路径，默认常用 `orders.db` |
+| `market_sqlite_path` | String | 行情库路径；为空时派生为订单库同目录下 `market.db` |
+| `min_diff` | f64 | pair arbitrage 触发阈值 |
+| `max_spread` | f64 | pair arbitrage 单 token 最大 bid/ask spread |
+| `min_price` | f64 | pair arbitrage 有效价格下限 |
+| `max_price` | f64 | pair arbitrage 有效价格上限 |
+| `default_threads` | usize | 历史订阅线程参数；当前 token topic 路由下实际作用有限 |
+| `tick_store_enabled` | bool | 是否记录 best tick |
+| `raw_store_enabled` | bool | 是否记录 raw book snapshot 和 trade event |
 
----
+### `[market_maker]`
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `enabled` | bool | `true` | 是否启动做市策略；`false` 时不会读取 `market_maker.csv` |
+| `file` | String | `market_maker.csv` | 做市市场 CSV 文件路径；相对路径按可执行文件目录解析 |
+| `max_inventory_usd` | f64 | `100.0` | 单市场库存归一化上限，单位 USD；用于计算 `inventory_ratio` |
+| `overweight_ratio` | f64 | `0.7` | 库存比例超过该值认为超重，超重时减少报价档位 |
+| `default_max_spread` | f64 | `0.03` | CSV 未配置 `rewards_max_spread` 时使用的默认最大报价偏离 |
+| `tick_size` | f64 | `0.01` | 报价价格 tick，目标买价会向下取整到该 tick |
+| `min_size` | f64 | `5.0` | CSV 未配置 `reward_min_size` / `rewards_min_size` 时使用的默认最小 token 数量 |
+| `max_skew` | f64 | `0.01` | 库存偏斜对报价 `adjusted_mid` 的最大调整幅度 |
+| `volatility_window_ms` | u64 | `300000` | fair midpoint 波动率统计窗口，单位毫秒 |
+| `volatility_min_samples` | usize | `5` | 波动率检测所需最少样本数 |
+| `volatility_threshold` | f64 | `0.02` | 窗口内 fair midpoint 最大值和最小值差超过该阈值时触发冷静期 |
+| `spread_cooldown_ms` | u64 | `60000` | 市场盘口 spread 异常后的冷静期，单位毫秒 |
+| `volatility_cooldown_ms` | u64 | `300000` | fair midpoint 波动率过高后的冷静期，单位毫秒 |
+| `fair_midpoint_cooldown_ms` | u64 | `600000` | fair midpoint 超出安全价格区间后的冷静期，单位毫秒 |
+| `fair_midpoint_min` | f64 | `0.15` | fair midpoint 安全区间下限 |
+| `fair_midpoint_max` | f64 | `0.85` | fair midpoint 安全区间上限 |
+| `abnormal_market_spread_multiplier` | f64 | `2.0` | 市场盘口 spread 大于 `max_spread * multiplier` 时认为异常 |
+| `normal_quote_levels` | usize | `3` | 正常库存状态下最多报价档位数 |
+| `overweight_quote_levels` | usize | `2` | 库存超重状态下最多报价档位数 |
+| `level_ratios` | Vec<f64> | `[0.4, 0.55, 0.7]` | 每档距离 fair midpoint 的比例：`distance = max_spread * level_ratio` |
+| `level_sizes_usd` | Vec<f64> | `[50.0, 75.0, 100.0]` | 每档目标美元金额：`size = max(level_size_usd / price, min_size)` |
+| `reconcile_size_tolerance` | f64 | `0.2` | reconcile 判断当前挂单 size 接近目标 size 的容忍比例 |
+
+优先级：`market_maker.csv` 的 `rewards_max_spread` 覆盖 `default_max_spread`，`reward_min_size` / `rewards_min_size` 覆盖 `min_size`。`PRICE_SCALE`、`MARKET_MAKER_NAME`、风控 code 和 `local_order_id` 格式是内部协议，不是配置项。
 
 ### `[notification.dingtalk]`
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
+|---|---|---:|---|
 | `enabled` | bool | `false` | 是否启用钉钉通知 |
-| `webhook` | String | `""` | 钉钉机器人完整 webhook；真实值建议放到 `config.local.toml` |
-| `secret` | String | `""` | 钉钉机器人加签 secret；为空时不加签 |
-| `timeout_secs` | u64 | `5` | 钉钉 HTTP 请求超时秒数 |
-| `queue_size` | usize | `1024` | 通知队列长度；队列满时丢弃通知，不阻塞订单 WebSocket |
+| `webhook` | String | `""` | 钉钉机器人 webhook |
+| `secret` | String | `""` | 钉钉加签 secret；为空时不加签 |
+| `timeout_secs` | u64 | `5` | HTTP 请求超时 |
+| `queue_size` | usize | `1024` | 通知队列长度 |
 
-当前通知触发条件：真实订单 WebSocket 检测到 liquidity_reward 订单成交增量，部分成交也会通知。通知发送失败只写日志，不影响策略 halt、撤单或订单状态更新。
+### `[liquidity_reward]`
 
----
+配置结构仍存在，部分代码也仍保留奖励市场池 loader/monitor 和历史状态表；当前主流程的做市策略加载入口是 `market_maker.csv`。
 
-### `[topic_threads]`
-
-为特定 topic 分配独立的 WebSocket 连接数，未列出的 topic 使用 `default_threads`。
-
-```toml
-[topic_threads]
-us_iran = 1
-# cs = 2
-# sports = 4
-```
-
----
-
-## 工具命令
-
-### `merge` — 头寸合并（YES+NO → USDC）
-
-将等量的 YES token 和 NO token 通过 Polymarket CTF 合约（`mergePositions`）换回 USDC。
-
-```bash
-cargo build --release --bin merge
-./target/release/merge <condition_id> <amount_usdc>
-```
-
-| 参数 | 说明 |
-|---|---|
-| `condition_id` | 市场的 condition ID，`0x` 开头 64 位十六进制 |
-| `amount_usdc` | 要合并的数量（USDC，如 `100.0`） |
-
-读取 `config.toml` / `config.local.toml` 中的 `[auth] private_key` 和 `[chain] rpc_url`，直接向 Polygon 发起链上交易。
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `enabled` | bool | `false` | 历史 liquidity reward 开关 |
+| `file` | String | `""` | 历史 CSV 文件路径 |
+| `source` | String | `csv` | 历史市场来源 |
+| `pool_market_count` | usize | `6` | 奖励市场池选入数量 |
+| `pool_max_rewards_min_size` | Option<f64> | `None` | 奖励池筛选参数 |
+| `monitor_enabled` | bool | `false` | 是否启动奖励市场池监控 |
+| `simulation` | bool | `false` | 历史策略内部模拟开关 |
+| `balance_cooldown_secs` | u64 | `60` | 历史余额冷却参数 |
 
 ---
 
 ## CSV 文件格式
 
-### `assets.csv`（配对套利）
+### `assets.csv`
 
-每行定义一对需要监控套利机会的 token，**含表头行**：
+用于 `pair_arbitrage`，要求有表头。
 
-| 列 | 字段名 | 类型 | 说明 |
+| 列 | 字段 | 必填 | 说明 |
 |---|---|---|---|
-| 0 | `token0` | String | YES token 的 Polymarket asset ID |
-| 1 | `token1` | String | 配对 token 的 asset ID（同一市场对立 outcome） |
-| 2 | `topic` | String | 订阅分组名，对应 `[topic_threads]` 中的键；同一 topic 的 token 共享 WebSocket 连接 |
+| 0 | `token0` / 任意表头 | 是 | 第一个 token asset ID |
+| 1 | `token1` / 任意表头 | 是 | 第二个 token asset ID |
+| 2 | `topic` / 任意表头 | 否 | 历史 topic 字段；当前订阅实际按 token 自身注册 |
 
 示例：
 
@@ -263,215 +446,147 @@ token0,token1,topic
 84133519426074676...,53265937461843025...,us_iran
 ```
 
----
+### `market_maker.csv`
 
-### `liquidity_reward.csv`（做市奖励规则）
+用于 `MarketMakerStrategy`，要求有表头。
 
-每行定义一个市场的做市规则，**含表头行**：
+当前解析字段：
 
-| 列 | 字段名 | 类型 | 必填 | 说明 |
-|---|---|---|---|---|
-| 0 | `token1` | String | 是 | YES token asset ID；策略会对此 token 挂买单 |
-| 1 | `token2` | String | 否 | 配对 NO token asset ID；填写后策略也会对此 token 挂买单；为空时仅对 token1 做市 |
-| 2 | `topic` | String | 否 | 订阅分组名；为空时默认使用 `"liquidity_reward"` |
-| 3 | `reward_min_orders` | u32 | 否 | 奖励达标所需的最少挂单数量（用于 monitor 评估） |
-| 4 | `reward_max_spread_cents` | f64 | 否 | 奖励有效的最大价差（**单位：cents**，如 `4` 表示 4 cents，即 offset = 0.04）。挂单价格和奖励区间均由此字段计算，建议填整数如 `3` 或 `4`。 |
-| 5 | `reward_min_size` | f64 | 否 | 奖励有效的最小单笔挂单金额（USDC） |
-| 6 | `reward_daily_pool` | f64 | 否 | 该市场每日奖励总池（USDC） |
-| 7 | `fixed_price` | bool | 否 | 报价模式开关：`true` = FixedPrice 模式；空或 `false` = CompetitorBased 模式（默认）。详见下方说明。 |
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `condition_id` | 否 | Polymarket 市场 condition ID；存在时用于 market 级撤单和 local order id |
+| `token1` | 是 | YES 或第一侧 token asset ID |
+| `token2` | 是 | NO 或第二侧 token asset ID |
+| `rewards_max_spread` | 否 | 市场级最大报价偏离；有值时覆盖 `[market_maker].default_max_spread` |
+| `reward_min_size` / `rewards_min_size` | 否 | 市场级最小 token 数量；有值时覆盖 `[market_maker].min_size` |
+
+兼容说明：
+
+- 如果没有 `condition_id` 列，会按旧格式读取前两列作为 `token1` 和 `token2`。
+- 如果有 `condition_id`，冷静期撤单使用 `CancelScope::Market`。
+- 如果没有 `condition_id`，冷静期撤单使用两个 token scope。
+- 做市行为参数来自 `[market_maker]`；CSV 只保留市场级覆盖项。
 
 示例：
 
 ```csv
-token1,token2,topic,reward_min_orders,reward_max_spread_cents,reward_min_size,reward_daily_pool,fixed_price
-84133519426074676...,53265937461843025...,us_iran,5,4,100,50,        <- CompetitorBased（默认）
-12345678901234567...,98765432109876543...,quiet_market,,4,50,30,true  <- FixedPrice
+condition_id,token1,token2
+0xabc...,84133519426074676...,53265937461843025...
+```
+
+旧格式仍可用：
+
+```csv
+token1,token2
+84133519426074676...,53265937461843025...
 ```
 
 ---
 
-### LiquidityReward 报价逻辑
+## 数据库与持久化
 
-策略对 `liquidity_reward.csv` 中配置的每个 token 独立维护一个买单状态。填写 `token1` 和 `token2` 时，分别在 YES token 和 NO token 上挂买单，而不是在同一 token 上挂买卖双边。
+项目默认使用两个 SQLite 文件：
 
-#### 实时价格输入
-
-每次收到 market WebSocket 的 `book` 或 `price_change` 后，`market.rs` 维护本地完整订单簿，并将最新 top-of-book 和全量 bids 传给策略：
-
-```text
-best_bid = 当前订单簿最高 bid
-best_ask = 当前订单簿最低 ask
-mid      = (best_bid + best_ask) / 2
-```
-
-#### 目标价与奖励有效区间
-
-两种模式共用以下价格计算，基于 `reward_max_spread_cents`（单位 cents，除以 100 得到小数）：
-
-```text
-spread           = reward_max_spread_cents / 100
-target_price     = snap_to_tick(mid - spread / 2, tick, 向下取整)
-min_reward_price = mid - spread
-```
-
-- `target_price`：理想挂单价，位于奖励区间内靠近 mid 的一侧。
-- `min_reward_price`：奖励有效的最低买单价，低于此值通常不计入官方奖励。
-
----
-
-#### 模式一：CompetitorBased（默认，`fixed_price` 为空或 `false`）
-
-**适合场景**：交投活跃、对手盘深度好的市场。策略跟随对手盘，不暴露为 best bid，尽量降低被成交的风险。
-
-策略会从 bids 中扣除自己的 active/pending 订单后，计算竞争对手最高 bid：
-
-```text
-competitor_best_bid = 排除自己挂单后的最高 bid
-non_best_cap        = competitor_best_bid - tick
-```
-
-最终 `desired_price` 选取规则：
-
-| 条件 | desired_price | 含义 |
+| 数据库 | 默认路径 | 说明 |
 |---|---|---|
-| `non_best_cap >= target_price` | `target_price` | 在理想位挂单 |
-| `min_reward_price <= non_best_cap < target_price` | `non_best_cap` | 退让至竞争者下方，仍在奖励区间内 |
-| `non_best_cap < min_reward_price` | — | 奖励区间外，撤单等待盘口恢复 |
-| 无竞争对手 bid | — | 不挂单，如有 active 则撤单等待 |
+| 订单库 | `orders.db` | 订单、gateway、仓位、全局风控状态 |
+| 行情库 | `market.db` | tick、raw book、trade event、奖励市场池 |
 
----
+### 订单库关键表
 
-#### 模式二：FixedPrice（`fixed_price = true`）
-
-**适合场景**：交投清淡、几乎无成交的市场。策略按 clean mid 计算 `target_price` 后直接挂单，最大化奖励时间占比。
-
-```text
-current_external_bid = 当前 token 排除自己 active/pending 后的最高 bid
-paired_external_bid  = 配对 token 排除自己 active/pending 后的最高 bid
-current_external_ask = 1 - paired_external_bid
-clean_mid            = (current_external_bid + current_external_ask) / 2
-desired_price        = target_price（始终）
-```
-
-- paired YES/NO 规则使用 `clean_mid` 计算 `target_price`，避免把自己在配对 token 上的买单当成当前 token 的外部 ask。
-- mid 每次变化重新计算 `target_price`；若与 active 不同则换单，相同则保持不动。
-- 不使用 CompetitorBased 的 `non_best_cap` 退让逻辑；但仍会排除自己的 active/pending 订单来获得外部盘口。
-- 如果无法得到 clean mid，则不新挂单；已有 active 时会先撤掉，等待外部盘口恢复。
-- 策略有意接受偶发成交的风险，成交后由 halt + 市价平仓逻辑兜底。
-
----
-
-#### 下单、替换和等待状态机（两种模式共用）
-
-每个 token 的状态：
-
-- `active_order`：当前已挂出的本地订单。
-- `pending_replacement`：等待旧单取消后补上的新订单。
-- `cancel_requested`：是否已发出取消请求，防重复。
-- `last_mid` / `last_best_bid` / `last_best_ask`：最近一次行情快照。
-- `halted`：成交后终止策略的保护标志。
-
-每次行情更新后的决策：
-
-| 当前状态 | 决策 |
+| 表 | 说明 |
 |---|---|
-| 无 active，无 pending，存在合法 `desired_price` | 直接下新买单 |
-| 有 active，且 `active.price != desired_price` | 创建 pending replacement，请求取消 active |
-| 有 active，且 `active.price == desired_price` | 保持不变 |
-| 已有 pending replacement | 等待旧 active 取消确认，不重复发单 |
-| 无法得到合法 `desired_price`，有 active | 发送 cancel-only，撤掉后等待 |
-| 无法得到合法 `desired_price`，无 active | 继续等待 |
+| `order_gateway_snapshots` | gateway 订单状态快照 |
+| `order_gateway_events` | gateway 订单事件日志 |
+| `order_gateway_submissions` | 下单提交记录 |
+| `position_journal` | 仓位事件流水 |
+| `position_snapshots` | 仓位快照 |
+| `position_open_orders` | 仓位侧 working exposure 快照 |
+| `position_reconciliations` | 仓位对账记录 |
+| `risk_daily_loss_state` | 单日亏损风控状态，支持重启后继续 halted |
+| `strategy_state_mid_requote*` | 历史 liquidity reward/mid requote 状态表 |
 
-replacement 流程是异步的：策略先发出 `LiquidityRewardStageReplacement`，订单执行模块取消旧 active；收到 `canceled` 后，策略才将 pending replacement 正式下出，避免同一 token 同时暴露两笔替换订单。
+### 行情库关键表
 
----
+| 表 | 说明 |
+|---|---|
+| `market_ticks` | best bid/ask tick |
+| `book_snapshots` | 全量订单簿快照，BLOB 固定格式 |
+| `trade_events` | 公开成交事件 |
+| `reward_market_pool_state` | 奖励市场池状态 |
 
-#### 成交终止保护（两种模式共用）
+`book_snapshots` BLOB 每档 6 字节：
 
-任一订单发生成交（部分成交也算），策略立即进入终止保护：
-
-1. 取消 token 对（YES + NO）上所有 active/pending 订单。
-2. 将两个 token 状态标记为 `halted`，不再补单。
-3. 以 `last_best_bid` 为参考价，立即发出市价卖单，平掉成交的持仓（`delta_size`）。
-
-市价卖单价格来自成交时刻的 `last_best_bid`（snap 到 tick）；在流动性薄的市场，实际成交价可能低于参考价，产生一定价差损失，属于已知风险。
-
-真实订单 WebSocket 检测到成交增量时，若启用了 `[notification.dingtalk]`，会异步发送钉钉通知，通知失败不影响 halt 和撤单流程。
-
-当策略来源为 `db_pool` 时，halt 会持久化到当前池子版本：`reward_market_pool_state.liquidity_reward_halted=1`，并记录 `liquidity_reward_halted_pool_version`、`liquidity_reward_halted_at_ms` 和 `liquidity_reward_halt_reason`。进程重启后，同一个 `pool_version` 下已 halted 的市场不会再次进入策略；UTC 重新构建池子生成新 `pool_version` 后，旧 halt 不再阻止该市场重新参与策略。
-
-奖励池 monitor 踢出市场、以及 UTC 重建时旧 selected 市场消失，也会走同一套 halt/cancel/unwind 保护；其中 monitor 踢出还会发送钉钉剔除通知。
-
----
-
-#### 关键订单日志 reason
-
-| reason | 触发模式 | 含义 |
-|---|---|---|
-| `no_order` | 两种 | 无订单，按 desired_price 新挂单 |
-| `target_price_changed` | CompetitorBased | active 价格与 desired_price 不一致，触发替换 |
-| `price_drifted` | FixedPrice | mid 偏移导致 target_price 变化，触发替换 |
-| `unchanged` | 两种 | active 已在 desired_price，保持不动 |
-| `pending_replacement` | 两种 | 已有待补单，等待旧单取消确认 |
-| `outside_reward_zone_wait` | CompetitorBased | 退让后掉出奖励区间，撤单或等待 |
-| `no_competitor_bid` | CompetitorBased | 无可参考的竞争对手 bid，撤单或等待 |
-| `no_external_fixed_mid` | FixedPrice | 无法从当前 token 外部 bid 和配对 token 外部 bid 计算 clean mid，撤单或等待 |
-| `invalid_target_price` | 两种 | 目标价格非法（≤ 0），撤单或等待 |
-
----
-
-## 数据库表结构
-
-项目使用两个 SQLite 库，避免大体量行情/raw 数据和真实订单恢复状态共用同一个 WAL：
-
-- 订单库：`[app] sqlite_path`，默认 `orders.db`。
-- 行情/模拟库：`[app] market_sqlite_path`；为空时默认派生为订单库同目录下的 `market.db`。
-
-### 订单库表
-
-| 表名 | 写入时机 | 说明 |
-|---|---|---|
-| `orders` | 每次下单/状态变更 | 核心订单表；`status` 值：`pending` / `open` / `filled` / `canceled` / `rejected` |
-| `order_events` | 订单生命周期事件 | 订单流水，`payload_json` 存储原始事件 JSON；订单 WS 的 `ws_update` 也在这里，用于计算成交增量 |
-| `strategy_state_mid_requote` | 做市策略状态变更 | 做市策略共享状态快照，用于崩溃恢复 |
-| `strategy_state_mid_requote_side` | 做市策略状态变更 | 做市策略按 token/side 保存 active、pending、cancel_requested 等状态，PK 为 `(token, side)` |
-
-### 行情/模拟库表
-
-| 表名 | 写入时机 | 说明 |
-|---|---|---|
-| `market_ticks` | `tick_store_enabled=true` | best bid/ask 变化时的 tick 记录；price/size 精度为 1/10000 的整数 |
-| `book_snapshots` | `raw_store_enabled=true` | 全量订单簿快照；`bids`/`asks` 为 BLOB，格式：每档 6 字节 = `price(u16 LE)` + `size(u32 LE)` |
-| `trade_events` | `raw_store_enabled=true` | `last_trade_price` 成交事件；字段：`token`、`market`、`price`、`side`、`size`、`fee_rate`、`ts_ms` |
-| `reward_market_pool_state` | `monitor_enabled=true` 且非模拟模式 | 每日奖励市场池状态；包含 token1/token2、competitiveness、奖励参数、是否仍在池、踢出原因、是否被选入 liquidity reward 策略，以及当前池子版本内是否已被 halt |
-
-旧版本已经写在订单库里的行情表不会自动迁移或删除；新版本只保证新增行情/模拟数据写入行情库。
-
-`book_snapshots` BLOB 解析（Python 示例）：
-
-```python
-import struct
-
-def parse_levels(blob: bytes) -> list[tuple[float, float]]:
-    levels = []
-    for i in range(0, len(blob), 6):
-        price = struct.unpack_from('<H', blob, i)[0] / 10000
-        size  = struct.unpack_from('<I', blob, i + 2)[0] / 10000
-        levels.append((price, size))
-    return levels
+```text
+price: u16 little-endian
+size : u32 little-endian
 ```
+
+解析时都需要除以 `10000` 得到实际值。
+
+---
+
+## 工具命令
+
+### `merge`
+
+`src/bin/merge.rs` 用于把同一市场等量 YES + NO 通过 Polygon CTF 合约 merge 回 USDC。
+
+```bash
+cargo build --release --bin merge
+./target/release/merge <condition_id> <amount_usdc>
+```
+
+PowerShell：
+
+```powershell
+cargo build --release --bin merge
+.\target\release\merge.exe <condition_id> <amount_usdc>
+```
+
+参数：
+
+| 参数 | 说明 |
+|---|---|
+| `condition_id` | Polymarket 市场 condition ID |
+| `amount_usdc` | merge 数量，单位 USDC |
 
 ---
 
 ## 模块说明
 
-| 模块 | 说明 |
+| 路径 | 说明 |
 |---|---|
-| `market.rs` | WebSocket 行情订阅；维护每个 token 的本地 BTreeMap 订单簿；按 topic broadcast 分发行情事件，并提供 firehose 全量行情流 |
-| `order_gateway.rs` | 接收策略请求，经过风控后真实或模拟下单；统一处理启动恢复、私有订单 WS observation、订单事件和 SQLite 持久化 |
-| `order_ws.rs` | Polymarket 私有订单频道网络适配层，把订单更新转换为 OrderGateway observation |
-| `position_engine.rs` | 单写者维护成交仓位，提供同步读取接口并异步持久化 |
-| `reward_market_cache.rs` | 拉取 Polymarket 当前奖励市场和市场详情，按规则构建每日奖励市场池并写入行情库 |
-| `reward_market_pool_monitor.rs` | 动态订阅奖励市场池行情，按 token1 spread 和 bid 区间把不合格市场踢出池 |
-| `storage.rs` | SQLite 封装；订单库与行情库分离，使用 WAL + NORMAL sync 模式 |
-| `proxy_ws.rs` | SOCKS5 / HTTP 代理 WebSocket 连接层 |
+| `src/main.rs` | 程序入口，串联配置、日志、SQLite、策略、行情、订单、仓位和风控 |
+| `src/config.rs` | 配置结构和加载逻辑 |
+| `src/market.rs` | 公开行情 WS、本地订单簿、token topic 分发、行情 recorder |
+| `src/order/order_gateway.rs` | 订单网关、风控接入、订单状态机、启动恢复、事件发布和持久化 |
+| `src/order/order_ws.rs` | Polymarket 私有订单 WS observation 适配 |
+| `src/position/position_engine.rs` | 仓位单写者、读句柄、持久化任务、订单事件桥接 |
+| `src/position/valuation.rs` | token 和 portfolio 估值 |
+| `src/risk/risk.rs` | gateway 全局/策略类型风控，包括 daily loss |
+| `src/strategies/pair_arbitrage.rs` | 配对套利信号策略 |
+| `src/strategies/market_maker.rs` | 做市策略、库存偏斜、多档报价、内部风控冷静期 |
+| `src/strategies/strategy.rs` | 策略公共类型、订阅注册、market subscription mux |
+| `src/storage.rs` | SQLite schema 和读写封装 |
+| `src/account.rs` | 账户资金快照监控 |
+| `src/clob_client.rs` | 认证 CLOB client 构造 |
+| `src/reward_market_cache.rs` | 奖励市场池 loader |
+| `src/reward_market_pool_monitor.rs` | 奖励市场池监控和剔除 |
+| `src/notification.rs` | 钉钉通知 |
+| `src/proxy_ws.rs` | 代理 WebSocket 连接 |
+| `src/tick_size.rs` | tick size 查询和价格/数量对齐辅助 |
+| `src/bin/merge.rs` | YES/NO merge 工具 |
+
+---
+
+## 已知限制
+
+- `pair_arbitrage` 当前只输出信号，不直接交易。
+- `risk::RiskConfig` 当前使用代码默认值，尚未从 `config.toml` 加载。
+- `MarketRiskReader` 当前主流程使用 `NoopMarketRiskReader`。
+- gateway 当前已有本地取消处理，但真实 Polymarket REST 撤单接口还需要继续接入。
+- 单日亏损风控第一版账户权益只使用账户 collateral balance，没有把持仓市值并入 equity。
+- portfolio 估值当前按 token 汇总，不做 YES/NO pair matched 估值。
+- `topic_threads` 是历史配置；当前策略订阅已简化为 token topic。
+- `liquidity_reward` 相关配置和奖励市场池代码仍保留，但当前主做市入口是 `market_maker.csv`。

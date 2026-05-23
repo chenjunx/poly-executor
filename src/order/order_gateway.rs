@@ -654,6 +654,22 @@ impl GatewayState {
             .collect()
     }
 
+    fn cancel_targets(&self, request: &CancelOrderRequest) -> Vec<LocalOrderId> {
+        self.orders
+            .values()
+            .filter(|record| {
+                record.strategy_id == request.strategy_id && !record.local_state.is_terminal()
+            })
+            .filter(|record| match &request.scope {
+                CancelScope::LocalOrderId { local_id, .. } => record.local_id == *local_id,
+                CancelScope::Token { token_id } => record.token_id == *token_id,
+                CancelScope::Market { market_id } => record.market_id == *market_id,
+                CancelScope::AllForStrategy => true,
+            })
+            .map(|record| record.local_id.clone())
+            .collect()
+    }
+
     pub fn pending_settlement_keys(&self) -> Vec<SettlementKey> {
         self.pending_settlements.keys().cloned().collect()
     }
@@ -1204,6 +1220,7 @@ impl OrderGateway {
             .order_store
             .clone()
             .ok_or_else(|| anyhow::anyhow!("order store is required for gateway recovery"))?;
+        self.state.next_seq = self.state.next_seq.max(store.load_max_order_gateway_event_seq()?);
         let snapshots = store.load_order_gateway_recoverable_orders()?;
         let mut recovered_order_count = 0;
         let mut failed_unrecoverable_count = 0;
@@ -1415,6 +1432,21 @@ impl OrderGateway {
                 None,
                 LocalRejectReason::RiskRejected { code, reason },
             );
+            return;
+        }
+
+        for local_id in self.state.cancel_targets(&request) {
+            for event in self
+                .state
+                .apply_observation(GatewayObservation::RestCancelAccepted {
+                    local_id,
+                    reason: CancelReason::Requested,
+                    ts_ns: self.state.next_seq + 1,
+                    recovery: false,
+                })
+            {
+                self.publish_and_persist(event);
+            }
         }
     }
 
@@ -1948,6 +1980,27 @@ mod tests {
         })
     }
 
+    fn place_request_for_market(
+        strategy_id: &str,
+        market_id: &str,
+        token_id: &str,
+        local_id: &str,
+    ) -> OrderRequest {
+        OrderRequest::Place(PlaceOrderRequest {
+            strategy_id: StrategyId::from(strategy_id),
+            market_id: Some(MarketId::from(market_id)),
+            token_id: TokenId::from(token_id),
+            local_id: LocalOrderId::from(local_id),
+            side: OrderSide::Buy,
+            order_type: GatewayOrderType::Limit {
+                time_in_force: TimeInForce::Gtc,
+            },
+            price: Some(Decimal::try_from(0.42_f64).expect("decimal")),
+            size: Decimal::try_from(10_f64).expect("decimal"),
+            reason: Some(Arc::from("test")),
+        })
+    }
+
     #[test]
     fn request_ring_full_returns_error_without_gateway_event() {
         let (handle, mut rx) = OrderGatewayHandle::new_for_test(1, GatewayPhase::Live);
@@ -2370,6 +2423,107 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].local_id, "runtime-persist-1");
         assert_eq!(active[0].local_state, "Open");
+    }
+
+    #[tokio::test]
+    async fn cancel_market_scope_cancels_matching_active_orders() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: true,
+            request_ring_capacity: 8,
+            event_ring_capacity: 16,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test(config, Arc::new(AllowAllRiskCheck));
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("market_maker"));
+        handle.set_phase(GatewayPhase::Live);
+
+        for request in [
+            place_request_for_market("market_maker", "market-a", "token-yes", "yes-open"),
+            place_request_for_market("market_maker", "market-a", "token-no", "no-open"),
+            place_request_for_market("market_maker", "market-b", "token-other", "other-open"),
+        ] {
+            handle
+                .try_send(request)
+                .expect("place should enter gateway");
+            assert!(gateway.run_one_request_for_test().await);
+        }
+        handle
+            .try_send(OrderRequest::Cancel(CancelOrderRequest {
+                strategy_id: StrategyId::from("market_maker"),
+                scope: CancelScope::Market {
+                    market_id: MarketId::from("market-a"),
+                },
+                reason: Some(Arc::from("cooldown")),
+            }))
+            .expect("cancel should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let mut cancelled = Vec::new();
+        while let Ok(event) = subscriber.try_recv_relevant() {
+            if event.kind == OrderEventKind::Cancelled {
+                cancelled.push(event.local_id.as_str().to_string());
+            }
+        }
+        cancelled.sort();
+        assert_eq!(
+            cancelled,
+            vec!["no-open".to_string(), "yes-open".to_string()]
+        );
+        assert_eq!(
+            gateway
+                .state
+                .order(&LocalOrderId::from("other-open"))
+                .expect("other order should exist")
+                .local_state,
+            LocalOrderState::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_token_scope_cancels_matching_active_orders() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: true,
+            request_ring_capacity: 8,
+            event_ring_capacity: 16,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test(config, Arc::new(AllowAllRiskCheck));
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("market_maker"));
+        handle.set_phase(GatewayPhase::Live);
+
+        for request in [
+            place_request_for_market("market_maker", "market-a", "token-yes", "yes-open"),
+            place_request_for_market("market_maker", "market-a", "token-no", "no-open"),
+        ] {
+            handle
+                .try_send(request)
+                .expect("place should enter gateway");
+            assert!(gateway.run_one_request_for_test().await);
+        }
+        handle
+            .try_send(OrderRequest::Cancel(CancelOrderRequest {
+                strategy_id: StrategyId::from("market_maker"),
+                scope: CancelScope::Token {
+                    token_id: TokenId::from("token-yes"),
+                },
+                reason: Some(Arc::from("cooldown")),
+            }))
+            .expect("cancel should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let cancelled = std::iter::from_fn(|| subscriber.try_recv_relevant().ok())
+            .filter(|event| event.kind == OrderEventKind::Cancelled)
+            .map(|event| event.local_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(cancelled, vec!["yes-open".to_string()]);
+        assert_eq!(
+            gateway
+                .state
+                .order(&LocalOrderId::from("no-open"))
+                .expect("no order should exist")
+                .local_state,
+            LocalOrderState::Open
+        );
     }
 
     #[tokio::test]

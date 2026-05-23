@@ -18,7 +18,60 @@ funder      = ""   # 钱包地址
 size_usdc = 10.0   # 每次套利投入的 USDC 总量
 
 [simulation]
-enabled = true    # true 时不走真实 order_ws / positions，改为本地模拟成交与仓位
+enabled = true    # true 时不真实下单，order gateway 只生成本地模拟订单事件
+
+[market_maker]
+# 是否启动做市策略；false 时不会读取 market_maker.csv
+enabled = true
+# 做市市场 CSV 文件；相对路径按可执行文件目录解析
+file = "market_maker.csv"
+
+# 单市场库存归一化上限，单位 USD；用于计算 inventory_ratio
+max_inventory_usd = 60.0
+# 库存比例超过该值认为超重，超重时减少报价档位
+overweight_ratio = 0.7
+
+# CSV 未配置 rewards_max_spread 时使用的默认最大报价偏离
+# CSV 有 rewards_max_spread / reward_max_spread 时，CSV 优先
+default_max_spread = 0.03
+# 报价价格 tick，目标买价会向下取整到该 tick
+tick_size = 0.01
+# CSV 未配置 reward_min_size / rewards_min_size 时使用的默认最小 token 数量
+min_size = 5.0
+# 库存偏斜对报价 adjusted_mid 的最大调整幅度
+max_skew = 0.01
+
+# fair midpoint 波动率统计窗口，单位毫秒
+volatility_window_ms = 300000
+# 波动率检测所需最少样本数
+volatility_min_samples = 5
+# 窗口内 fair midpoint 最大值和最小值差超过该阈值时触发冷静期
+volatility_threshold = 0.02
+
+# 市场盘口 spread 异常后的冷静期，单位毫秒
+spread_cooldown_ms = 60000
+# fair midpoint 波动率过高后的冷静期，单位毫秒
+volatility_cooldown_ms = 300000
+# fair midpoint 超出安全价格区间后的冷静期，单位毫秒
+fair_midpoint_cooldown_ms = 600000
+
+# fair midpoint 安全区间；低于 min 或高于 max 时暂停该市场报价
+fair_midpoint_min = 0.15
+fair_midpoint_max = 0.85
+# 市场盘口 spread > max_spread * 该倍数时认为异常
+abnormal_market_spread_multiplier = 2.0
+
+# 正常库存状态下最多报价档位数
+normal_quote_levels = 3
+# 库存超重状态下最多报价档位数
+overweight_quote_levels = 2
+# 每档距离 fair midpoint 的比例：distance = max_spread * level_ratio
+level_ratios = [0.4, 0.55, 0.7]
+# 每档目标美元金额：size = max(level_size_usd / price, min_size)
+level_sizes_usd = [10.0, 20.0, 30.0]
+
+# reconcile 判断当前挂单 size 接近目标 size 的容忍比例
+reconcile_size_tolerance = 0.2
 
 [app]
 # 告警日志文件名

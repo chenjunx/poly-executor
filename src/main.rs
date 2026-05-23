@@ -10,6 +10,8 @@ mod order_gateway;
 mod order_ws;
 #[path = "position/position_engine.rs"]
 mod position_engine;
+#[path = "position/valuation.rs"]
+mod position_valuation;
 mod proxy_ws;
 #[path = "risk/risk.rs"]
 mod risk;
@@ -28,9 +30,12 @@ use tracing::info;
 
 use config::{AppConfig, load_app_config};
 use order_gateway::{OrderGateway, OrderGatewayConfig};
-use risk::{GatewayRiskEngine, NoopMarketRiskReader, RiskConfig, StrategyKindRegistry};
+use risk::{
+    AccountHandleEquityReader, GatewayRiskEngine, GlobalPortfolioValuationReader,
+    NoopMarketRiskReader, RiskConfig, StrategyKindRegistry,
+};
 use storage::{MarketStore, OrderStore};
-use strategies::market_maker::MarketMakerStrategy;
+use strategies::market_maker::{MarketMakerStrategy, MarketMakerStrategyConfig};
 use strategies::pair_arbitrage::PairArbitrageStrategy;
 use strategy::{
     CleanOrderbook, Filters, Strategy, StrategyRegistration, build_token_topics,
@@ -89,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     let _log_guards = logging::init_logging(&log_path)?;
     let (order_store, market_store) = init_stores(&app_config)?;
 
-    let _account_read_handle = account::spawn_account_monitor(app_config.auth.clone());
+    let account_read_handle = account::spawn_account_monitor(app_config.auth.clone());
     let strategy_bootstrap = build_strategies(&app_config, market_store.clone()).await?;
     let StrategyBootstrap {
         pair_strategy,
@@ -110,18 +115,28 @@ async fn main() -> anyhow::Result<()> {
     let (firehose_tx, firehose_rx) = tokio::sync::mpsc::channel(16_384);
     let topic_txs = Arc::new(build_topic_broadcasts(routing.topic_tokens.as_ref(), 1024));
     let book_publisher = market::MarketBookPublisher::new();
+    let market_book_read_handle = book_publisher.read_handle();
     let position_keeper = position_engine::recover_keeper(&order_store)?;
     let (position_ingestor, position_ingest_handle, position_persist_rx) =
         position_engine::PositionIngestor::new(16_384, 16_384, position_keeper);
     let position_read_handle = position_ingest_handle.read_handle();
     let strategy_position_read_handle = position_read_handle.clone();
     let position_status_handle = position_ingest_handle.status_handle();
-    let risk_engine = GatewayRiskEngine::new(
+    let risk_engine = GatewayRiskEngine::new_with_daily_loss_limit(
         RiskConfig::default(),
         position_read_handle,
         position_status_handle,
         StrategyKindRegistry::from_registrations(&registrations),
         Arc::new(NoopMarketRiskReader),
+        order_store.clone(),
+        Arc::new(GlobalPortfolioValuationReader::new(
+            strategy_position_read_handle.clone(),
+            position_valuation::MarketBookMarkPriceReader::new(
+                market_book_read_handle,
+                position_valuation::MarkPriceKind::BestBid,
+            ),
+        )),
+        Arc::new(AccountHandleEquityReader::new(account_read_handle)),
     );
     let gateway_config = OrderGatewayConfig {
         simulation_enabled: app_config.simulation.enabled,
@@ -221,26 +236,68 @@ fn build_pair_strategy(app_config: &AppConfig) -> anyhow::Result<PairArbitrageSt
 }
 
 fn build_market_maker_strategy(
-    _app_config: &AppConfig,
+    app_config: &AppConfig,
     _market_store: &MarketStore,
 ) -> anyhow::Result<Option<MarketMakerStrategy>> {
-    let csv_file = resolve_path("market_maker.csv");
-    build_market_maker_strategy_from_csv_file(&csv_file)
+    build_market_maker_strategy_from_config(&app_config.market_maker)
+}
+
+fn build_market_maker_strategy_from_config(
+    config: &config::MarketMakerConfig,
+) -> anyhow::Result<Option<MarketMakerStrategy>> {
+    if !config.enabled {
+        info!(target: "order", "market_maker 配置已禁用，未启动");
+        return Ok(None);
+    }
+    let csv_filename = if config.file.is_empty() {
+        "market_maker.csv"
+    } else {
+        config.file.as_str()
+    };
+    let csv_file = resolve_path(csv_filename);
+    let strategy_config = MarketMakerStrategyConfig::try_from(config)?;
+    build_market_maker_strategy_from_csv_file_with_config(&csv_file, strategy_config)
 }
 
 fn build_market_maker_strategy_from_csv_file(
     csv_file: &str,
 ) -> anyhow::Result<Option<MarketMakerStrategy>> {
-    let strategy = MarketMakerStrategy::from_csv(csv_file)?;
+    build_market_maker_strategy_from_csv_file_with_config(
+        csv_file,
+        MarketMakerStrategyConfig::default(),
+    )
+}
+
+fn build_market_maker_strategy_from_csv_file_with_config(
+    csv_file: &str,
+    config: MarketMakerStrategyConfig,
+) -> anyhow::Result<Option<MarketMakerStrategy>> {
+    let strategy = MarketMakerStrategy::from_csv_with_config(csv_file, config)?;
     match strategy.as_ref() {
-        Some(strategy) => info!(
-            target: "alerts",
-            csv_file,
-            token_count = strategy.registration().related_tokens.len(),
-            "market_maker 已加载 CSV"
-        ),
+        Some(strategy) => {
+            info!(
+                target: "order",
+                csv_file,
+                token_count = strategy.registration().related_tokens.len(),
+                market_count = strategy.rules().len(),
+                "market_maker 已加载 CSV"
+            );
+            for rule in strategy.rules() {
+                info!(
+                    target: "order",
+                    csv_file,
+                    condition_id = %rule.condition_id,
+                    market_slug = %rule.market_slug.as_deref().unwrap_or_default(),
+                    token1 = %rule.token1,
+                    token2 = %rule.token2,
+                    rewards_max_spread = %rule.rewards_max_spread.as_deref().unwrap_or_default(),
+                    rewards_min_size = %rule.rewards_min_size.as_deref().unwrap_or_default(),
+                    "market_maker 加载市场"
+                );
+            }
+        }
         None => info!(
-            target: "alerts",
+            target: "order",
             csv_file,
             "market_maker CSV 为空，未启动"
         ),
@@ -519,6 +576,58 @@ mod tests {
                 "csv-maker-token-1".to_string(),
                 "csv-maker-token-2".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn build_market_maker_strategy_from_config_skips_csv_when_disabled() {
+        let config = config::MarketMakerConfig {
+            enabled: false,
+            file: "missing-market-maker.csv".to_string(),
+            ..Default::default()
+        };
+
+        let market_maker = build_market_maker_strategy_from_config(&config)
+            .expect("disabled market maker should not try to read csv");
+
+        assert!(market_maker.is_none());
+    }
+
+    #[test]
+    fn build_market_maker_strategy_from_config_uses_configured_csv_file() {
+        let csv_path = std::env::temp_dir().join(format!(
+            "market_maker_config_csv_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &csv_path,
+            "token1,token2,topic,reward_min_orders,rewards_max_spread,reward_min_size,reward_daily_pool,fixed_price\nconfigured-token-1,configured-token-2,market_maker,,0.04,25,75,false\n",
+        )
+        .expect("csv should write");
+        let config = config::MarketMakerConfig {
+            enabled: true,
+            file: csv_path.to_string_lossy().to_string(),
+            default_max_spread: 0.02,
+            min_size: 10.0,
+            ..Default::default()
+        };
+
+        let market_maker = build_market_maker_strategy_from_config(&config)
+            .expect("configured market maker should build")
+            .expect("configured csv row should create strategy");
+
+        assert_eq!(market_maker.rules()[0].token1, "configured-token-1");
+        assert_eq!(
+            market_maker.rules()[0].rewards_max_spread.as_deref(),
+            Some("0.04")
+        );
+        assert_eq!(
+            market_maker.rules()[0].rewards_min_size.as_deref(),
+            Some("25")
         );
     }
 }

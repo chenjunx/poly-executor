@@ -7,30 +7,18 @@ use tracing::{info, warn};
 use polymarket_client_sdk_v2::types::Decimal;
 
 use crate::order_gateway::{
-    GatewayOrderType, LocalOrderId, MarketId, OrderRequest, OrderSide, PlaceOrderRequest,
-    StrategyId, TimeInForce, TokenId,
+    CancelOrderRequest, CancelScope, GatewayOrderType, LocalOrderId, LocalOrderState, MarketId,
+    OrderRecord, OrderRequest, OrderSide, PlaceOrderRequest, StrategyId, TimeInForce, TokenId,
 };
 use crate::storage::ActiveRewardMarketPoolEntry;
 use crate::strategy::{
     CleanOrderbook, MarketEvent, Strategy, StrategyKind, StrategyMarketSubscriptions,
     StrategyRegistration, TopicRegistration, spawn_market_subscription_mux,
 };
+use crate::tick_size::snap_unwind_size_to_lot;
 
 const MARKET_MAKER_NAME: &str = "market_maker";
 const PRICE_SCALE: u32 = 10_000;
-const MAX_INVENTORY_USD: u32 = 100;
-const OVERWEIGHT_RATIO_NUMERATOR: u32 = 7;
-const OVERWEIGHT_RATIO_DENOMINATOR: u32 = 10;
-const DEFAULT_MAX_SPREAD: &str = "0.03";
-const DEFAULT_TICK_SIZE: &str = "0.01";
-const DEFAULT_MIN_SIZE: u32 = 5;
-const DEFAULT_MAX_SKEW: &str = "0.01";
-const VOLATILITY_WINDOW_MS: u64 = 5 * 60 * 1000;
-const VOLATILITY_MIN_SAMPLES: usize = 5;
-
-fn volatility_threshold() -> Decimal {
-    Decimal::from(2u32) / Decimal::from(100u32)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketMakerRule {
@@ -45,6 +33,172 @@ pub struct MarketMakerRule {
 pub struct MarketMakerStrategy {
     rules: Arc<[MarketMakerRule]>,
     registration: Arc<StrategyRegistration>,
+    config: Arc<MarketMakerStrategyConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketMakerStrategyConfig {
+    pub max_inventory_usd: Decimal,
+    pub overweight_ratio: Decimal,
+    pub default_max_spread: Decimal,
+    pub tick_size: Decimal,
+    pub min_size: Decimal,
+    pub max_skew: Decimal,
+    pub volatility_window_ms: u64,
+    pub volatility_min_samples: usize,
+    pub volatility_threshold: Decimal,
+    pub spread_cooldown_ms: u64,
+    pub volatility_cooldown_ms: u64,
+    pub fair_midpoint_cooldown_ms: u64,
+    pub fair_midpoint_min: Decimal,
+    pub fair_midpoint_max: Decimal,
+    pub abnormal_market_spread_multiplier: Decimal,
+    pub normal_quote_levels: usize,
+    pub overweight_quote_levels: usize,
+    pub level_ratios: Vec<Decimal>,
+    pub level_sizes_usd: Vec<Decimal>,
+    pub reconcile_size_tolerance: Decimal,
+}
+
+impl Default for MarketMakerStrategyConfig {
+    fn default() -> Self {
+        Self {
+            max_inventory_usd: Decimal::from(100u32),
+            overweight_ratio: Decimal::from(7u32) / Decimal::from(10u32),
+            default_max_spread: parse_decimal("0.03"),
+            tick_size: parse_decimal("0.01"),
+            min_size: Decimal::from(5u32),
+            max_skew: parse_decimal("0.01"),
+            volatility_window_ms: 5 * 60 * 1000,
+            volatility_min_samples: 5,
+            volatility_threshold: parse_decimal("0.02"),
+            spread_cooldown_ms: 60 * 1000,
+            volatility_cooldown_ms: 5 * 60 * 1000,
+            fair_midpoint_cooldown_ms: 10 * 60 * 1000,
+            fair_midpoint_min: parse_decimal("0.15"),
+            fair_midpoint_max: parse_decimal("0.85"),
+            abnormal_market_spread_multiplier: Decimal::from(2u32),
+            normal_quote_levels: 3,
+            overweight_quote_levels: 2,
+            level_ratios: vec![
+                parse_decimal("0.4"),
+                parse_decimal("0.55"),
+                parse_decimal("0.7"),
+            ],
+            level_sizes_usd: vec![
+                Decimal::from(50u32),
+                Decimal::from(75u32),
+                Decimal::from(100u32),
+            ],
+            reconcile_size_tolerance: parse_decimal("0.2"),
+        }
+    }
+}
+
+impl TryFrom<&crate::config::MarketMakerConfig> for MarketMakerStrategyConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(config: &crate::config::MarketMakerConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.max_inventory_usd > 0.0,
+            "market_maker.max_inventory_usd must be > 0"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&config.overweight_ratio),
+            "market_maker.overweight_ratio must be between 0 and 1"
+        );
+        anyhow::ensure!(
+            config.default_max_spread > 0.0,
+            "market_maker.default_max_spread must be > 0"
+        );
+        anyhow::ensure!(config.tick_size > 0.0, "market_maker.tick_size must be > 0");
+        anyhow::ensure!(config.min_size > 0.0, "market_maker.min_size must be > 0");
+        anyhow::ensure!(config.max_skew >= 0.0, "market_maker.max_skew must be >= 0");
+        anyhow::ensure!(
+            config.volatility_min_samples > 0,
+            "market_maker.volatility_min_samples must be > 0"
+        );
+        anyhow::ensure!(
+            config.volatility_threshold >= 0.0,
+            "market_maker.volatility_threshold must be >= 0"
+        );
+        anyhow::ensure!(
+            config.fair_midpoint_min >= 0.0
+                && config.fair_midpoint_min < config.fair_midpoint_max
+                && config.fair_midpoint_max <= 1.0,
+            "market_maker fair midpoint range must satisfy 0 <= min < max <= 1"
+        );
+        anyhow::ensure!(
+            config.abnormal_market_spread_multiplier > 0.0,
+            "market_maker.abnormal_market_spread_multiplier must be > 0"
+        );
+        anyhow::ensure!(
+            config.normal_quote_levels > 0,
+            "market_maker.normal_quote_levels must be > 0"
+        );
+        anyhow::ensure!(
+            config.overweight_quote_levels > 0,
+            "market_maker.overweight_quote_levels must be > 0"
+        );
+        anyhow::ensure!(
+            !config.level_ratios.is_empty(),
+            "market_maker.level_ratios must not be empty"
+        );
+        anyhow::ensure!(
+            config.level_ratios.len() == config.level_sizes_usd.len(),
+            "market_maker.level_ratios and level_sizes_usd must have the same length"
+        );
+        anyhow::ensure!(
+            config.level_ratios.iter().all(|value| *value > 0.0),
+            "market_maker.level_ratios entries must be > 0"
+        );
+        anyhow::ensure!(
+            config.level_sizes_usd.iter().all(|value| *value > 0.0),
+            "market_maker.level_sizes_usd entries must be > 0"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&config.reconcile_size_tolerance),
+            "market_maker.reconcile_size_tolerance must be between 0 and 1"
+        );
+
+        Ok(Self {
+            max_inventory_usd: decimal_from_f64(config.max_inventory_usd)?,
+            overweight_ratio: decimal_from_f64(config.overweight_ratio)?,
+            default_max_spread: decimal_from_f64(config.default_max_spread)?,
+            tick_size: decimal_from_f64(config.tick_size)?,
+            min_size: decimal_from_f64(config.min_size)?,
+            max_skew: decimal_from_f64(config.max_skew)?,
+            volatility_window_ms: config.volatility_window_ms,
+            volatility_min_samples: config.volatility_min_samples,
+            volatility_threshold: decimal_from_f64(config.volatility_threshold)?,
+            spread_cooldown_ms: config.spread_cooldown_ms,
+            volatility_cooldown_ms: config.volatility_cooldown_ms,
+            fair_midpoint_cooldown_ms: config.fair_midpoint_cooldown_ms,
+            fair_midpoint_min: decimal_from_f64(config.fair_midpoint_min)?,
+            fair_midpoint_max: decimal_from_f64(config.fair_midpoint_max)?,
+            abnormal_market_spread_multiplier: decimal_from_f64(
+                config.abnormal_market_spread_multiplier,
+            )?,
+            normal_quote_levels: config.normal_quote_levels,
+            overweight_quote_levels: config.overweight_quote_levels,
+            level_ratios: config
+                .level_ratios
+                .iter()
+                .map(|value| decimal_from_f64(*value))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            level_sizes_usd: config
+                .level_sizes_usd
+                .iter()
+                .map(|value| decimal_from_f64(*value))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            reconcile_size_tolerance: decimal_from_f64(config.reconcile_size_tolerance)?,
+        })
+    }
+}
+
+fn decimal_from_f64(value: f64) -> anyhow::Result<Decimal> {
+    Decimal::try_from(value)
+        .map_err(|error| anyhow::anyhow!("invalid decimal config value {value}: {error}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +304,8 @@ pub struct TargetQuoteParams {
     pub max_spread: Decimal,
     pub tick_size: Decimal,
     pub min_size: Decimal,
+    pub normal_quote_levels: usize,
+    pub overweight_quote_levels: usize,
     pub level_ratios: Vec<Decimal>,
     pub level_sizes_usd: Vec<Decimal>,
 }
@@ -174,7 +330,11 @@ pub fn compute_target_buy_quotes_for_token(
     params: &TargetQuoteParams,
 ) -> Vec<TargetQuote> {
     let adjusted_mid = fair_mid + skew;
-    let num_levels = if is_overweight { 2 } else { 3 };
+    let num_levels = if is_overweight {
+        params.overweight_quote_levels
+    } else {
+        params.normal_quote_levels
+    };
     params
         .level_ratios
         .iter()
@@ -188,7 +348,7 @@ pub fn compute_target_buy_quotes_for_token(
             if price <= Decimal::ZERO {
                 return None;
             }
-            let size = decimal_max(size_usd / price, params.min_size);
+            let size = snap_unwind_size_to_lot(decimal_max(size_usd / price, params.min_size));
             Some(TargetQuote {
                 token_side,
                 level: index + 1,
@@ -238,17 +398,24 @@ fn record_fair_midpoint_history(
     }
 }
 
-fn price_history_is_volatile(
+#[derive(Debug, Clone, PartialEq)]
+struct VolatilityState {
+    sample_count: usize,
+    min_fair_mid: Decimal,
+    max_fair_mid: Decimal,
+    range: Decimal,
+    threshold: Decimal,
+    is_volatile: bool,
+}
+
+fn price_history_volatility_state(
     history: &VecDeque<(u64, Decimal)>,
     threshold: Decimal,
     min_samples: usize,
-) -> bool {
-    if history.len() < min_samples {
-        return false;
-    }
-
-    let mut min_price = history[0].1;
-    let mut max_price = history[0].1;
+) -> Option<VolatilityState> {
+    let (_, first_price) = history.front()?;
+    let mut min_price = *first_price;
+    let mut max_price = *first_price;
     for (_, price) in history.iter().skip(1) {
         if *price < min_price {
             min_price = *price;
@@ -257,17 +424,65 @@ fn price_history_is_volatile(
             max_price = *price;
         }
     }
+    let range = max_price - min_price;
 
-    max_price - min_price > threshold
+    Some(VolatilityState {
+        sample_count: history.len(),
+        min_fair_mid: min_price,
+        max_fair_mid: max_price,
+        range,
+        threshold,
+        is_volatile: history.len() >= min_samples && range > threshold,
+    })
+}
+
+fn price_history_is_volatile(
+    history: &VecDeque<(u64, Decimal)>,
+    threshold: Decimal,
+    min_samples: usize,
+) -> bool {
+    price_history_volatility_state(history, threshold, min_samples)
+        .is_some_and(|state| state.is_volatile)
 }
 
 fn token_price_is_volatile(
     price_history: &HashMap<String, VecDeque<(u64, Decimal)>>,
     token_id: &str,
+    config: &MarketMakerStrategyConfig,
 ) -> bool {
     price_history.get(token_id).is_some_and(|history| {
-        price_history_is_volatile(history, volatility_threshold(), VOLATILITY_MIN_SAMPLES)
+        price_history_is_volatile(
+            history,
+            config.volatility_threshold,
+            config.volatility_min_samples,
+        )
     })
+}
+
+fn log_volatility_state(
+    asset_id: &str,
+    history: &VecDeque<(u64, Decimal)>,
+    config: &MarketMakerStrategyConfig,
+) {
+    if let Some(state) = price_history_volatility_state(
+        history,
+        config.volatility_threshold,
+        config.volatility_min_samples,
+    ) {
+        info!(
+            target: "order",
+            asset_id = %asset_id,
+            window_ms = config.volatility_window_ms,
+            sample_count = state.sample_count,
+            min_samples = config.volatility_min_samples,
+            min_fair_mid = %state.min_fair_mid,
+            max_fair_mid = %state.max_fair_mid,
+            range = %state.range,
+            threshold = %state.threshold,
+            is_volatile = state.is_volatile,
+            "market_maker 5m volatility state"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,11 +497,100 @@ impl MarketMakerRiskDecision {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CooldownState {
+    until_ms: u64,
+    code: &'static str,
+    reason: String,
+    triggered_at_ms: u64,
+}
+
+fn cooldown_key(rule: &MarketMakerRule) -> String {
+    if rule.condition_id.is_empty() {
+        format!("{}:{}", rule.token1, rule.token2)
+    } else {
+        rule.condition_id.clone()
+    }
+}
+
+fn cooldown_duration_ms(code: &str, config: &MarketMakerStrategyConfig) -> u64 {
+    match code {
+        "price_volatility" => config.volatility_cooldown_ms,
+        "fair_midpoint_out_of_range" => config.fair_midpoint_cooldown_ms,
+        "abnormal_market_spread" => config.spread_cooldown_ms,
+        _ => config.spread_cooldown_ms,
+    }
+}
+
+fn active_cooldown<'a>(
+    cooldowns: &'a mut HashMap<String, CooldownState>,
+    rule: &MarketMakerRule,
+    now_ms: u64,
+) -> Option<&'a CooldownState> {
+    let key = cooldown_key(rule);
+    let expired = cooldowns
+        .get(&key)
+        .is_some_and(|cooldown| now_ms >= cooldown.until_ms);
+    if expired {
+        cooldowns.remove(&key);
+    }
+    cooldowns.get(&key)
+}
+
+fn enter_cooldown(
+    cooldowns: &mut HashMap<String, CooldownState>,
+    rule: &MarketMakerRule,
+    now_ms: u64,
+    code: &'static str,
+    reason: String,
+    config: &MarketMakerStrategyConfig,
+) -> CooldownState {
+    let cooldown = CooldownState {
+        until_ms: now_ms + cooldown_duration_ms(code, config),
+        code,
+        reason,
+        triggered_at_ms: now_ms,
+    };
+    cooldowns.insert(cooldown_key(rule), cooldown.clone());
+    cooldown
+}
+
+fn cooldown_cancel_requests(rule: &MarketMakerRule) -> Vec<CancelOrderRequest> {
+    let reason = Some(Arc::from("market_maker_cooldown"));
+    if !rule.condition_id.is_empty() {
+        vec![CancelOrderRequest {
+            strategy_id: StrategyId::from(MARKET_MAKER_NAME),
+            scope: CancelScope::Market {
+                market_id: MarketId::from(rule.condition_id.clone()),
+            },
+            reason,
+        }]
+    } else {
+        vec![
+            CancelOrderRequest {
+                strategy_id: StrategyId::from(MARKET_MAKER_NAME),
+                scope: CancelScope::Token {
+                    token_id: TokenId::from(rule.token1.clone()),
+                },
+                reason: reason.clone(),
+            },
+            CancelOrderRequest {
+                strategy_id: StrategyId::from(MARKET_MAKER_NAME),
+                scope: CancelScope::Token {
+                    token_id: TokenId::from(rule.token2.clone()),
+                },
+                reason,
+            },
+        ]
+    }
+}
+
 struct MarketMakerQuoteRiskContext<'a> {
     rule: &'a MarketMakerRule,
     intent: &'a TargetBuyQuoteIntent,
     books: &'a HashMap<String, Arc<CleanOrderbook>>,
     price_history: &'a HashMap<String, VecDeque<(u64, Decimal)>>,
+    config: &'a MarketMakerStrategyConfig,
 }
 
 fn check_market_maker_quote_risk(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
@@ -312,7 +616,10 @@ fn check_abnormal_market_spread(ctx: &MarketMakerQuoteRiskContext<'_>) -> Market
     let market_spread =
         price_to_decimal(book.best_ask_price) - price_to_decimal(book.best_bid_price);
     if market_spread
-        > reward_max_spread(ctx.rule.rewards_max_spread.as_deref()) * Decimal::from(2u32)
+        > reward_max_spread(
+            ctx.rule.rewards_max_spread.as_deref(),
+            ctx.config.default_max_spread,
+        ) * ctx.config.abnormal_market_spread_multiplier
     {
         MarketMakerRiskDecision::Skip {
             code: "abnormal_market_spread",
@@ -330,7 +637,7 @@ fn check_fair_midpoint_safe_range(
         return MarketMakerRiskDecision::Allow;
     };
     let fair_mid = price_to_decimal(compute_fair_midpoint(book));
-    if fair_mid < dec_percent(15) || fair_mid > dec_percent(85) {
+    if fair_mid < ctx.config.fair_midpoint_min || fair_mid > ctx.config.fair_midpoint_max {
         MarketMakerRiskDecision::Skip {
             code: "fair_midpoint_out_of_range",
             reason: "fair midpoint out of safe range".to_string(),
@@ -341,7 +648,7 @@ fn check_fair_midpoint_safe_range(
 }
 
 fn check_quote_volatility(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
-    if token_price_is_volatile(ctx.price_history, &ctx.intent.token_id) {
+    if token_price_is_volatile(ctx.price_history, &ctx.intent.token_id, ctx.config) {
         MarketMakerRiskDecision::Skip {
             code: "price_volatility",
             reason: "price volatility too high".to_string(),
@@ -420,6 +727,7 @@ fn current_inventory_state(
     yes_book: &CleanOrderbook,
     no_book: &CleanOrderbook,
     position_read: &crate::position_engine::PositionReadHandle,
+    config: &MarketMakerStrategyConfig,
 ) -> (Decimal, Decimal, Decimal, Decimal, InventoryState) {
     let yes_balance = position_read
         .get_entry(MARKET_MAKER_NAME, &rule.token1)
@@ -436,8 +744,8 @@ fn current_inventory_state(
         no_balance,
         yes_fair_mid,
         no_fair_mid,
-        Decimal::from(MAX_INVENTORY_USD),
-        Decimal::from(OVERWEIGHT_RATIO_NUMERATOR) / Decimal::from(OVERWEIGHT_RATIO_DENOMINATOR),
+        config.max_inventory_usd,
+        config.overweight_ratio,
     );
 
     (
@@ -483,14 +791,103 @@ struct TargetBuyQuoteIntent {
     quote: TargetQuote,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ReconcileResult {
+    to_cancel: Vec<OrderRecord>,
+    to_place: Vec<TargetBuyQuoteIntent>,
+    to_keep: Vec<OrderRecord>,
+}
+
+fn reconcile_market_maker_orders(
+    targets: &[TargetBuyQuoteIntent],
+    current_orders: Vec<OrderRecord>,
+    tick_size: Decimal,
+    size_tolerance_ratio: Decimal,
+) -> ReconcileResult {
+    let mut unmatched_current = current_orders;
+    let mut to_place = Vec::new();
+    let mut to_keep = Vec::new();
+
+    for target in targets {
+        let matched_index = unmatched_current.iter().position(|current| {
+            if current.token_id.as_str() != target.token_id || current.side != OrderSide::Buy {
+                return false;
+            }
+            if matches!(
+                current.local_state,
+                LocalOrderState::Filled
+                    | LocalOrderState::Cancelled
+                    | LocalOrderState::Rejected
+                    | LocalOrderState::Failed
+                    | LocalOrderState::UnknownTerminal
+            ) {
+                return false;
+            }
+            let Some(current_price) = current.price else {
+                return false;
+            };
+            let price_diff = decimal_abs(current_price - target.quote.price);
+            let size_diff_ratio = if target.quote.size > Decimal::ZERO {
+                decimal_abs(current.remaining_size - target.quote.size) / target.quote.size
+            } else {
+                Decimal::ONE
+            };
+            price_diff < tick_size && size_diff_ratio < size_tolerance_ratio
+        });
+
+        if let Some(index) = matched_index {
+            to_keep.push(unmatched_current.remove(index));
+        } else {
+            to_place.push(target.clone());
+        }
+    }
+
+    ReconcileResult {
+        to_cancel: unmatched_current,
+        to_place,
+        to_keep,
+    }
+}
+
+fn filter_current_orders_for_rule(
+    rule: &MarketMakerRule,
+    orders: Vec<OrderRecord>,
+) -> Vec<OrderRecord> {
+    orders
+        .into_iter()
+        .filter(|order| {
+            if !rule.condition_id.is_empty() {
+                order.market_id.as_str() == rule.condition_id
+            } else {
+                order.token_id.as_str() == rule.token1 || order.token_id.as_str() == rule.token2
+            }
+        })
+        .filter(|order| order.side == OrderSide::Buy && order.price.is_some())
+        .filter(|order| order.remaining_size > Decimal::ZERO)
+        .collect()
+}
+
+fn cancel_request_for_order(order: &OrderRecord) -> CancelOrderRequest {
+    CancelOrderRequest {
+        strategy_id: StrategyId::from(MARKET_MAKER_NAME),
+        scope: CancelScope::LocalOrderId {
+            local_id: order.local_id.clone(),
+            exch_id: order.exch_id.clone(),
+            token_id: Some(order.token_id.clone()),
+        },
+        reason: Some(Arc::from("market_maker_reconcile")),
+    }
+}
+
 fn target_buy_quote_intents(
     rule: &MarketMakerRule,
     yes_fair_mid: Decimal,
     no_fair_mid: Decimal,
     inventory: &InventoryState,
+    config: &MarketMakerStrategyConfig,
 ) -> Vec<TargetBuyQuoteIntent> {
-    let params = target_quote_params(rule);
-    let skew = compute_quote_skew(inventory.ratio, parse_decimal(DEFAULT_MAX_SKEW));
+    let params = target_quote_params(rule, config);
+    let skew = compute_quote_skew(inventory.ratio, config.max_skew);
     let mut intents = Vec::new();
 
     if inventory.ratio <= Decimal::ZERO {
@@ -530,28 +927,30 @@ fn target_buy_quote_intents(
     intents
 }
 
-fn target_quote_params(rule: &MarketMakerRule) -> TargetQuoteParams {
+fn target_quote_params(
+    rule: &MarketMakerRule,
+    config: &MarketMakerStrategyConfig,
+) -> TargetQuoteParams {
     TargetQuoteParams {
-        max_spread: reward_max_spread(rule.rewards_max_spread.as_deref()),
-        tick_size: parse_decimal(DEFAULT_TICK_SIZE),
+        max_spread: reward_max_spread(
+            rule.rewards_max_spread.as_deref(),
+            config.default_max_spread,
+        ),
+        tick_size: config.tick_size,
         min_size: rule
             .rewards_min_size
             .as_deref()
             .map(parse_decimal)
-            .unwrap_or_else(|| Decimal::from(DEFAULT_MIN_SIZE)),
-        level_ratios: vec![dec_percent(40), dec_percent(55), dec_percent(70)],
-        level_sizes_usd: vec![
-            Decimal::from(50u32),
-            Decimal::from(75u32),
-            Decimal::from(100u32),
-        ],
+            .unwrap_or(config.min_size),
+        normal_quote_levels: config.normal_quote_levels,
+        overweight_quote_levels: config.overweight_quote_levels,
+        level_ratios: config.level_ratios.clone(),
+        level_sizes_usd: config.level_sizes_usd.clone(),
     }
 }
 
-fn reward_max_spread(value: Option<&str>) -> Decimal {
-    let spread = value
-        .map(parse_decimal)
-        .unwrap_or_else(|| parse_decimal(DEFAULT_MAX_SPREAD));
+fn reward_max_spread(value: Option<&str>, default_max_spread: Decimal) -> Decimal {
+    let spread = value.map(parse_decimal).unwrap_or(default_max_spread);
     if spread > Decimal::ONE {
         spread / Decimal::from(100u32)
     } else {
@@ -565,6 +964,24 @@ fn parse_decimal(value: &str) -> Decimal {
 
 fn dec_percent(value: u32) -> Decimal {
     Decimal::from(value) / Decimal::from(100u32)
+}
+
+fn send_cooldown_cancel_requests(
+    order_gateway: &crate::order_gateway::OrderGatewayHandle,
+    rule: &MarketMakerRule,
+) {
+    for request in cooldown_cancel_requests(rule) {
+        if let Err(error) = order_gateway.try_send(OrderRequest::Cancel(request)) {
+            warn!(
+                target: "order",
+                condition_id = %rule.condition_id,
+                token1 = %rule.token1,
+                token2 = %rule.token2,
+                error = ?error,
+                "market_maker 冷静期撤单请求投递失败"
+            );
+        }
+    }
 }
 
 fn build_place_order_request(
@@ -599,52 +1016,77 @@ fn local_order_id(
     )
 }
 
-fn quote_dedupe_key(rule: &MarketMakerRule, intent: &TargetBuyQuoteIntent) -> String {
-    format!(
-        "{}:{}:L{}:{}:{}",
-        rule.condition_id,
-        intent.token_id,
-        intent.quote.level,
-        intent.quote.price,
-        intent.quote.size
-    )
-}
-
 impl MarketMakerStrategy {
     pub fn from_csv(csv_file: &str) -> anyhow::Result<Option<Self>> {
+        Self::from_csv_with_config(csv_file, MarketMakerStrategyConfig::default())
+    }
+
+    pub fn from_csv_with_config(
+        csv_file: &str,
+        config: MarketMakerStrategyConfig,
+    ) -> anyhow::Result<Option<Self>> {
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_path(csv_file)
             .map_err(|e| anyhow::anyhow!("无法打开 {}: {}", csv_file, e))?;
+        let headers = reader.headers()?.clone();
+        let header_index = |name: &str| {
+            headers
+                .iter()
+                .position(|header| header.trim().eq_ignore_ascii_case(name))
+        };
+        let condition_id_index = header_index("condition_id");
+        let rewards_max_spread_index = header_index("rewards_max_spread");
+        let rewards_min_size_index =
+            header_index("rewards_min_size").or_else(|| header_index("reward_min_size"));
+        let token1_index = header_index("token1").unwrap_or(0);
+        let token2_index = header_index("token2").unwrap_or(1);
 
         let mut rules = Vec::new();
         for result in reader.records() {
             let record = result?;
-            if record.len() < 2 {
-                continue;
-            }
-
-            let token1 = record[0].trim();
-            let token2 = record[1].trim();
+            let token1 = record.get(token1_index).map(str::trim).unwrap_or_default();
+            let token2 = record.get(token2_index).map(str::trim).unwrap_or_default();
             if token1.is_empty() || token2.is_empty() {
                 continue;
             }
+            let condition_id = condition_id_index
+                .and_then(|index| record.get(index))
+                .map(str::trim)
+                .unwrap_or_default();
+            let rewards_max_spread = rewards_max_spread_index
+                .and_then(|index| record.get(index))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let rewards_min_size = rewards_min_size_index
+                .and_then(|index| record.get(index))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
 
             rules.push(MarketMakerRule {
-                condition_id: String::new(),
+                condition_id: condition_id.to_string(),
                 market_slug: None,
                 token1: token1.to_string(),
                 token2: token2.to_string(),
-                rewards_max_spread: None,
-                rewards_min_size: None,
+                rewards_max_spread,
+                rewards_min_size,
             });
         }
 
-        Self::from_rules(rules)
+        Self::from_rules_with_config(rules, config)
     }
 
     pub fn from_pool_entries(
         entries: Vec<ActiveRewardMarketPoolEntry>,
+    ) -> anyhow::Result<Option<Self>> {
+        Self::from_pool_entries_with_config(entries, MarketMakerStrategyConfig::default())
+    }
+
+    pub fn from_pool_entries_with_config(
+        entries: Vec<ActiveRewardMarketPoolEntry>,
+        config: MarketMakerStrategyConfig,
     ) -> anyhow::Result<Option<Self>> {
         let rules = entries
             .into_iter()
@@ -657,10 +1099,17 @@ impl MarketMakerStrategy {
                 rewards_min_size: entry.rewards_min_size,
             })
             .collect::<Vec<_>>();
-        Self::from_rules(rules)
+        Self::from_rules_with_config(rules, config)
     }
 
     pub fn from_rules(rules: Vec<MarketMakerRule>) -> anyhow::Result<Option<Self>> {
+        Self::from_rules_with_config(rules, MarketMakerStrategyConfig::default())
+    }
+
+    pub fn from_rules_with_config(
+        rules: Vec<MarketMakerRule>,
+        config: MarketMakerStrategyConfig,
+    ) -> anyhow::Result<Option<Self>> {
         if rules.is_empty() {
             return Ok(None);
         }
@@ -694,6 +1143,7 @@ impl MarketMakerStrategy {
         Ok(Some(Self {
             rules: Arc::<[MarketMakerRule]>::from(rules),
             registration,
+            config: Arc::new(config),
         }))
     }
 
@@ -718,28 +1168,46 @@ impl Strategy for MarketMakerStrategy {
         position_read: crate::position_engine::PositionReadHandle,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let config = self.config.clone();
             let mut books: HashMap<String, Arc<CleanOrderbook>> = HashMap::new();
             let mut price_history: HashMap<String, VecDeque<(u64, Decimal)>> = HashMap::new();
-            let mut submitted_quotes: BTreeSet<String> = BTreeSet::new();
+            let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
             let mut rx = spawn_market_subscription_mux(market_subscriptions, 256);
             while let Some(event) = rx.recv().await {
                 log_fair_midpoint(&event);
                 let asset_id = event.asset_id.to_string();
+                let history = price_history.entry(asset_id.clone()).or_default();
                 record_fair_midpoint_history(
-                    price_history.entry(asset_id.clone()).or_default(),
+                    history,
                     event.book.timestamp_ms,
                     price_to_decimal(compute_fair_midpoint(&event.book)),
-                    VOLATILITY_WINDOW_MS,
+                    config.volatility_window_ms,
                 );
+                log_volatility_state(&asset_id, history, &config);
                 books.insert(asset_id, event.book.clone());
                 for rule in self.rules.iter() {
+                    if let Some(cooldown) =
+                        active_cooldown(&mut cooldowns, rule, event.book.timestamp_ms)
+                    {
+                        info!(
+                            target: "order",
+                            condition_id = %rule.condition_id,
+                            token1 = %rule.token1,
+                            token2 = %rule.token2,
+                            risk_code = cooldown.code,
+                            reason = %cooldown.reason,
+                            cooldown_until_ms = cooldown.until_ms,
+                            "market_maker 冷静期中，跳过报价"
+                        );
+                        continue;
+                    }
                     let (Some(yes_book), Some(no_book)) =
                         (books.get(&rule.token1), books.get(&rule.token2))
                     else {
                         continue;
                     };
                     let (yes_balance, no_balance, yes_fair_mid, no_fair_mid, inventory) =
-                        current_inventory_state(rule, yes_book, no_book, &position_read);
+                        current_inventory_state(rule, yes_book, no_book, &position_read, &config);
                     log_inventory_state(
                         rule,
                         yes_balance,
@@ -748,48 +1216,119 @@ impl Strategy for MarketMakerStrategy {
                         no_fair_mid,
                         &inventory,
                     );
-                    for intent in
-                        target_buy_quote_intents(rule, yes_fair_mid, no_fair_mid, &inventory)
-                    {
+                    let mut target_intents = Vec::new();
+                    let mut entered_cooldown = false;
+                    for intent in target_buy_quote_intents(
+                        rule,
+                        yes_fair_mid,
+                        no_fair_mid,
+                        &inventory,
+                        &config,
+                    ) {
                         let risk_ctx = MarketMakerQuoteRiskContext {
                             rule,
                             intent: &intent,
                             books: &books,
                             price_history: &price_history,
+                            config: &config,
                         };
                         match check_market_maker_quote_risk(&risk_ctx) {
-                            MarketMakerRiskDecision::Allow => {}
+                            MarketMakerRiskDecision::Allow => target_intents.push(intent),
                             MarketMakerRiskDecision::Skip { code, reason } => {
+                                let cooldown = enter_cooldown(
+                                    &mut cooldowns,
+                                    rule,
+                                    event.book.timestamp_ms,
+                                    code,
+                                    reason,
+                                    &config,
+                                );
                                 warn!(
                                     target: "order",
                                     condition_id = %risk_ctx.rule.condition_id,
                                     token_id = %risk_ctx.intent.token_id,
-                                    risk_code = code,
-                                    reason = %reason,
-                                    "market_maker 跳过报价"
+                                    risk_code = cooldown.code,
+                                    reason = %cooldown.reason,
+                                    cooldown_until_ms = cooldown.until_ms,
+                                    cooldown_ms = cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms),
+                                    "market_maker 进入冷静期并撤单"
                                 );
-                                continue;
+                                send_cooldown_cancel_requests(&order_gateway, rule);
+                                entered_cooldown = true;
+                                break;
                             }
                         }
-                        let dedupe_key = quote_dedupe_key(rule, &intent);
-                        if submitted_quotes.contains(&dedupe_key) {
+                    }
+                    if entered_cooldown {
+                        continue;
+                    }
+                    let current_orders = match order_gateway
+                        .query_active_orders(StrategyId::from(MARKET_MAKER_NAME))
+                        .await
+                    {
+                        Ok(orders) => filter_current_orders_for_rule(rule, orders),
+                        Err(error) => {
+                            warn!(
+                                target: "order",
+                                condition_id = %rule.condition_id,
+                                error = ?error,
+                                "market_maker 查询当前挂单失败，跳过改单"
+                            );
                             continue;
                         }
+                    };
+                    let quote_params = target_quote_params(rule, &config);
+                    let reconcile = reconcile_market_maker_orders(
+                        &target_intents,
+                        current_orders,
+                        quote_params.tick_size,
+                        config.reconcile_size_tolerance,
+                    );
+                    info!(
+                        target: "order",
+                        condition_id = %rule.condition_id,
+                        token1 = %rule.token1,
+                        token2 = %rule.token2,
+                        target_count = target_intents.len(),
+                        keep_count = reconcile.to_keep.len(),
+                        cancel_count = reconcile.to_cancel.len(),
+                        place_count = reconcile.to_place.len(),
+                        "market_maker reconcile orders"
+                    );
+                    for order in reconcile.to_cancel {
+                        let request = cancel_request_for_order(&order);
+                        match order_gateway.try_send(OrderRequest::Cancel(request)) {
+                            Ok(()) => info!(
+                                target: "order",
+                                condition_id = %rule.condition_id,
+                                local_id = %order.local_id.as_str(),
+                                token_id = %order.token_id.as_str(),
+                                price = ?order.price,
+                                remaining_size = %order.remaining_size,
+                                "market_maker reconcile 撤单请求已投递"
+                            ),
+                            Err(error) => warn!(
+                                target: "order",
+                                condition_id = %rule.condition_id,
+                                local_id = %order.local_id.as_str(),
+                                error = ?error,
+                                "market_maker reconcile 撤单请求投递失败"
+                            ),
+                        }
+                    }
+                    for intent in reconcile.to_place {
                         let request =
                             build_place_order_request(rule, &intent, event.book.timestamp_ms);
                         match order_gateway.try_send(OrderRequest::Place(request)) {
-                            Ok(()) => {
-                                submitted_quotes.insert(dedupe_key);
-                                info!(
-                                    target: "order",
-                                    condition_id = %rule.condition_id,
-                                    token_id = %intent.token_id,
-                                    level = intent.quote.level,
-                                    price = %intent.quote.price,
-                                    size = %intent.quote.size,
-                                    "market_maker 模拟发单请求已投递"
-                                );
-                            }
+                            Ok(()) => info!(
+                                target: "order",
+                                condition_id = %rule.condition_id,
+                                token_id = %intent.token_id,
+                                level = intent.quote.level,
+                                price = %intent.quote.price,
+                                size = %intent.quote.size,
+                                "market_maker 模拟发单请求已投递"
+                            ),
                             Err(error) => warn!(
                                 target: "order",
                                 condition_id = %rule.condition_id,
@@ -876,6 +1415,261 @@ mod tests {
 
     fn dec(numerator: u32, denominator: u32) -> Decimal {
         Decimal::from(numerator) / Decimal::from(denominator)
+    }
+
+    fn target_intent(token_id: &str, price: Decimal, size: Decimal) -> TargetBuyQuoteIntent {
+        TargetBuyQuoteIntent {
+            token_id: token_id.to_string(),
+            quote: TargetQuote {
+                token_side: TargetTokenSide::Yes,
+                level: 1,
+                price,
+                size,
+                size_usd: price * size,
+                adjusted_mid: price,
+                distance: Decimal::ZERO,
+                raw_bid: price,
+            },
+        }
+    }
+
+    fn active_order(local_id: &str, token_id: &str, price: Decimal, size: Decimal) -> OrderRecord {
+        active_order_for_market(local_id, "market-a", token_id, price, size)
+    }
+
+    fn active_order_for_market(
+        local_id: &str,
+        market_id: &str,
+        token_id: &str,
+        price: Decimal,
+        size: Decimal,
+    ) -> OrderRecord {
+        OrderRecord {
+            strategy_id: StrategyId::from(MARKET_MAKER_NAME),
+            market_id: MarketId::from(market_id),
+            token_id: TokenId::from(token_id),
+            local_id: LocalOrderId::from(local_id),
+            exch_id: None,
+            side: OrderSide::Buy,
+            order_type: GatewayOrderType::Limit {
+                time_in_force: TimeInForce::Gtc,
+            },
+            price: Some(price),
+            original_size: size,
+            local_state: LocalOrderState::Open,
+            filled_size_total: Decimal::ZERO,
+            remaining_size: size,
+            avg_fill_price: None,
+        }
+    }
+
+    async fn collect_gateway_requests(
+        mut gateway_rx: tokio::sync::mpsc::Receiver<OrderRequest>,
+        mut active_order_replies: VecDeque<Vec<OrderRecord>>,
+    ) -> Vec<OrderRequest> {
+        let mut requests = Vec::new();
+        while let Some(request) = gateway_rx.recv().await {
+            match request {
+                OrderRequest::Query(crate::order_gateway::OrderQueryRequest::ActiveOrders {
+                    reply_tx,
+                    ..
+                }) => {
+                    let _ = reply_tx.send(active_order_replies.pop_front().unwrap_or_default());
+                }
+                other => requests.push(other),
+            }
+        }
+        requests
+    }
+
+    #[test]
+    fn reconcile_orders_keeps_current_order_when_price_and_size_are_close() {
+        let target = target_intent("yes-token", dec(58, 100), Decimal::from(100u32));
+        let current = active_order(
+            "current-1",
+            "yes-token",
+            dec(575, 1000),
+            Decimal::from(110u32),
+        );
+
+        let result = reconcile_market_maker_orders(
+            &[target],
+            vec![current.clone()],
+            dec(1, 100),
+            dec(20, 100),
+        );
+
+        assert_eq!(result.to_keep, vec![current]);
+        assert!(result.to_cancel.is_empty());
+        assert!(result.to_place.is_empty());
+    }
+
+    #[test]
+    fn reconcile_orders_replaces_current_order_when_price_or_size_drift() {
+        let target = target_intent("yes-token", dec(58, 100), Decimal::from(100u32));
+        let far_price = active_order(
+            "far-price",
+            "yes-token",
+            dec(56, 100),
+            Decimal::from(100u32),
+        );
+        let far_size = active_order(
+            "far-size",
+            "yes-token",
+            dec(575, 1000),
+            Decimal::from(130u32),
+        );
+
+        let price_result = reconcile_market_maker_orders(
+            &[target.clone()],
+            vec![far_price.clone()],
+            dec(1, 100),
+            dec(20, 100),
+        );
+        let size_result = reconcile_market_maker_orders(
+            &[target.clone()],
+            vec![far_size.clone()],
+            dec(1, 100),
+            dec(20, 100),
+        );
+
+        assert_eq!(price_result.to_cancel, vec![far_price]);
+        assert_eq!(price_result.to_place, vec![target.clone()]);
+        assert!(price_result.to_keep.is_empty());
+        assert_eq!(size_result.to_cancel, vec![far_size]);
+        assert_eq!(size_result.to_place, vec![target]);
+        assert!(size_result.to_keep.is_empty());
+    }
+
+    #[test]
+    fn reconcile_orders_does_not_match_different_token() {
+        let target = target_intent("yes-token", dec(58, 100), Decimal::from(100u32));
+        let current = active_order(
+            "no-order",
+            "no-token",
+            dec(575, 1000),
+            Decimal::from(100u32),
+        );
+
+        let result = reconcile_market_maker_orders(
+            &[target.clone()],
+            vec![current.clone()],
+            dec(1, 100),
+            dec(20, 100),
+        );
+
+        assert_eq!(result.to_cancel, vec![current]);
+        assert_eq!(result.to_place, vec![target]);
+        assert!(result.to_keep.is_empty());
+    }
+
+    #[test]
+    fn default_market_maker_config_matches_existing_quote_parameters() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "yes-token".to_string(),
+            token2: "no-token".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+        let config = MarketMakerStrategyConfig::default();
+
+        let params = target_quote_params(&rule, &config);
+
+        assert_eq!(params.max_spread, dec(3, 100));
+        assert_eq!(params.tick_size, dec(1, 100));
+        assert_eq!(params.min_size, Decimal::from(5u32));
+        assert_eq!(params.normal_quote_levels, 3);
+        assert_eq!(params.overweight_quote_levels, 2);
+        assert_eq!(
+            params.level_ratios,
+            vec![dec(40, 100), dec(55, 100), dec(70, 100)]
+        );
+        assert_eq!(
+            params.level_sizes_usd,
+            vec![
+                Decimal::from(50u32),
+                Decimal::from(75u32),
+                Decimal::from(100u32)
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_market_maker_config_controls_quote_levels_and_sizes() {
+        let params = TargetQuoteParams {
+            max_spread: dec(4, 100),
+            tick_size: dec(1, 100),
+            min_size: Decimal::from(5u32),
+            normal_quote_levels: 2,
+            overweight_quote_levels: 1,
+            level_ratios: vec![dec(50, 100), Decimal::ONE],
+            level_sizes_usd: vec![Decimal::from(10u32), Decimal::from(20u32)],
+        };
+
+        let normal_quotes = compute_target_buy_quotes_for_token(
+            TargetTokenSide::Yes,
+            dec(50, 100),
+            Decimal::ZERO,
+            false,
+            &params,
+        );
+        let overweight_quotes = compute_target_buy_quotes_for_token(
+            TargetTokenSide::Yes,
+            dec(50, 100),
+            Decimal::ZERO,
+            true,
+            &params,
+        );
+
+        assert_eq!(normal_quotes.len(), 2);
+        assert_eq!(normal_quotes[0].size_usd, Decimal::from(10u32));
+        assert_eq!(normal_quotes[1].size_usd, Decimal::from(20u32));
+        assert_eq!(overweight_quotes.len(), 1);
+        assert_eq!(overweight_quotes[0].size_usd, Decimal::from(10u32));
+    }
+
+    #[test]
+    fn target_quote_size_is_truncated_to_lot_precision() {
+        let params = TargetQuoteParams {
+            max_spread: Decimal::ZERO,
+            tick_size: dec(1, 100),
+            min_size: Decimal::from(5u32),
+            normal_quote_levels: 1,
+            overweight_quote_levels: 1,
+            level_ratios: vec![Decimal::ONE],
+            level_sizes_usd: vec![Decimal::from(10u32)],
+        };
+
+        let quotes = compute_target_buy_quotes_for_token(
+            TargetTokenSide::Yes,
+            dec(57, 100),
+            Decimal::ZERO,
+            false,
+            &params,
+        );
+
+        assert_eq!(quotes[0].price, dec(57, 100));
+        assert_eq!(quotes[0].size, dec(1754, 100));
+    }
+
+    #[test]
+    fn market_maker_config_rejects_mismatched_level_arrays() {
+        let config = crate::config::MarketMakerConfig {
+            level_ratios: vec![0.4, 0.7],
+            level_sizes_usd: vec![50.0],
+            ..Default::default()
+        };
+
+        let error = MarketMakerStrategyConfig::try_from(&config)
+            .expect_err("mismatched quote level arrays should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("level_ratios and level_sizes_usd")
+        );
     }
 
     #[test]
@@ -1020,6 +1814,8 @@ mod tests {
             max_spread: dec(3, 100),
             tick_size: dec(1, 100),
             min_size: Decimal::from(5u32),
+            normal_quote_levels: 3,
+            overweight_quote_levels: 2,
             level_ratios: vec![dec(40, 100), dec(55, 100), dec(70, 100)],
             level_sizes_usd: vec![
                 Decimal::from(50u32),
@@ -1229,6 +2025,27 @@ mod tests {
     }
 
     #[test]
+    fn volatility_state_reports_window_range_and_threshold() {
+        let history = VecDeque::from([
+            (1, dec(50, 100)),
+            (2, dec(51, 100)),
+            (3, dec(49, 100)),
+            (4, dec(52, 100)),
+            (5, dec(515, 1000)),
+        ]);
+
+        let state = price_history_volatility_state(&history, dec(2, 100), 5)
+            .expect("history should produce volatility state");
+
+        assert_eq!(state.sample_count, 5);
+        assert_eq!(state.min_fair_mid, dec(49, 100));
+        assert_eq!(state.max_fair_mid, dec(52, 100));
+        assert_eq!(state.range, dec(3, 100));
+        assert_eq!(state.threshold, dec(2, 100));
+        assert!(state.is_volatile);
+    }
+
+    #[test]
     fn fair_midpoint_history_prunes_prices_outside_window() {
         let mut history = VecDeque::new();
         record_fair_midpoint_history(&mut history, 1, dec(40, 100), 100);
@@ -1278,11 +2095,13 @@ mod tests {
             "maker-token-1".to_string(),
             Arc::new(clean_book(4_900, 5_100, 100, 100)),
         )]);
+        let config = MarketMakerStrategyConfig::default();
         let ctx = MarketMakerQuoteRiskContext {
             rule: &rule,
             intent: &intent,
             books: &books,
             price_history: &price_history,
+            config: &config,
         };
 
         let decision = check_market_maker_quote_risk(&ctx);
@@ -1324,11 +2143,13 @@ mod tests {
             "maker-token-1".to_string(),
             Arc::new(clean_book(4_000, 5_000, 100, 100)),
         )]);
+        let config = MarketMakerStrategyConfig::default();
         let ctx = MarketMakerQuoteRiskContext {
             rule: &rule,
             intent: &intent,
             books: &books,
             price_history: &price_history,
+            config: &config,
         };
 
         let decision = check_market_maker_quote_risk(&ctx);
@@ -1370,11 +2191,13 @@ mod tests {
             "maker-token-1".to_string(),
             Arc::new(clean_book(900, 1_100, 100, 100)),
         )]);
+        let config = MarketMakerStrategyConfig::default();
         let ctx = MarketMakerQuoteRiskContext {
             rule: &rule,
             intent: &intent,
             books: &books,
             price_history: &price_history,
+            config: &config,
         };
 
         let decision = check_market_maker_quote_risk(&ctx);
@@ -1454,12 +2277,137 @@ mod tests {
             .expect("csv row should build strategy");
 
         assert_eq!(strategy.rules().len(), 1);
+        assert_eq!(strategy.rules()[0].condition_id, "");
         assert_eq!(strategy.rules()[0].token1, "csv-token-1");
         assert_eq!(strategy.rules()[0].token2, "csv-token-2");
         assert_eq!(
             strategy.registration().related_tokens.as_ref(),
             &["csv-token-1".to_string(), "csv-token-2".to_string()]
         );
+    }
+
+    #[test]
+    fn from_csv_accepts_optional_condition_id_column() {
+        let csv_path = std::env::temp_dir().join(format!(
+            "market_maker_from_csv_condition_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &csv_path,
+            "condition_id,token1,token2\n0xabc,csv-token-1,csv-token-2\n",
+        )
+        .expect("csv should write");
+
+        let strategy = MarketMakerStrategy::from_csv(csv_path.to_str().expect("utf8 path"))
+            .expect("csv should load")
+            .expect("csv row should build strategy");
+
+        assert_eq!(strategy.rules().len(), 1);
+        assert_eq!(strategy.rules()[0].condition_id, "0xabc");
+        assert_eq!(strategy.rules()[0].token1, "csv-token-1");
+        assert_eq!(strategy.rules()[0].token2, "csv-token-2");
+    }
+
+    #[test]
+    fn from_csv_loads_reward_spread_and_min_size_columns() {
+        let csv_path = std::env::temp_dir().join(format!(
+            "market_maker_from_csv_rewards_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &csv_path,
+            "token1,token2,topic,reward_min_orders,rewards_max_spread,reward_min_size,reward_daily_pool,fixed_price\ncsv-token-1,csv-token-2,market_maker,,0.05,200,50,false\n",
+        )
+        .expect("csv should write");
+
+        let strategy = MarketMakerStrategy::from_csv(csv_path.to_str().expect("utf8 path"))
+            .expect("csv should load")
+            .expect("csv row should build strategy");
+
+        assert_eq!(strategy.rules().len(), 1);
+        assert_eq!(
+            strategy.rules()[0].rewards_max_spread.as_deref(),
+            Some("0.05")
+        );
+        assert_eq!(strategy.rules()[0].rewards_min_size.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn cooldown_cancel_requests_use_market_when_condition_id_exists() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "yes-token".to_string(),
+            token2: "no-token".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+
+        let requests = cooldown_cancel_requests(&rule);
+
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0].scope,
+            CancelScope::Market { market_id } if market_id.as_str() == "0xabc"
+        ));
+    }
+
+    #[test]
+    fn cooldown_cancel_requests_fall_back_to_both_tokens_without_condition_id() {
+        let rule = MarketMakerRule {
+            condition_id: String::new(),
+            market_slug: None,
+            token1: "yes-token".to_string(),
+            token2: "no-token".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+
+        let requests = cooldown_cancel_requests(&rule);
+
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            &requests[0].scope,
+            CancelScope::Token { token_id } if token_id.as_str() == "yes-token"
+        ));
+        assert!(matches!(
+            &requests[1].scope,
+            CancelScope::Token { token_id } if token_id.as_str() == "no-token"
+        ));
+    }
+
+    #[test]
+    fn cooldown_expires_before_market_can_quote_again() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "yes-token".to_string(),
+            token2: "no-token".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+        let config = MarketMakerStrategyConfig::default();
+        let mut cooldowns = HashMap::new();
+        enter_cooldown(
+            &mut cooldowns,
+            &rule,
+            1_000,
+            "abnormal_market_spread",
+            "wide".to_string(),
+            &config,
+        );
+
+        assert!(active_cooldown(&mut cooldowns, &rule, 1_001).is_some());
+        assert!(active_cooldown(&mut cooldowns, &rule, 61_000).is_none());
+        assert!(cooldowns.is_empty());
     }
 
     #[test]
@@ -1590,17 +2538,95 @@ mod tests {
             orders.push(request);
         }
 
-        assert_eq!(orders.len(), 3);
-        for request in orders {
-            let crate::order_gateway::OrderRequest::Place(request) = request else {
-                panic!("market maker should only place orders");
-            };
-            assert_eq!(request.token_id.as_str(), "maker-token-2");
-        }
+        assert_eq!(orders.len(), 1);
+        let crate::order_gateway::OrderRequest::Cancel(request) = orders.remove(0) else {
+            panic!("market maker should cancel orders after volatility risk");
+        };
+        assert_eq!(request.strategy_id.as_str(), "market_maker");
+        assert!(matches!(
+            request.scope,
+            CancelScope::Market { market_id } if market_id.as_str() == "0xabc"
+        ));
     }
 
     #[tokio::test]
-    async fn spawn_emits_buy_orders_to_gateway() {
+    async fn spawn_uses_token_cancels_for_csv_rule_without_condition_id() {
+        let strategy = MarketMakerStrategy::from_rules(vec![MarketMakerRule {
+            condition_id: String::new(),
+            market_slug: None,
+            token1: "maker-token-1".to_string(),
+            token2: "maker-token-2".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        }])
+        .expect("market maker should build")
+        .expect("non-empty rules should create strategy");
+        let (topic1_tx, topic1_rx) = tokio::sync::broadcast::channel(16);
+        let (topic2_tx, topic2_rx) = tokio::sync::broadcast::channel(16);
+        let subscriptions = StrategyMarketSubscriptions {
+            topics: vec![
+                (Arc::from("maker-token-1"), topic1_rx),
+                (Arc::from("maker-token-2"), topic2_rx),
+            ],
+        };
+        let (gateway_handle, mut gateway_rx) =
+            crate::order_gateway::OrderGatewayHandle::new_for_test(
+                8,
+                crate::order_gateway::GatewayPhase::Live,
+            );
+        let (_ingestor, ingest_handle, _persist_rx) =
+            crate::position_engine::PositionIngestor::new_for_test(8, 8);
+
+        let handle = strategy.spawn(subscriptions, gateway_handle, ingest_handle.read_handle());
+        for (timestamp_ms, bid, ask) in [
+            (1_000, 4_900, 5_100),
+            (2_000, 4_950, 5_150),
+            (3_000, 5_000, 5_200),
+            (4_000, 5_050, 5_250),
+            (5_000, 5_200, 5_400),
+        ] {
+            topic1_tx
+                .send(MarketEvent {
+                    topic: Arc::from("maker-token-1"),
+                    asset_id: Arc::from("maker-token-1"),
+                    book: Arc::new(clean_book_at(bid, ask, 100, 100, timestamp_ms)),
+                })
+                .expect("yes market event should send");
+        }
+        topic2_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-2"),
+                asset_id: Arc::from("maker-token-2"),
+                book: Arc::new(clean_book_at(4_900, 5_100, 100, 300, 6_000)),
+            })
+            .expect("no market event should send");
+        drop(topic1_tx);
+        drop(topic2_tx);
+        handle
+            .await
+            .expect("market maker task should exit when event channel closes");
+
+        let mut cancels = Vec::new();
+        while let Ok(request) = gateway_rx.try_recv() {
+            let crate::order_gateway::OrderRequest::Cancel(request) = request else {
+                panic!("market maker should only cancel orders after volatility risk");
+            };
+            cancels.push(request);
+        }
+
+        assert_eq!(cancels.len(), 2);
+        assert!(matches!(
+            &cancels[0].scope,
+            CancelScope::Token { token_id } if token_id.as_str() == "maker-token-1"
+        ));
+        assert!(matches!(
+            &cancels[1].scope,
+            CancelScope::Token { token_id } if token_id.as_str() == "maker-token-2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_keeps_existing_close_orders_instead_of_placing_duplicates() {
         let strategy = MarketMakerStrategy::from_pool_entries(vec![active_entry(
             "0xabc",
             "maker-token-1",
@@ -1616,14 +2642,23 @@ mod tests {
                 (Arc::from("maker-token-2"), topic2_rx),
             ],
         };
-        let (gateway_handle, mut gateway_rx) =
-            crate::order_gateway::OrderGatewayHandle::new_for_test(
-                8,
-                crate::order_gateway::GatewayPhase::Live,
-            );
+        let (gateway_handle, gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
+            16,
+            crate::order_gateway::GatewayPhase::Live,
+        );
         let (_ingestor, ingest_handle, _persist_rx) =
             crate::position_engine::PositionIngestor::new_for_test(8, 8);
 
+        let request_collector = tokio::spawn(collect_gateway_requests(
+            gateway_rx,
+            VecDeque::from([vec![active_order_for_market(
+                "existing-yes-l1",
+                "0xabc",
+                "maker-token-1",
+                dec(49, 100),
+                dec(1040, 10),
+            )]]),
+        ));
         let handle = strategy.spawn(subscriptions, gateway_handle, ingest_handle.read_handle());
         topic1_tx
             .send(MarketEvent {
@@ -1644,11 +2679,142 @@ mod tests {
         handle
             .await
             .expect("market maker task should exit when event channel closes");
+        let requests = request_collector
+            .await
+            .expect("request collector should exit after handle drops");
 
-        let mut orders = Vec::new();
-        while let Ok(request) = gateway_rx.try_recv() {
-            orders.push(request);
-        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, OrderRequest::Place(request) if request.local_id.as_str().contains("maker-token-1:L1")))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_cancels_drifted_order_and_places_target_quote() {
+        let strategy = MarketMakerStrategy::from_pool_entries(vec![active_entry(
+            "0xabc",
+            "maker-token-1",
+            "maker-token-2",
+        )])
+        .expect("market maker should build")
+        .expect("non-empty pool should create strategy");
+        let (topic1_tx, topic1_rx) = tokio::sync::broadcast::channel(8);
+        let (topic2_tx, topic2_rx) = tokio::sync::broadcast::channel(8);
+        let subscriptions = StrategyMarketSubscriptions {
+            topics: vec![
+                (Arc::from("maker-token-1"), topic1_rx),
+                (Arc::from("maker-token-2"), topic2_rx),
+            ],
+        };
+        let (gateway_handle, gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
+            16,
+            crate::order_gateway::GatewayPhase::Live,
+        );
+        let (_ingestor, ingest_handle, _persist_rx) =
+            crate::position_engine::PositionIngestor::new_for_test(8, 8);
+
+        let request_collector = tokio::spawn(collect_gateway_requests(
+            gateway_rx,
+            VecDeque::from([vec![active_order_for_market(
+                "old-yes-l1",
+                "0xabc",
+                "maker-token-1",
+                dec(45, 100),
+                Decimal::from(100u32),
+            )]]),
+        ));
+        let handle = strategy.spawn(subscriptions, gateway_handle, ingest_handle.read_handle());
+        topic1_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-1"),
+                asset_id: Arc::from("maker-token-1"),
+                book: Arc::new(clean_book(4_900, 5_100, 300, 100)),
+            })
+            .expect("yes market event should send");
+        topic2_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-2"),
+                asset_id: Arc::from("maker-token-2"),
+                book: Arc::new(clean_book(4_900, 5_100, 100, 300)),
+            })
+            .expect("no market event should send");
+        drop(topic1_tx);
+        drop(topic2_tx);
+        handle
+            .await
+            .expect("market maker task should exit when event channel closes");
+        let requests = request_collector
+            .await
+            .expect("request collector should exit after handle drops");
+
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            OrderRequest::Cancel(request)
+                if matches!(&request.scope, CancelScope::LocalOrderId { local_id, token_id, .. }
+                    if local_id.as_str() == "old-yes-l1"
+                        && token_id.as_ref().is_some_and(|token_id| token_id.as_str() == "maker-token-1"))
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            OrderRequest::Place(request)
+                if request.local_id.as_str().contains("maker-token-1:L1")
+        )));
+    }
+
+    #[tokio::test]
+    async fn spawn_emits_buy_orders_to_gateway() {
+        let strategy = MarketMakerStrategy::from_pool_entries(vec![active_entry(
+            "0xabc",
+            "maker-token-1",
+            "maker-token-2",
+        )])
+        .expect("market maker should build")
+        .expect("non-empty pool should create strategy");
+        let (topic1_tx, topic1_rx) = tokio::sync::broadcast::channel(8);
+        let (topic2_tx, topic2_rx) = tokio::sync::broadcast::channel(8);
+        let subscriptions = StrategyMarketSubscriptions {
+            topics: vec![
+                (Arc::from("maker-token-1"), topic1_rx),
+                (Arc::from("maker-token-2"), topic2_rx),
+            ],
+        };
+        let (gateway_handle, gateway_rx) = crate::order_gateway::OrderGatewayHandle::new_for_test(
+            16,
+            crate::order_gateway::GatewayPhase::Live,
+        );
+        let (_ingestor, ingest_handle, _persist_rx) =
+            crate::position_engine::PositionIngestor::new_for_test(8, 8);
+
+        let request_collector = tokio::spawn(collect_gateway_requests(
+            gateway_rx,
+            VecDeque::from([Vec::new()]),
+        ));
+        let handle = strategy.spawn(subscriptions, gateway_handle, ingest_handle.read_handle());
+        topic1_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-1"),
+                asset_id: Arc::from("maker-token-1"),
+                book: Arc::new(clean_book(4_900, 5_100, 300, 100)),
+            })
+            .expect("yes market event should send");
+        topic2_tx
+            .send(MarketEvent {
+                topic: Arc::from("maker-token-2"),
+                asset_id: Arc::from("maker-token-2"),
+                book: Arc::new(clean_book(4_900, 5_100, 100, 300)),
+            })
+            .expect("no market event should send");
+        drop(topic1_tx);
+        drop(topic2_tx);
+        handle
+            .await
+            .expect("market maker task should exit when event channel closes");
+        let orders = request_collector
+            .await
+            .expect("request collector should exit after handle drops");
 
         assert_eq!(orders.len(), 6);
         for request in orders {

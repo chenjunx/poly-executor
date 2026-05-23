@@ -1,13 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use polymarket_client_sdk_v2::types::Decimal;
 
+use crate::account::AccountReadHandle;
 use crate::order_gateway::{
     CancelOrderRequest, GatewayState, OrderRiskCheck, OrderSide, PlaceOrderRequest, RiskDecision,
     StrategyId,
 };
 use crate::position_engine::{PositionEngineStatus, PositionReadHandle, PositionStatusHandle};
+use crate::position_valuation::{
+    MarketBookMarkPriceReader, PortfolioValuation, value_global_portfolio,
+};
+use crate::storage::{OrderStore, StoredDailyLossState};
 use crate::strategy::{StrategyKind, StrategyRegistration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +31,50 @@ pub struct MarketTopOfBook {
 pub trait MarketRiskReader: Send + Sync {
     fn best_bid_ask(&self, token_id: &str) -> Option<MarketTopOfBook>;
     fn mid_price(&self, token_id: &str) -> Option<Decimal>;
+}
+
+pub trait PortfolioValuationReader: Send + Sync {
+    fn current(&self) -> PortfolioValuation;
+}
+
+pub trait AccountEquityReader: Send + Sync {
+    fn current_equity(&self) -> Option<Decimal>;
+}
+
+pub struct GlobalPortfolioValuationReader {
+    position_read: PositionReadHandle,
+    mark_prices: MarketBookMarkPriceReader,
+}
+
+impl GlobalPortfolioValuationReader {
+    pub fn new(position_read: PositionReadHandle, mark_prices: MarketBookMarkPriceReader) -> Self {
+        Self {
+            position_read,
+            mark_prices,
+        }
+    }
+}
+
+impl PortfolioValuationReader for GlobalPortfolioValuationReader {
+    fn current(&self) -> PortfolioValuation {
+        value_global_portfolio(&self.position_read, &self.mark_prices)
+    }
+}
+
+pub struct AccountHandleEquityReader {
+    account_read: AccountReadHandle,
+}
+
+impl AccountHandleEquityReader {
+    pub fn new(account_read: AccountReadHandle) -> Self {
+        Self { account_read }
+    }
+}
+
+impl AccountEquityReader for AccountHandleEquityReader {
+    fn current_equity(&self) -> Option<Decimal> {
+        self.account_read.latest().map(|snapshot| snapshot.balance)
+    }
 }
 
 pub struct NoopMarketRiskReader;
@@ -59,6 +109,8 @@ pub struct RiskConfig {
     pub default_strategy_kind_token_exposure: Decimal,
     pub strategy_kind_order_size_limits: Vec<StrategyKindOrderSizeLimit>,
     pub strategy_kind_token_exposure_limits: Vec<StrategyKindTokenExposureLimit>,
+    pub daily_loss_limit_enabled: bool,
+    pub daily_loss_limit_ratio: Decimal,
 }
 
 impl Default for RiskConfig {
@@ -71,6 +123,8 @@ impl Default for RiskConfig {
             default_strategy_kind_token_exposure: high_limit,
             strategy_kind_order_size_limits: Vec::new(),
             strategy_kind_token_exposure_limits: Vec::new(),
+            daily_loss_limit_enabled: true,
+            daily_loss_limit_ratio: Decimal::try_from(0.03_f64).expect("risk ratio decimal"),
         }
     }
 }
@@ -137,6 +191,7 @@ pub struct GatewayRiskEngine {
     position_status: PositionStatusHandle,
     strategy_registry: StrategyKindRegistry,
     market_reader: Arc<dyn MarketRiskReader>,
+    daily_loss_rule: Option<Arc<DailyLossLimitRule>>,
     rules: Vec<Arc<dyn RiskRule>>,
 }
 
@@ -154,6 +209,40 @@ impl GatewayRiskEngine {
             position_status,
             strategy_registry,
             market_reader,
+            None,
+            vec![
+                Arc::new(PositionEngineHealthRule),
+                Arc::new(BasicOrderSanityRule),
+                Arc::new(GlobalTokenExposureRule),
+                Arc::new(KnownStrategyRule),
+                Arc::new(StrategyKindOrderSizeRule),
+                Arc::new(StrategyKindTokenExposureRule),
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_daily_loss_limit(
+        config: RiskConfig,
+        position_read: PositionReadHandle,
+        position_status: PositionStatusHandle,
+        strategy_registry: StrategyKindRegistry,
+        market_reader: Arc<dyn MarketRiskReader>,
+        store: OrderStore,
+        valuation_reader: Arc<dyn PortfolioValuationReader>,
+        account_reader: Arc<dyn AccountEquityReader>,
+    ) -> Self {
+        Self::with_rules(
+            config,
+            position_read,
+            position_status,
+            strategy_registry,
+            market_reader,
+            Some(Arc::new(DailyLossLimitRule::new(
+                store,
+                valuation_reader,
+                account_reader,
+            ))),
             vec![
                 Arc::new(PositionEngineHealthRule),
                 Arc::new(BasicOrderSanityRule),
@@ -171,6 +260,7 @@ impl GatewayRiskEngine {
         position_status: PositionStatusHandle,
         strategy_registry: StrategyKindRegistry,
         market_reader: Arc<dyn MarketRiskReader>,
+        daily_loss_rule: Option<Arc<DailyLossLimitRule>>,
         rules: Vec<Arc<dyn RiskRule>>,
     ) -> Self {
         Self {
@@ -179,6 +269,7 @@ impl GatewayRiskEngine {
             position_status,
             strategy_registry,
             market_reader,
+            daily_loss_rule,
             rules,
         }
     }
@@ -198,6 +289,12 @@ impl GatewayRiskEngine {
 impl OrderRiskCheck for GatewayRiskEngine {
     fn check_place(&self, request: &PlaceOrderRequest, state: &GatewayState) -> RiskDecision {
         let ctx = self.context(state);
+        if let Some(rule) = &self.daily_loss_rule {
+            let decision = rule.check_place(request, &ctx);
+            if !matches!(decision, RiskDecision::Allow) {
+                return decision;
+            }
+        }
         for rule in &self.rules {
             let decision = rule.check_place(request, &ctx);
             if !matches!(decision, RiskDecision::Allow) {
@@ -215,6 +312,109 @@ impl OrderRiskCheck for GatewayRiskEngine {
                 return decision;
             }
         }
+        RiskDecision::Allow
+    }
+}
+
+pub struct DailyLossLimitRule {
+    store: OrderStore,
+    valuation_reader: Arc<dyn PortfolioValuationReader>,
+    account_reader: Arc<dyn AccountEquityReader>,
+}
+
+impl DailyLossLimitRule {
+    pub fn new(
+        store: OrderStore,
+        valuation_reader: Arc<dyn PortfolioValuationReader>,
+        account_reader: Arc<dyn AccountEquityReader>,
+    ) -> Self {
+        Self {
+            store,
+            valuation_reader,
+            account_reader,
+        }
+    }
+}
+
+impl RiskRule for DailyLossLimitRule {
+    fn id(&self) -> &'static str {
+        "daily_loss_limit"
+    }
+
+    fn layer(&self) -> RiskLayer {
+        RiskLayer::Global
+    }
+
+    fn check_place(&self, _request: &PlaceOrderRequest, ctx: &RiskContext<'_>) -> RiskDecision {
+        if !ctx.config.daily_loss_limit_enabled {
+            return RiskDecision::Allow;
+        }
+        let trading_day = current_trading_day_utc();
+        let mut state = match load_or_initialize_daily_loss_state(
+            &self.store,
+            &trading_day,
+            self.valuation_reader.as_ref(),
+            self.account_reader.as_ref(),
+            ctx.config.daily_loss_limit_ratio,
+        ) {
+            Ok(state) => state,
+            Err(DailyLossStateError::ValuationDegraded) => {
+                return reject_dynamic(
+                    "daily_loss_valuation_degraded",
+                    "daily loss valuation is degraded or missing mark prices",
+                );
+            }
+            Err(DailyLossStateError::EquityUnavailable) => {
+                return reject_dynamic(
+                    "daily_loss_equity_unavailable",
+                    "daily loss state cannot initialize because account equity is unavailable",
+                );
+            }
+            Err(DailyLossStateError::Storage) => {
+                return reject_dynamic(
+                    "daily_loss_persistence_failed",
+                    "daily loss state cannot load or initialize",
+                );
+            }
+        };
+        if state.halted {
+            return reject_dynamic(
+                self.id(),
+                state
+                    .halt_reason
+                    .unwrap_or_else(|| "daily loss limit already triggered".to_string()),
+            );
+        }
+
+        let valuation = self.valuation_reader.current();
+        if valuation.degraded {
+            return reject_dynamic(
+                "daily_loss_valuation_degraded",
+                "daily loss valuation is degraded or missing mark prices",
+            );
+        }
+
+        let daily_pnl = valuation.total_pnl - state.day_start_total_pnl;
+        if daily_pnl <= -state.loss_limit_amount {
+            let now = now_ms();
+            let reason = format!(
+                "daily loss limit triggered: daily_pnl={} loss_limit={} day_start_equity={}",
+                daily_pnl, state.loss_limit_amount, state.day_start_equity
+            );
+            if self
+                .store
+                .halt_daily_loss_state(&trading_day, &reason, now)
+                .is_err()
+            {
+                return reject_dynamic(
+                    "daily_loss_persistence_failed",
+                    "daily loss limit triggered but halted state persistence failed",
+                );
+            }
+            state.halted = true;
+            return reject_dynamic(self.id(), reason);
+        }
+
         RiskDecision::Allow
     }
 }
@@ -368,10 +568,74 @@ impl RiskRule for StrategyKindTokenExposureRule {
 }
 
 fn reject(code: &'static str, reason: &'static str) -> RiskDecision {
+    reject_dynamic(code, reason)
+}
+
+fn reject_dynamic(code: &'static str, reason: impl Into<Arc<str>>) -> RiskDecision {
     RiskDecision::Reject {
         code: Arc::from(code),
-        reason: Arc::from(reason),
+        reason: reason.into(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DailyLossStateError {
+    ValuationDegraded,
+    EquityUnavailable,
+    Storage,
+}
+
+fn load_or_initialize_daily_loss_state(
+    store: &OrderStore,
+    trading_day: &str,
+    valuation_reader: &dyn PortfolioValuationReader,
+    account_reader: &dyn AccountEquityReader,
+    loss_limit_ratio: Decimal,
+) -> Result<StoredDailyLossState, DailyLossStateError> {
+    let state = store
+        .load_daily_loss_state(trading_day)
+        .map_err(|_| DailyLossStateError::Storage)?;
+    if let Some(state) = state {
+        return Ok(state);
+    }
+
+    let valuation = valuation_reader.current();
+    if valuation.degraded {
+        return Err(DailyLossStateError::ValuationDegraded);
+    }
+    let equity = account_reader
+        .current_equity()
+        .ok_or(DailyLossStateError::EquityUnavailable)?;
+    if equity <= Decimal::ZERO || loss_limit_ratio <= Decimal::ZERO {
+        return Err(DailyLossStateError::EquityUnavailable);
+    }
+    let now = now_ms();
+    let state = StoredDailyLossState {
+        trading_day: trading_day.to_string(),
+        day_start_total_pnl: valuation.total_pnl,
+        day_start_equity: equity,
+        loss_limit_ratio,
+        loss_limit_amount: equity * loss_limit_ratio,
+        halted: false,
+        halt_reason: None,
+        halted_at_ms: None,
+        updated_at_ms: now,
+    };
+    store
+        .upsert_daily_loss_state(&state)
+        .map_err(|_| DailyLossStateError::Storage)?;
+    Ok(state)
+}
+
+fn current_trading_day_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_millis() as u64
 }
 
 fn projected_global_exposure(request: &PlaceOrderRequest, ctx: &RiskContext<'_>) -> Decimal {
@@ -402,6 +666,7 @@ mod tests {
         PositionEvent, PositionEventSource, PositionIngestor, PositionKeeper, PositionSide,
         PositionSnapshotPublisher,
     };
+    use crate::position_valuation::{PortfolioValuation, TokenValuation};
     use crate::strategy::{StrategyKind, StrategyRegistration};
 
     fn dec(value: f64) -> Decimal {
@@ -440,6 +705,72 @@ mod tests {
             scope: CancelScope::AllForStrategy,
             reason: None,
         }
+    }
+
+    struct TestPortfolioValuationReader {
+        valuation: PortfolioValuation,
+    }
+
+    impl TestPortfolioValuationReader {
+        fn new(total_pnl: Decimal, degraded: bool) -> Self {
+            Self {
+                valuation: PortfolioValuation {
+                    market_value: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
+                    realized_pnl: Decimal::ZERO,
+                    unrealized_pnl: total_pnl,
+                    total_pnl,
+                    tokens: Vec::<TokenValuation>::new(),
+                    missing_price_tokens: Vec::new(),
+                    degraded,
+                },
+            }
+        }
+    }
+
+    impl PortfolioValuationReader for TestPortfolioValuationReader {
+        fn current(&self) -> PortfolioValuation {
+            self.valuation.clone()
+        }
+    }
+
+    struct TestAccountEquityReader {
+        equity: Option<Decimal>,
+    }
+
+    impl AccountEquityReader for TestAccountEquityReader {
+        fn current_equity(&self) -> Option<Decimal> {
+            self.equity
+        }
+    }
+
+    fn test_store() -> OrderStore {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        store
+    }
+
+    fn engine_with_daily_loss(
+        config: RiskConfig,
+        store: OrderStore,
+        total_pnl: Decimal,
+        degraded: bool,
+        equity: Option<Decimal>,
+    ) -> GatewayRiskEngine {
+        let (_ingestor, ingest_handle, _persist_rx) = PositionIngestor::new_for_test(8, 8);
+        GatewayRiskEngine::new_with_daily_loss_limit(
+            config,
+            ingest_handle.read_handle(),
+            ingest_handle.status_handle(),
+            StrategyKindRegistry::from_registrations(&[registration(
+                "market_maker",
+                StrategyKind::MarketMaker,
+            )]),
+            Arc::new(NoopMarketRiskReader),
+            store,
+            Arc::new(TestPortfolioValuationReader::new(total_pnl, degraded)),
+            Arc::new(TestAccountEquityReader { equity }),
+        )
     }
 
     fn engine_with_config(config: RiskConfig) -> GatewayRiskEngine {
@@ -485,6 +816,256 @@ mod tests {
             )]),
             Arc::new(NoopMarketRiskReader),
         )
+    }
+
+    #[test]
+    fn daily_loss_rule_allows_when_disabled() {
+        let store = test_store();
+        let config = RiskConfig {
+            daily_loss_limit_enabled: false,
+            ..RiskConfig::default()
+        };
+        let engine = engine_with_daily_loss(config, store, dec(-100.0), false, None);
+
+        let decision = engine.check_place(
+            &place("market_maker", "token-1", 1.0),
+            &GatewayState::default(),
+        );
+
+        assert_eq!(decision, RiskDecision::Allow);
+    }
+
+    #[test]
+    fn daily_loss_rule_initializes_state_with_account_equity_when_missing() {
+        let store = test_store();
+        let engine = engine_with_daily_loss(
+            RiskConfig::default(),
+            store.clone(),
+            dec(2.0),
+            false,
+            Some(dec(1000.0)),
+        );
+
+        let decision = engine.check_place(
+            &place("market_maker", "token-1", 1.0),
+            &GatewayState::default(),
+        );
+
+        assert_eq!(decision, RiskDecision::Allow);
+        let state = store
+            .load_daily_loss_state(&current_trading_day_utc())
+            .expect("state should load")
+            .expect("state should initialize");
+        assert_eq!(state.day_start_total_pnl, dec(2.0));
+        assert_eq!(state.day_start_equity, dec(1000.0));
+        assert_eq!(state.loss_limit_amount, dec(30.0));
+        assert!(!state.halted);
+    }
+
+    #[test]
+    fn daily_loss_rule_rejects_when_account_equity_unavailable() {
+        let store = test_store();
+        let engine = engine_with_daily_loss(RiskConfig::default(), store, dec(0.0), false, None);
+
+        let decision = engine.check_place(
+            &place("market_maker", "token-1", 1.0),
+            &GatewayState::default(),
+        );
+
+        assert!(matches!(
+            decision,
+            RiskDecision::Reject { ref code, .. } if code.as_ref() == "daily_loss_equity_unavailable"
+        ));
+    }
+
+    #[test]
+    fn daily_loss_rule_rejects_when_valuation_degraded() {
+        let store = test_store();
+        let engine = engine_with_daily_loss(
+            RiskConfig::default(),
+            store,
+            Decimal::ZERO,
+            true,
+            Some(dec(1000.0)),
+        );
+
+        let decision = engine.check_place(
+            &place("market_maker", "token-1", 1.0),
+            &GatewayState::default(),
+        );
+
+        assert!(matches!(
+            decision,
+            RiskDecision::Reject { ref code, .. } if code.as_ref() == "daily_loss_valuation_degraded"
+        ));
+    }
+
+    #[test]
+    fn daily_loss_rule_rejects_and_persists_halt_when_loss_exceeds_limit() {
+        let store = test_store();
+        let trading_day = current_trading_day_utc();
+        store
+            .upsert_daily_loss_state(&StoredDailyLossState {
+                trading_day: trading_day.clone(),
+                day_start_total_pnl: Decimal::ZERO,
+                day_start_equity: dec(1000.0),
+                loss_limit_ratio: dec(0.03),
+                loss_limit_amount: dec(30.0),
+                halted: false,
+                halt_reason: None,
+                halted_at_ms: None,
+                updated_at_ms: 100,
+            })
+            .expect("state should upsert");
+        let engine = engine_with_daily_loss(
+            RiskConfig::default(),
+            store.clone(),
+            dec(-31.0),
+            false,
+            Some(dec(999.0)),
+        );
+
+        let decision = engine.check_place(
+            &place("market_maker", "token-1", 1.0),
+            &GatewayState::default(),
+        );
+
+        assert!(matches!(
+            decision,
+            RiskDecision::Reject { ref code, .. } if code.as_ref() == "daily_loss_limit"
+        ));
+        let state = store
+            .load_daily_loss_state(&trading_day)
+            .expect("state should load")
+            .expect("state should exist");
+        assert!(state.halted);
+        assert!(
+            state
+                .halt_reason
+                .unwrap()
+                .contains("daily loss limit triggered")
+        );
+    }
+
+    #[test]
+    fn daily_loss_rule_rejects_after_restart_when_halted_state_exists() {
+        let store = test_store();
+        let trading_day = current_trading_day_utc();
+        store
+            .upsert_daily_loss_state(&StoredDailyLossState {
+                trading_day,
+                day_start_total_pnl: Decimal::ZERO,
+                day_start_equity: dec(1000.0),
+                loss_limit_ratio: dec(0.03),
+                loss_limit_amount: dec(30.0),
+                halted: true,
+                halt_reason: Some("already halted".to_string()),
+                halted_at_ms: Some(200),
+                updated_at_ms: 200,
+            })
+            .expect("state should upsert");
+        let engine = engine_with_daily_loss(
+            RiskConfig::default(),
+            store,
+            Decimal::ZERO,
+            false,
+            Some(dec(1000.0)),
+        );
+
+        let decision = engine.check_place(
+            &place("market_maker", "token-1", 1.0),
+            &GatewayState::default(),
+        );
+
+        assert!(matches!(
+            decision,
+            RiskDecision::Reject { ref code, ref reason } if code.as_ref() == "daily_loss_limit" && reason.as_ref() == "already halted"
+        ));
+    }
+
+    #[test]
+    fn daily_loss_rule_rejects_after_sqlite_store_reopens_halted_state() {
+        let db_path = std::env::temp_dir().join(format!(
+            "daily_loss_restart_{}_{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let db_path = db_path.to_string_lossy().to_string();
+        let trading_day = current_trading_day_utc();
+        {
+            let store = OrderStore::open(&db_path).expect("store should open");
+            store.init_schema().expect("schema should initialize");
+            store
+                .upsert_daily_loss_state(&StoredDailyLossState {
+                    trading_day: trading_day.clone(),
+                    day_start_total_pnl: Decimal::ZERO,
+                    day_start_equity: dec(1000.0),
+                    loss_limit_ratio: dec(0.03),
+                    loss_limit_amount: dec(30.0),
+                    halted: true,
+                    halt_reason: Some("persisted halt".to_string()),
+                    halted_at_ms: Some(200),
+                    updated_at_ms: 200,
+                })
+                .expect("state should upsert");
+        }
+
+        {
+            let reopened = OrderStore::open(&db_path).expect("store should reopen");
+            reopened.init_schema().expect("schema should initialize");
+            let engine = engine_with_daily_loss(
+                RiskConfig::default(),
+                reopened,
+                Decimal::ZERO,
+                false,
+                Some(dec(1000.0)),
+            );
+
+            let place_decision = engine.check_place(
+                &place("market_maker", "token-1", 1.0),
+                &GatewayState::default(),
+            );
+            let cancel_decision =
+                engine.check_cancel(&cancel("market_maker"), &GatewayState::default());
+
+            assert!(matches!(
+                place_decision,
+                RiskDecision::Reject { ref code, ref reason } if code.as_ref() == "daily_loss_limit" && reason.as_ref() == "persisted halt"
+            ));
+            assert_eq!(cancel_decision, RiskDecision::Allow);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn daily_loss_rule_allows_cancel_even_when_halted() {
+        let store = test_store();
+        let trading_day = current_trading_day_utc();
+        store
+            .upsert_daily_loss_state(&StoredDailyLossState {
+                trading_day,
+                day_start_total_pnl: Decimal::ZERO,
+                day_start_equity: dec(1000.0),
+                loss_limit_ratio: dec(0.03),
+                loss_limit_amount: dec(30.0),
+                halted: true,
+                halt_reason: Some("already halted".to_string()),
+                halted_at_ms: Some(200),
+                updated_at_ms: 200,
+            })
+            .expect("state should upsert");
+        let engine = engine_with_daily_loss(
+            RiskConfig::default(),
+            store,
+            Decimal::ZERO,
+            false,
+            Some(dec(1000.0)),
+        );
+
+        let decision = engine.check_cancel(&cancel("market_maker"), &GatewayState::default());
+
+        assert_eq!(decision, RiskDecision::Allow);
     }
 
     #[test]

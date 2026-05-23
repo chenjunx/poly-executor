@@ -16,6 +16,8 @@ pub(crate) struct AppConfig {
     #[serde(default)]
     pub(crate) notification: NotificationConfig,
     #[serde(default)]
+    pub(crate) market_maker: MarketMakerConfig,
+    #[serde(default)]
     pub(crate) topic_threads: HashMap<String, usize>,
 }
 
@@ -98,6 +100,84 @@ impl Default for LiquidityRewardConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct MarketMakerConfig {
+    #[serde(default = "default_market_maker_enabled")]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_market_maker_file")]
+    pub(crate) file: String,
+    #[serde(default = "default_market_maker_max_inventory_usd")]
+    pub(crate) max_inventory_usd: f64,
+    #[serde(default = "default_market_maker_overweight_ratio")]
+    pub(crate) overweight_ratio: f64,
+    #[serde(default = "default_market_maker_default_max_spread")]
+    pub(crate) default_max_spread: f64,
+    #[serde(default = "default_market_maker_tick_size")]
+    pub(crate) tick_size: f64,
+    #[serde(default = "default_market_maker_min_size")]
+    pub(crate) min_size: f64,
+    #[serde(default = "default_market_maker_max_skew")]
+    pub(crate) max_skew: f64,
+    #[serde(default = "default_market_maker_volatility_window_ms")]
+    pub(crate) volatility_window_ms: u64,
+    #[serde(default = "default_market_maker_volatility_min_samples")]
+    pub(crate) volatility_min_samples: usize,
+    #[serde(default = "default_market_maker_volatility_threshold")]
+    pub(crate) volatility_threshold: f64,
+    #[serde(default = "default_market_maker_spread_cooldown_ms")]
+    pub(crate) spread_cooldown_ms: u64,
+    #[serde(default = "default_market_maker_volatility_cooldown_ms")]
+    pub(crate) volatility_cooldown_ms: u64,
+    #[serde(default = "default_market_maker_fair_midpoint_cooldown_ms")]
+    pub(crate) fair_midpoint_cooldown_ms: u64,
+    #[serde(default = "default_market_maker_fair_midpoint_min")]
+    pub(crate) fair_midpoint_min: f64,
+    #[serde(default = "default_market_maker_fair_midpoint_max")]
+    pub(crate) fair_midpoint_max: f64,
+    #[serde(default = "default_market_maker_abnormal_market_spread_multiplier")]
+    pub(crate) abnormal_market_spread_multiplier: f64,
+    #[serde(default = "default_market_maker_normal_quote_levels")]
+    pub(crate) normal_quote_levels: usize,
+    #[serde(default = "default_market_maker_overweight_quote_levels")]
+    pub(crate) overweight_quote_levels: usize,
+    #[serde(default = "default_market_maker_level_ratios")]
+    pub(crate) level_ratios: Vec<f64>,
+    #[serde(default = "default_market_maker_level_sizes_usd")]
+    pub(crate) level_sizes_usd: Vec<f64>,
+    #[serde(default = "default_market_maker_reconcile_size_tolerance")]
+    pub(crate) reconcile_size_tolerance: f64,
+}
+
+impl Default for MarketMakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_market_maker_enabled(),
+            file: default_market_maker_file(),
+            max_inventory_usd: default_market_maker_max_inventory_usd(),
+            overweight_ratio: default_market_maker_overweight_ratio(),
+            default_max_spread: default_market_maker_default_max_spread(),
+            tick_size: default_market_maker_tick_size(),
+            min_size: default_market_maker_min_size(),
+            max_skew: default_market_maker_max_skew(),
+            volatility_window_ms: default_market_maker_volatility_window_ms(),
+            volatility_min_samples: default_market_maker_volatility_min_samples(),
+            volatility_threshold: default_market_maker_volatility_threshold(),
+            spread_cooldown_ms: default_market_maker_spread_cooldown_ms(),
+            volatility_cooldown_ms: default_market_maker_volatility_cooldown_ms(),
+            fair_midpoint_cooldown_ms: default_market_maker_fair_midpoint_cooldown_ms(),
+            fair_midpoint_min: default_market_maker_fair_midpoint_min(),
+            fair_midpoint_max: default_market_maker_fair_midpoint_max(),
+            abnormal_market_spread_multiplier:
+                default_market_maker_abnormal_market_spread_multiplier(),
+            normal_quote_levels: default_market_maker_normal_quote_levels(),
+            overweight_quote_levels: default_market_maker_overweight_quote_levels(),
+            level_ratios: default_market_maker_level_ratios(),
+            level_sizes_usd: default_market_maker_level_sizes_usd(),
+            reconcile_size_tolerance: default_market_maker_reconcile_size_tolerance(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub(crate) struct NotificationConfig {
     #[serde(default)]
@@ -140,6 +220,94 @@ fn default_liquidity_reward_pool_market_count() -> usize {
 
 fn default_liquidity_reward_balance_cooldown_secs() -> u64 {
     60
+}
+
+fn default_market_maker_enabled() -> bool {
+    true
+}
+
+fn default_market_maker_file() -> String {
+    "market_maker.csv".to_string()
+}
+
+fn default_market_maker_max_inventory_usd() -> f64 {
+    100.0
+}
+
+fn default_market_maker_overweight_ratio() -> f64 {
+    0.7
+}
+
+fn default_market_maker_default_max_spread() -> f64 {
+    0.03
+}
+
+fn default_market_maker_tick_size() -> f64 {
+    0.01
+}
+
+fn default_market_maker_min_size() -> f64 {
+    5.0
+}
+
+fn default_market_maker_max_skew() -> f64 {
+    0.01
+}
+
+fn default_market_maker_volatility_window_ms() -> u64 {
+    5 * 60 * 1000
+}
+
+fn default_market_maker_volatility_min_samples() -> usize {
+    5
+}
+
+fn default_market_maker_volatility_threshold() -> f64 {
+    0.02
+}
+
+fn default_market_maker_spread_cooldown_ms() -> u64 {
+    60 * 1000
+}
+
+fn default_market_maker_volatility_cooldown_ms() -> u64 {
+    5 * 60 * 1000
+}
+
+fn default_market_maker_fair_midpoint_cooldown_ms() -> u64 {
+    10 * 60 * 1000
+}
+
+fn default_market_maker_fair_midpoint_min() -> f64 {
+    0.15
+}
+
+fn default_market_maker_fair_midpoint_max() -> f64 {
+    0.85
+}
+
+fn default_market_maker_abnormal_market_spread_multiplier() -> f64 {
+    2.0
+}
+
+fn default_market_maker_normal_quote_levels() -> usize {
+    3
+}
+
+fn default_market_maker_overweight_quote_levels() -> usize {
+    2
+}
+
+fn default_market_maker_level_ratios() -> Vec<f64> {
+    vec![0.4, 0.55, 0.7]
+}
+
+fn default_market_maker_level_sizes_usd() -> Vec<f64> {
+    vec![50.0, 75.0, 100.0]
+}
+
+fn default_market_maker_reconcile_size_tolerance() -> f64 {
+    0.2
 }
 
 fn default_dingtalk_timeout_secs() -> u64 {
@@ -216,5 +384,97 @@ size_usdc = 1.0
             .try_deserialize()
             .expect("minimal config should parse without account section");
         assert!(config.app.assets_file.is_empty());
+    }
+
+    #[test]
+    fn app_config_uses_default_market_maker_config_when_section_missing() {
+        let toml = r#"
+[proxy]
+url = ""
+
+[app]
+log_file = ""
+assets_file = ""
+min_diff = 0.0
+max_spread = 0.0
+min_price = 0.0
+max_price = 1.0
+default_threads = 1
+
+[auth]
+api_key = ""
+api_secret = ""
+passphrase = ""
+private_key = ""
+funder = ""
+
+[order]
+size_usdc = 1.0
+"#;
+
+        let config: AppConfig = Config::builder()
+            .add_source(config::File::from_str(toml, FileFormat::Toml))
+            .build()
+            .expect("minimal config source should build")
+            .try_deserialize()
+            .expect("minimal config should parse without market maker section");
+
+        assert!(config.market_maker.enabled);
+        assert_eq!(config.market_maker.file, "market_maker.csv");
+        assert_eq!(config.market_maker.max_inventory_usd, 100.0);
+        assert_eq!(config.market_maker.overweight_ratio, 0.7);
+        assert_eq!(config.market_maker.level_ratios, vec![0.4, 0.55, 0.7]);
+        assert_eq!(config.market_maker.level_sizes_usd, vec![50.0, 75.0, 100.0]);
+    }
+
+    #[test]
+    fn app_config_parses_market_maker_section() {
+        let toml = r#"
+[proxy]
+url = ""
+
+[app]
+log_file = ""
+assets_file = ""
+min_diff = 0.0
+max_spread = 0.0
+min_price = 0.0
+max_price = 1.0
+default_threads = 1
+
+[auth]
+api_key = ""
+api_secret = ""
+passphrase = ""
+private_key = ""
+funder = ""
+
+[order]
+size_usdc = 1.0
+
+[market_maker]
+enabled = false
+file = "custom_market_maker.csv"
+max_inventory_usd = 250.0
+overweight_ratio = 0.6
+level_ratios = [0.25, 0.5]
+level_sizes_usd = [20.0, 40.0]
+reconcile_size_tolerance = 0.05
+"#;
+
+        let config: AppConfig = Config::builder()
+            .add_source(config::File::from_str(toml, FileFormat::Toml))
+            .build()
+            .expect("config source should build")
+            .try_deserialize()
+            .expect("market maker config should parse");
+
+        assert!(!config.market_maker.enabled);
+        assert_eq!(config.market_maker.file, "custom_market_maker.csv");
+        assert_eq!(config.market_maker.max_inventory_usd, 250.0);
+        assert_eq!(config.market_maker.overweight_ratio, 0.6);
+        assert_eq!(config.market_maker.level_ratios, vec![0.25, 0.5]);
+        assert_eq!(config.market_maker.level_sizes_usd, vec![20.0, 40.0]);
+        assert_eq!(config.market_maker.reconcile_size_tolerance, 0.05);
     }
 }
