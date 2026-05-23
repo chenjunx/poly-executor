@@ -25,6 +25,48 @@ pub(crate) enum NotificationEvent {
     LiquidityRewardUnwindAction(LiquidityRewardUnwindActionNotification),
     LiquidityRewardPoolRemoval(LiquidityRewardPoolRemovalNotification),
     LiquidityRewardManualAttention(LiquidityRewardManualAttentionNotification),
+    OrderSubmitted(OrderSubmittedNotification),
+    OrderFilled(OrderFilledNotification),
+    RiskEvent(RiskEventNotification),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OrderSubmittedNotification {
+    pub(crate) strategy_id: String,
+    pub(crate) local_order_id: String,
+    pub(crate) exchange_order_id: Option<String>,
+    pub(crate) market_id: String,
+    pub(crate) token_id: String,
+    pub(crate) side: String,
+    pub(crate) order_type: String,
+    pub(crate) price: Option<Decimal>,
+    pub(crate) size: Decimal,
+    pub(crate) event_kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OrderFilledNotification {
+    pub(crate) strategy_id: String,
+    pub(crate) local_order_id: String,
+    pub(crate) market_id: String,
+    pub(crate) token_id: String,
+    pub(crate) side: String,
+    pub(crate) fill_kind: String,
+    pub(crate) fill_qty: Decimal,
+    pub(crate) fill_price: Decimal,
+    pub(crate) cum_qty: Decimal,
+    pub(crate) avg_fill_price: Option<Decimal>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RiskEventNotification {
+    pub(crate) source: String,
+    pub(crate) strategy_id: Option<String>,
+    pub(crate) local_order_id: Option<String>,
+    pub(crate) market_id: Option<String>,
+    pub(crate) token_id: Option<String>,
+    pub(crate) risk_code: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +244,32 @@ async fn send_dingtalk_message(
                 "钉钉 liquidity_reward 人工处理通知发送成功"
             );
         }
+        NotificationEvent::OrderSubmitted(submitted) => {
+            info!(
+                target: "notification",
+                strategy_id = %submitted.strategy_id,
+                local_order_id = %submitted.local_order_id,
+                token_id = %submitted.token_id,
+                "钉钉订单提交通知发送成功"
+            );
+        }
+        NotificationEvent::OrderFilled(fill) => {
+            info!(
+                target: "notification",
+                strategy_id = %fill.strategy_id,
+                local_order_id = %fill.local_order_id,
+                fill_qty = %fill.fill_qty,
+                "钉钉订单成交通知发送成功"
+            );
+        }
+        NotificationEvent::RiskEvent(risk) => {
+            info!(
+                target: "notification",
+                source = %risk.source,
+                risk_code = %risk.risk_code,
+                "钉钉风控通知发送成功"
+            );
+        }
     }
     Ok(())
 }
@@ -260,7 +328,132 @@ fn build_dingtalk_payload(event: &NotificationEvent) -> serde_json::Value {
                 },
             })
         }
+        NotificationEvent::OrderSubmitted(submitted) => {
+            let text = build_order_submitted_markdown(submitted);
+            json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "订单已提交",
+                    "text": text,
+                },
+                "at": {
+                    "isAtAll": false,
+                },
+            })
+        }
+        NotificationEvent::OrderFilled(fill) => {
+            let text = build_order_filled_markdown(fill);
+            json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "订单成交",
+                    "text": text,
+                },
+                "at": {
+                    "isAtAll": false,
+                },
+            })
+        }
+        NotificationEvent::RiskEvent(risk) => {
+            let text = build_risk_event_markdown(risk);
+            json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "风控事件",
+                    "text": text,
+                },
+                "at": {
+                    "isAtAll": false,
+                },
+            })
+        }
     }
+}
+
+fn build_order_submitted_markdown(submitted: &OrderSubmittedNotification) -> String {
+    let notify_time = chrono::Utc::now().to_rfc3339();
+    format!(
+        "### 订单已提交\n\n\
+        - 策略：{}\n\
+        - Local Order ID：{}\n\
+        - Exchange Order ID：{}\n\
+        - Market ID：{}\n\
+        - Token ID：{}\n\
+        - 方向：{}\n\
+        - 订单类型：{}\n\
+        - 价格：{}\n\
+        - 数量：{}\n\
+        - 事件：{}\n\
+        - 通知时间：{}",
+        submitted.strategy_id,
+        submitted.local_order_id,
+        submitted.exchange_order_id.as_deref().unwrap_or("-"),
+        submitted.market_id,
+        submitted.token_id,
+        submitted.side,
+        submitted.order_type,
+        submitted
+            .price
+            .map(|price| price.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        submitted.size,
+        submitted.event_kind,
+        notify_time,
+    )
+}
+
+fn build_order_filled_markdown(fill: &OrderFilledNotification) -> String {
+    let notify_time = chrono::Utc::now().to_rfc3339();
+    format!(
+        "### 订单成交\n\n\
+        - 策略：{}\n\
+        - Local Order ID：{}\n\
+        - Market ID：{}\n\
+        - Token ID：{}\n\
+        - 方向：{}\n\
+        - 成交类型：{}\n\
+        - 本次成交数量：{}\n\
+        - 本次成交价格：{}\n\
+        - 累计成交数量：{}\n\
+        - 平均成交价格：{}\n\
+        - 通知时间：{}",
+        fill.strategy_id,
+        fill.local_order_id,
+        fill.market_id,
+        fill.token_id,
+        fill.side,
+        fill.fill_kind,
+        fill.fill_qty,
+        fill.fill_price,
+        fill.cum_qty,
+        fill.avg_fill_price
+            .map(|price| price.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        notify_time,
+    )
+}
+
+fn build_risk_event_markdown(risk: &RiskEventNotification) -> String {
+    let notify_time = chrono::Utc::now().to_rfc3339();
+    format!(
+        "### 风控事件\n\n\
+        - 来源：{}\n\
+        - 策略：{}\n\
+        - Local Order ID：{}\n\
+        - Market ID：{}\n\
+        - Token ID：{}\n\
+        - 风控代码：{}\n\
+        - 原因：{}\n\
+        - 通知时间：{}",
+        risk.source,
+        risk.strategy_id.as_deref().unwrap_or("-"),
+        risk.local_order_id.as_deref().unwrap_or("-"),
+        risk.market_id.as_deref().unwrap_or("-"),
+        risk.token_id.as_deref().unwrap_or("-"),
+        risk.risk_code,
+        risk.reason,
+        notify_time,
+    )
 }
 
 fn build_liquidity_reward_fill_markdown(fill: &LiquidityRewardFillNotification) -> String {
@@ -595,5 +788,87 @@ mod tests {
         assert!(text.contains("2"));
         assert!(text.contains("已尝试次数：5"));
         assert!(text.contains("not enough balance / allowance"));
+    }
+
+    #[test]
+    fn dingtalk_payload_contains_order_submitted_fields() {
+        let payload = build_dingtalk_payload(&NotificationEvent::OrderSubmitted(
+            OrderSubmittedNotification {
+                strategy_id: "market_maker".to_string(),
+                local_order_id: "mm-local-1".to_string(),
+                exchange_order_id: Some("0xorder".to_string()),
+                market_id: "0xmarket".to_string(),
+                token_id: "token-1".to_string(),
+                side: "Buy".to_string(),
+                order_type: "LimitGtc".to_string(),
+                price: Some(Decimal::try_from(0.42_f64).unwrap()),
+                size: Decimal::try_from(10.5_f64).unwrap(),
+                event_kind: "Accepted".to_string(),
+            },
+        ));
+
+        assert_eq!(payload["markdown"]["title"].as_str().unwrap(), "订单已提交");
+        let text = payload["markdown"]["text"].as_str().unwrap();
+        assert!(text.contains("market_maker"));
+        assert!(text.contains("mm-local-1"));
+        assert!(text.contains("0xorder"));
+        assert!(text.contains("0xmarket"));
+        assert!(text.contains("token-1"));
+        assert!(text.contains("Buy"));
+        assert!(text.contains("LimitGtc"));
+        assert!(text.contains("0.42"));
+        assert!(text.contains("10.5"));
+        assert!(text.contains("Accepted"));
+    }
+
+    #[test]
+    fn dingtalk_payload_contains_order_fill_fields() {
+        let payload =
+            build_dingtalk_payload(&NotificationEvent::OrderFilled(OrderFilledNotification {
+                strategy_id: "market_maker".to_string(),
+                local_order_id: "mm-local-1".to_string(),
+                market_id: "0xmarket".to_string(),
+                token_id: "token-1".to_string(),
+                side: "Buy".to_string(),
+                fill_kind: "partial_fill".to_string(),
+                fill_qty: Decimal::try_from(1.25_f64).unwrap(),
+                fill_price: Decimal::try_from(0.41_f64).unwrap(),
+                cum_qty: Decimal::try_from(2.5_f64).unwrap(),
+                avg_fill_price: Some(Decimal::try_from(0.415_f64).unwrap()),
+            }));
+
+        assert_eq!(payload["markdown"]["title"].as_str().unwrap(), "订单成交");
+        let text = payload["markdown"]["text"].as_str().unwrap();
+        assert!(text.contains("market_maker"));
+        assert!(text.contains("mm-local-1"));
+        assert!(text.contains("partial_fill"));
+        assert!(text.contains("1.25"));
+        assert!(text.contains("0.41"));
+        assert!(text.contains("2.5"));
+        assert!(text.contains("0.415"));
+    }
+
+    #[test]
+    fn dingtalk_payload_contains_risk_event_fields() {
+        let payload =
+            build_dingtalk_payload(&NotificationEvent::RiskEvent(RiskEventNotification {
+                source: "order_gateway".to_string(),
+                strategy_id: Some("market_maker".to_string()),
+                local_order_id: Some("mm-local-1".to_string()),
+                market_id: Some("0xmarket".to_string()),
+                token_id: Some("token-1".to_string()),
+                risk_code: "daily_loss_limit".to_string(),
+                reason: "daily loss limit triggered".to_string(),
+            }));
+
+        assert_eq!(payload["markdown"]["title"].as_str().unwrap(), "风控事件");
+        let text = payload["markdown"]["text"].as_str().unwrap();
+        assert!(text.contains("order_gateway"));
+        assert!(text.contains("market_maker"));
+        assert!(text.contains("mm-local-1"));
+        assert!(text.contains("0xmarket"));
+        assert!(text.contains("token-1"));
+        assert!(text.contains("daily_loss_limit"));
+        assert!(text.contains("daily loss limit triggered"));
     }
 }

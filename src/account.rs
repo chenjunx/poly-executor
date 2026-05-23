@@ -6,7 +6,7 @@ use polymarket_client_sdk_v2::clob::types::AssetType;
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::response::BalanceAllowanceResponse;
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
 use crate::config::AuthConfig;
@@ -17,6 +17,7 @@ pub const ACCOUNT_MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub struct AccountFundSnapshot {
     pub checked_at_ms: u64,
     pub balance: Decimal,
+    pub balance_raw: Decimal,
     pub allowances_json: String,
 }
 
@@ -62,10 +63,11 @@ async fn run(auth: AuthConfig, tx: tokio::sync::watch::Sender<Option<AccountFund
     loop {
         match fetch_account_fund_snapshot(&client).await {
             Ok(snapshot) => {
-                info!(
+                debug!(
                     target: "order",
                     checked_at_ms = snapshot.checked_at_ms,
                     balance = %snapshot.balance,
+                    balance_raw = %snapshot.balance_raw,
                     allowances_json = %snapshot.allowances_json,
                     "account_monitor 账户资金快照同步完成"
                 );
@@ -100,11 +102,17 @@ fn snapshot_from_balance_response(
         .collect::<BTreeMap<_, _>>();
     let allowances_json =
         serde_json::to_string(&allowances).context("serialize account allowance map")?;
+    let balance_raw = response.balance;
     Ok(AccountFundSnapshot {
         checked_at_ms,
-        balance: response.balance,
+        balance: collateral_balance_to_usdc(balance_raw),
+        balance_raw,
         allowances_json,
     })
+}
+
+fn collateral_balance_to_usdc(balance: Decimal) -> Decimal {
+    balance / Decimal::from(1_000_000u32)
 }
 
 fn now_ms() -> anyhow::Result<u64> {
@@ -130,6 +138,7 @@ mod tests {
         let snapshot = AccountFundSnapshot {
             checked_at_ms: 42,
             balance: Decimal::from(100u32),
+            balance_raw: Decimal::from(100_000_000u32),
             allowances_json: r#"{"0xabc":"123"}"#.to_string(),
         };
         tx.send_replace(Some(snapshot.clone()));
@@ -145,6 +154,7 @@ mod tests {
         let snapshot = AccountFundSnapshot {
             checked_at_ms: 100,
             balance: Decimal::from(200u32),
+            balance_raw: Decimal::from(200_000_000u32),
             allowances_json: r#"{"0xdef":"456"}"#.to_string(),
         };
         tx.send_replace(Some(snapshot.clone()));
@@ -162,6 +172,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_from_balance_response_scales_collateral_balance_to_usdc() {
+        let response = BalanceAllowanceResponse::builder()
+            .balance(Decimal::from(875_362_001u64))
+            .allowances(HashMap::new())
+            .build();
+
+        let snapshot =
+            snapshot_from_balance_response(42, response).expect("snapshot conversion should work");
+
+        assert_eq!(
+            snapshot.balance,
+            Decimal::from_str("875.362001").expect("decimal should parse")
+        );
+    }
+
+    #[test]
     fn snapshot_from_balance_response_serializes_allowances_as_json() {
         let address = Address::from_str("0x0000000000000000000000000000000000000001")
             .expect("address should parse");
@@ -176,7 +202,8 @@ mod tests {
             snapshot_from_balance_response(42, response).expect("snapshot conversion should work");
 
         assert_eq!(snapshot.checked_at_ms, 42);
-        assert_eq!(snapshot.balance, Decimal::from(100u32));
+        assert_eq!(snapshot.balance, Decimal::try_from(0.0001_f64).unwrap());
+        assert_eq!(snapshot.balance_raw, Decimal::from(100u32));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&snapshot.allowances_json).unwrap(),
             json!({"0x0000000000000000000000000000000000000001":"123.45"})

@@ -18,7 +18,7 @@ funder      = ""   # 钱包地址
 size_usdc = 10.0   # 每次套利投入的 USDC 总量
 
 [simulation]
-enabled = true    # true 时不真实下单，order gateway 只生成本地模拟订单事件
+enabled = false    # true 时不真实下单，order gateway 只生成本地模拟订单事件
 
 [market_maker]
 # 是否启动做市策略；false 时不会读取 market_maker.csv

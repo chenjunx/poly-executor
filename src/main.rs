@@ -29,7 +29,11 @@ use polymarket_client_sdk_v2::types::Decimal;
 use tracing::info;
 
 use config::{AppConfig, load_app_config};
-use order_gateway::{OrderGateway, OrderGatewayConfig};
+use order_gateway::{
+    ClobOrderCancelSubmitter, ClobOrderSubmitter, GatewayOrderType, LocalRejectReason,
+    OrderEventKind, OrderEventPayload, OrderEventSubscriber, OrderGateway, OrderGatewayConfig,
+    OrderSide, SimulatedOrderCancelSubmitter, SimulatedOrderSubmitter, TimeInForce,
+};
 use risk::{
     AccountHandleEquityReader, GatewayRiskEngine, GlobalPortfolioValuationReader,
     NoopMarketRiskReader, RiskConfig, StrategyKindRegistry,
@@ -92,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
     let app_config = load_app_config()?;
     let log_path = init_log_path(&app_config);
     let _log_guards = logging::init_logging(&log_path)?;
+    let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
     let (order_store, market_store) = init_stores(&app_config)?;
 
     let account_read_handle = account::spawn_account_monitor(app_config.auth.clone());
@@ -143,8 +148,25 @@ async fn main() -> anyhow::Result<()> {
         request_ring_capacity: 1024,
         event_ring_capacity: 16384,
     };
+    let order_submitter: Arc<dyn order_gateway::OrderSubmitter> = if app_config.simulation.enabled {
+        Arc::new(SimulatedOrderSubmitter)
+    } else {
+        Arc::new(ClobOrderSubmitter::new(app_config.auth.clone()))
+    };
+    let order_cancel_submitter: Arc<dyn order_gateway::OrderCancelSubmitter> =
+        if app_config.simulation.enabled {
+            Arc::new(SimulatedOrderCancelSubmitter)
+        } else {
+            Arc::new(ClobOrderCancelSubmitter::new(app_config.auth.clone()))
+        };
     let (mut order_gateway, order_gateway_handle, order_event_ring, order_observation_tx) =
-        OrderGateway::new(gateway_config, Arc::new(risk_engine), order_store.clone());
+        OrderGateway::new_with_submitters(
+            gateway_config,
+            Arc::new(risk_engine),
+            order_store.clone(),
+            order_submitter,
+            order_cancel_submitter,
+        );
     let pending_settlement_rx = order_gateway.subscribe_pending_settlements();
     tokio::spawn(position_ingestor.run_until_input_closed());
     tokio::spawn(position_engine::run_persist_task(
@@ -155,6 +177,12 @@ async fn main() -> anyhow::Result<()> {
         order_event_ring.subscribe_all(),
         position_ingest_handle,
     ));
+    if let Some(notifier) = notifier.clone() {
+        tokio::spawn(run_order_notification_bridge(
+            order_event_ring.subscribe_all(),
+            notifier,
+        ));
+    }
     order_gateway
         .complete_startup_recovery()
         .expect("order gateway startup recovery should complete");
@@ -167,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         order_gateway_handle,
         strategy_position_read_handle,
         topic_txs.as_ref(),
+        notifier.clone(),
     )?;
     tokio::spawn(drain_market_firehose(firehose_rx));
     let recorder_senders = spawn_recorders(&app_config, market_store.clone());
@@ -348,6 +377,7 @@ fn spawn_strategy_tasks(
     order_gateway_handle: order_gateway::OrderGatewayHandle,
     position_read: position_engine::PositionReadHandle,
     topic_txs: &HashMap<Arc<str>, tokio::sync::broadcast::Sender<strategy::MarketEvent>>,
+    notifier: Option<notification::Notifier>,
 ) -> anyhow::Result<()> {
     let pair_subscriptions = subscribe_strategy_topics(&pair_registration, topic_txs)?;
     pair_strategy.spawn(
@@ -359,7 +389,7 @@ fn spawn_strategy_tasks(
     if let Some(market_maker_strategy) = market_maker {
         let market_maker_subscriptions =
             subscribe_strategy_topics(market_maker_strategy.registration(), topic_txs)?;
-        market_maker_strategy.spawn(
+        market_maker_strategy.with_notifier(notifier).spawn(
             market_maker_subscriptions,
             order_gateway_handle,
             position_read,
@@ -394,6 +424,163 @@ fn spawn_recorders(app_config: &AppConfig, market_store: MarketStore) -> Recorde
 
 async fn drain_market_firehose(mut rx: tokio::sync::mpsc::Receiver<strategy::MarketAssetEvent>) {
     while rx.recv().await.is_some() {}
+}
+
+async fn run_order_notification_bridge(
+    mut subscriber: OrderEventSubscriber,
+    notifier: notification::Notifier,
+) {
+    loop {
+        match subscriber.recv_relevant().await {
+            Ok(event) => {
+                if let Some(notification) = notification_from_order_event(&event) {
+                    notifier.try_notify(notification);
+                }
+            }
+            Err(order_gateway::OrderEventPollError::Closed) => break,
+            Err(order_gateway::OrderEventPollError::Lagged { skipped }) => {
+                tracing::warn!(
+                    target: "notification",
+                    skipped,
+                    "订单通知订阅落后，部分订单通知可能已跳过"
+                );
+            }
+            Err(order_gateway::OrderEventPollError::Empty) => {}
+        }
+    }
+}
+
+fn notification_from_order_event(
+    event: &order_gateway::OrderEventEnvelope,
+) -> Option<notification::NotificationEvent> {
+    if event.recovery {
+        return None;
+    }
+
+    match (&event.kind, &event.payload) {
+        (OrderEventKind::Accepted, OrderEventPayload::Accepted { exch_id }) => {
+            let order = event.order.as_ref();
+            Some(notification::NotificationEvent::OrderSubmitted(
+                notification::OrderSubmittedNotification {
+                    strategy_id: event.strategy_id.as_str().to_string(),
+                    local_order_id: event.local_id.as_str().to_string(),
+                    exchange_order_id: exch_id.as_ref().map(|value| value.as_str().to_string()),
+                    market_id: event.market_id.as_str().to_string(),
+                    token_id: event.token_id.as_str().to_string(),
+                    side: order
+                        .map(|meta| order_side_label(meta.side).to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    order_type: order
+                        .map(|meta| gateway_order_type_label(&meta.order_type).to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    price: order.and_then(|meta| meta.price),
+                    size: order
+                        .map(|meta| meta.original_size)
+                        .unwrap_or(Decimal::ZERO),
+                    event_kind: "Accepted".to_string(),
+                },
+            ))
+        }
+        (
+            OrderEventKind::PartialFill,
+            OrderEventPayload::PartialFill {
+                fill_qty,
+                fill_price,
+                cum_qty,
+                avg_fill_price,
+            },
+        ) => Some(order_fill_notification(
+            event,
+            "partial_fill",
+            *fill_qty,
+            *fill_price,
+            *cum_qty,
+            *avg_fill_price,
+        )),
+        (
+            OrderEventKind::Fill,
+            OrderEventPayload::Fill {
+                fill_qty,
+                fill_price,
+                cum_qty,
+                avg_fill_price,
+            },
+        ) => Some(order_fill_notification(
+            event,
+            "fill",
+            *fill_qty,
+            *fill_price,
+            *cum_qty,
+            *avg_fill_price,
+        )),
+        (
+            OrderEventKind::LocalRejected,
+            OrderEventPayload::LocalRejected {
+                reason: LocalRejectReason::RiskRejected { code, reason },
+            },
+        ) => Some(notification::NotificationEvent::RiskEvent(
+            notification::RiskEventNotification {
+                source: "order_gateway".to_string(),
+                strategy_id: Some(event.strategy_id.as_str().to_string()),
+                local_order_id: Some(event.local_id.as_str().to_string()),
+                market_id: Some(event.market_id.as_str().to_string()),
+                token_id: Some(event.token_id.as_str().to_string()),
+                risk_code: code.to_string(),
+                reason: reason.to_string(),
+            },
+        )),
+        _ => None,
+    }
+}
+
+fn order_fill_notification(
+    event: &order_gateway::OrderEventEnvelope,
+    fill_kind: &str,
+    fill_qty: Decimal,
+    fill_price: Decimal,
+    cum_qty: Decimal,
+    avg_fill_price: Option<Decimal>,
+) -> notification::NotificationEvent {
+    let order = event.order.as_ref();
+    notification::NotificationEvent::OrderFilled(notification::OrderFilledNotification {
+        strategy_id: event.strategy_id.as_str().to_string(),
+        local_order_id: event.local_id.as_str().to_string(),
+        market_id: event.market_id.as_str().to_string(),
+        token_id: event.token_id.as_str().to_string(),
+        side: order
+            .map(|meta| order_side_label(meta.side).to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        fill_kind: fill_kind.to_string(),
+        fill_qty,
+        fill_price,
+        cum_qty,
+        avg_fill_price,
+    })
+}
+
+fn order_side_label(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "Buy",
+        OrderSide::Sell => "Sell",
+    }
+}
+
+fn gateway_order_type_label(order_type: &GatewayOrderType) -> &'static str {
+    match order_type {
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtc,
+        } => "LimitGtc",
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtd { .. },
+        } => "LimitGtd",
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Ioc,
+        } => "LimitIoc",
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Fok,
+        } => "LimitFok",
+        GatewayOrderType::Market => "Market",
+    }
 }
 
 fn spawn_market_and_positions(app_config: &AppConfig, runtime: MarketRuntime) {
@@ -519,6 +706,179 @@ mod tests {
         let _spawn_fn = OrderGateway::spawn_settlement_activity_poller::<
             order_gateway::DataApiSettlementActivityReader,
         >;
+    }
+
+    fn sample_order_meta() -> order_gateway::OrderEventOrderMeta {
+        order_gateway::OrderEventOrderMeta {
+            side: order_gateway::OrderSide::Buy,
+            order_type: order_gateway::GatewayOrderType::Limit {
+                time_in_force: order_gateway::TimeInForce::Gtc,
+            },
+            price: Some(Decimal::try_from(0.42_f64).unwrap()),
+            original_size: Decimal::try_from(10.5_f64).unwrap(),
+        }
+    }
+
+    fn sample_order_event(
+        kind: order_gateway::OrderEventKind,
+        payload: order_gateway::OrderEventPayload,
+    ) -> order_gateway::OrderEventEnvelope {
+        order_gateway::OrderEventEnvelope {
+            strategy_id: order_gateway::StrategyId::from("market_maker"),
+            local_id: order_gateway::LocalOrderId::from("mm-local-1"),
+            token_id: order_gateway::TokenId::from("token-1"),
+            market_id: order_gateway::MarketId::from("0xmarket"),
+            seq: 1,
+            ts_ns: 1,
+            recovery: false,
+            kind,
+            payload,
+            order: Some(sample_order_meta()),
+        }
+    }
+
+    #[test]
+    fn accepted_order_event_maps_to_order_submitted_notification() {
+        let event = sample_order_event(
+            order_gateway::OrderEventKind::Accepted,
+            order_gateway::OrderEventPayload::Accepted {
+                exch_id: Some(order_gateway::ExchangeOrderId::from("0xorder")),
+            },
+        );
+
+        let notification =
+            notification_from_order_event(&event).expect("should map accepted order");
+
+        match notification {
+            notification::NotificationEvent::OrderSubmitted(submitted) => {
+                assert_eq!(submitted.strategy_id, "market_maker");
+                assert_eq!(submitted.local_order_id, "mm-local-1");
+                assert_eq!(submitted.exchange_order_id.as_deref(), Some("0xorder"));
+                assert_eq!(submitted.market_id, "0xmarket");
+                assert_eq!(submitted.token_id, "token-1");
+                assert_eq!(submitted.side, "Buy");
+                assert_eq!(submitted.order_type, "LimitGtc");
+                assert_eq!(submitted.price, Some(Decimal::try_from(0.42_f64).unwrap()));
+                assert_eq!(submitted.size, Decimal::try_from(10.5_f64).unwrap());
+                assert_eq!(submitted.event_kind, "Accepted");
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_fill_event_maps_to_order_filled_notification() {
+        let event = sample_order_event(
+            order_gateway::OrderEventKind::PartialFill,
+            order_gateway::OrderEventPayload::PartialFill {
+                fill_qty: Decimal::try_from(1.25_f64).unwrap(),
+                fill_price: Decimal::try_from(0.41_f64).unwrap(),
+                cum_qty: Decimal::try_from(2.5_f64).unwrap(),
+                avg_fill_price: Some(Decimal::try_from(0.415_f64).unwrap()),
+            },
+        );
+
+        let notification = notification_from_order_event(&event).expect("should map fill");
+
+        match notification {
+            notification::NotificationEvent::OrderFilled(fill) => {
+                assert_eq!(fill.strategy_id, "market_maker");
+                assert_eq!(fill.local_order_id, "mm-local-1");
+                assert_eq!(fill.fill_kind, "partial_fill");
+                assert_eq!(fill.fill_qty, Decimal::try_from(1.25_f64).unwrap());
+                assert_eq!(fill.fill_price, Decimal::try_from(0.41_f64).unwrap());
+                assert_eq!(fill.cum_qty, Decimal::try_from(2.5_f64).unwrap());
+                assert_eq!(
+                    fill.avg_fill_price,
+                    Some(Decimal::try_from(0.415_f64).unwrap())
+                );
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fill_event_maps_to_order_filled_notification() {
+        let event = sample_order_event(
+            order_gateway::OrderEventKind::Fill,
+            order_gateway::OrderEventPayload::Fill {
+                fill_qty: Decimal::try_from(8_f64).unwrap(),
+                fill_price: Decimal::try_from(0.44_f64).unwrap(),
+                cum_qty: Decimal::try_from(10.5_f64).unwrap(),
+                avg_fill_price: Some(Decimal::try_from(0.435_f64).unwrap()),
+            },
+        );
+
+        let notification = notification_from_order_event(&event).expect("should map fill");
+
+        match notification {
+            notification::NotificationEvent::OrderFilled(fill) => {
+                assert_eq!(fill.strategy_id, "market_maker");
+                assert_eq!(fill.local_order_id, "mm-local-1");
+                assert_eq!(fill.fill_kind, "fill");
+                assert_eq!(fill.fill_qty, Decimal::try_from(8_f64).unwrap());
+                assert_eq!(fill.fill_price, Decimal::try_from(0.44_f64).unwrap());
+                assert_eq!(fill.cum_qty, Decimal::try_from(10.5_f64).unwrap());
+                assert_eq!(
+                    fill.avg_fill_price,
+                    Some(Decimal::try_from(0.435_f64).unwrap())
+                );
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_local_rejected_event_maps_to_risk_notification() {
+        let event = sample_order_event(
+            order_gateway::OrderEventKind::LocalRejected,
+            order_gateway::OrderEventPayload::LocalRejected {
+                reason: order_gateway::LocalRejectReason::RiskRejected {
+                    code: Arc::from("daily_loss_limit"),
+                    reason: Arc::from("daily loss limit triggered"),
+                },
+            },
+        );
+
+        let notification = notification_from_order_event(&event).expect("should map risk reject");
+
+        match notification {
+            notification::NotificationEvent::RiskEvent(risk) => {
+                assert_eq!(risk.source, "order_gateway");
+                assert_eq!(risk.strategy_id.as_deref(), Some("market_maker"));
+                assert_eq!(risk.local_order_id.as_deref(), Some("mm-local-1"));
+                assert_eq!(risk.market_id.as_deref(), Some("0xmarket"));
+                assert_eq!(risk.token_id.as_deref(), Some("token-1"));
+                assert_eq!(risk.risk_code, "daily_loss_limit");
+                assert_eq!(risk.reason, "daily loss limit triggered");
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_risk_local_rejected_event_is_ignored() {
+        let event = sample_order_event(
+            order_gateway::OrderEventKind::LocalRejected,
+            order_gateway::OrderEventPayload::LocalRejected {
+                reason: order_gateway::LocalRejectReason::DuplicateLocalId,
+            },
+        );
+
+        assert!(notification_from_order_event(&event).is_none());
+    }
+
+    #[test]
+    fn recovery_order_event_is_ignored() {
+        let mut event = sample_order_event(
+            order_gateway::OrderEventKind::Accepted,
+            order_gateway::OrderEventPayload::Accepted {
+                exch_id: Some(order_gateway::ExchangeOrderId::from("0xorder")),
+            },
+        );
+        event.recovery = true;
+
+        assert!(notification_from_order_event(&event).is_none());
     }
 
     #[test]

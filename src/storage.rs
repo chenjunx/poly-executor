@@ -185,6 +185,17 @@ pub struct OrderGatewaySubmissionInsert<'a> {
     pub submit_state: &'a str,
 }
 
+pub struct OrderGatewayCancelAttemptInsert<'a> {
+    pub local_id: Option<&'a str>,
+    pub exch_id: Option<&'a str>,
+    pub scope: &'a str,
+    pub rest_request_json: &'a str,
+    pub rest_response_json: Option<&'a str>,
+    pub rest_status_code: Option<i64>,
+    pub cancel_state: &'a str,
+    pub error_code: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOrderGatewaySubmission {
     pub local_id: String,
@@ -447,6 +458,11 @@ impl OrderStore {
                     error_message TEXT,
                     raw_json TEXT NOT NULL,
                     recovery INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS seq_allocator (
+                    namespace TEXT PRIMARY KEY,
+                    next_seq INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS order_gateway_submissions (
@@ -1073,6 +1089,35 @@ impl OrderStore {
         })
     }
 
+    pub fn insert_order_gateway_cancel_attempt(
+        &self,
+        attempt: &OrderGatewayCancelAttemptInsert<'_>,
+    ) -> anyhow::Result<()> {
+        let now = now_ms()?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "
+                INSERT INTO order_gateway_cancel_attempts (
+                    local_id, exch_id, scope, rest_request_json, rest_response_json,
+                    rest_status_code, cancel_state, error_code, created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    attempt.local_id,
+                    attempt.exch_id,
+                    attempt.scope,
+                    attempt.rest_request_json,
+                    attempt.rest_response_json,
+                    attempt.rest_status_code,
+                    attempt.cancel_state,
+                    attempt.error_code,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn append_position_journal(&self, event: &PositionJournalInsert<'_>) -> anyhow::Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -1322,6 +1367,76 @@ impl OrderStore {
                 |row| row.get::<_, i64>(0),
             )?;
             Ok(seq as u64)
+        })
+    }
+
+    pub fn load_max_gateway_seq(&self) -> anyhow::Result<u64> {
+        self.with_conn(|conn| {
+            let seq = conn.query_row(
+                "
+                SELECT MAX(seq) FROM (
+                    SELECT COALESCE(MAX(seq), 0) AS seq FROM order_gateway_events
+                    UNION ALL
+                    SELECT COALESCE(MAX(seq), 0) AS seq FROM position_journal
+                    UNION ALL
+                    SELECT COALESCE(MAX(last_event_seq), 0) AS seq FROM order_gateway_orders
+                )
+                ",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(seq as u64)
+        })
+    }
+
+    pub fn allocate_gateway_seq(&self) -> anyhow::Result<u64> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> anyhow::Result<u64> {
+                let current_next_seq = conn
+                    .query_row(
+                        "SELECT next_seq FROM seq_allocator WHERE namespace = ?1",
+                        params!["gateway"],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                let max_seq = conn.query_row(
+                    "
+                    SELECT MAX(seq) FROM (
+                        SELECT COALESCE(MAX(seq), 0) AS seq FROM order_gateway_events
+                        UNION ALL
+                        SELECT COALESCE(MAX(seq), 0) AS seq FROM position_journal
+                        UNION ALL
+                        SELECT COALESCE(MAX(last_event_seq), 0) AS seq FROM order_gateway_orders
+                    )
+                    ",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let allocated_seq = current_next_seq
+                    .map(|value| value as u64)
+                    .unwrap_or(1)
+                    .max(max_seq as u64 + 1);
+                conn.execute(
+                    "
+                    INSERT INTO seq_allocator (namespace, next_seq)
+                    VALUES (?1, ?2)
+                    ON CONFLICT(namespace) DO UPDATE SET next_seq = excluded.next_seq
+                    ",
+                    params!["gateway", (allocated_seq + 1) as i64],
+                )?;
+                Ok(allocated_seq)
+            })();
+            match result {
+                Ok(seq) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(seq)
+                }
+                Err(error) => {
+                    conn.execute_batch("ROLLBACK")?;
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -2475,6 +2590,18 @@ mod tests {
                 submit_state: "Submitted",
             })
             .expect("submission should persist");
+        store
+            .insert_order_gateway_cancel_attempt(&OrderGatewayCancelAttemptInsert {
+                local_id: Some("local-1"),
+                exch_id: Some("exch-1"),
+                scope: "local_order_id",
+                rest_request_json: "[\"exch-1\"]",
+                rest_response_json: Some("{\"canceled\":[\"exch-1\"]}"),
+                rest_status_code: Some(200),
+                cancel_state: "Cancelled",
+                error_code: None,
+            })
+            .expect("cancel attempt should persist");
 
         let active = store
             .load_order_gateway_recoverable_orders()
@@ -2525,6 +2652,97 @@ mod tests {
                 .load_max_order_gateway_event_seq()
                 .expect("max seq should load"),
             33
+        );
+    }
+
+    #[test]
+    fn load_max_gateway_seq_includes_position_journal_seq() {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        store
+            .append_order_gateway_event(&OrderGatewayEventInsert {
+                seq: 46,
+                strategy_id: "market_maker",
+                token_id: "token-1",
+                market_id: Some("market-1"),
+                local_id: Some("local-1"),
+                exch_id: Some("exch-1"),
+                event_kind: "Open",
+                local_state: "Open",
+                remote_status_code: Some("open"),
+                remote_reject_code: None,
+                remote_reject_reason: None,
+                fill_delta: None,
+                fill_total: Some("0"),
+                remaining_size: Some("10"),
+                avg_fill_price: None,
+                error_code: None,
+                error_message: None,
+                raw_json: "{}",
+                recovery: false,
+            })
+            .expect("gateway event should persist");
+        store
+            .append_position_journal(&PositionJournalInsert {
+                seq: 49,
+                ts_ms: 1000,
+                event_type: "OrderWorkingRegistered",
+                strategy_id: Some("market_maker"),
+                token_id: "token-1",
+                local_order_id: Some("local-1"),
+                exchange_order_id: Some("exch-1"),
+                side: Some("Buy"),
+                qty: Some("10"),
+                price: Some("0.57"),
+                source: "Live",
+                recovery: false,
+                payload_json: "{}",
+            })
+            .expect("position journal should persist");
+
+        assert_eq!(
+            store
+                .load_max_gateway_seq()
+                .expect("max shared seq should load"),
+            49
+        );
+    }
+
+    #[test]
+    fn allocate_gateway_seq_initializes_from_persisted_shared_seq() {
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+
+        store
+            .append_position_journal(&PositionJournalInsert {
+                seq: 49,
+                ts_ms: 1000,
+                event_type: "OrderWorkingRegistered",
+                strategy_id: Some("market_maker"),
+                token_id: "token-1",
+                local_order_id: Some("local-1"),
+                exchange_order_id: Some("exch-1"),
+                side: Some("Buy"),
+                qty: Some("10"),
+                price: Some("0.57"),
+                source: "Live",
+                recovery: false,
+                payload_json: "{}",
+            })
+            .expect("position journal should persist");
+
+        assert_eq!(
+            store
+                .allocate_gateway_seq()
+                .expect("gateway seq should allocate"),
+            50
+        );
+        assert_eq!(
+            store
+                .allocate_gateway_seq()
+                .expect("next gateway seq should allocate"),
+            51
         );
     }
 

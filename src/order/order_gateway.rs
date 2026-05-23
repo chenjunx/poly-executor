@@ -1,13 +1,21 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use polymarket_client_sdk_v2::types::Decimal;
+use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
+use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType, Side as ClobSide};
+use polymarket_client_sdk_v2::types::{Decimal, U256};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::config::AuthConfig;
-use crate::storage::{OrderGatewayEventInsert, OrderGatewayOrderSnapshot, OrderStore};
+use crate::storage::{
+    OrderGatewayCancelAttemptInsert, OrderGatewayEventInsert, OrderGatewayOrderSnapshot,
+    OrderGatewaySubmissionInsert, OrderStore,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StrategyId(pub Arc<str>);
@@ -654,7 +662,7 @@ impl GatewayState {
             .collect()
     }
 
-    fn cancel_targets(&self, request: &CancelOrderRequest) -> Vec<LocalOrderId> {
+    fn cancel_targets(&self, request: &CancelOrderRequest) -> Vec<OrderCancelTarget> {
         self.orders
             .values()
             .filter(|record| {
@@ -666,7 +674,12 @@ impl GatewayState {
                 CancelScope::Market { market_id } => record.market_id == *market_id,
                 CancelScope::AllForStrategy => true,
             })
-            .map(|record| record.local_id.clone())
+            .filter_map(|record| {
+                record.exch_id.clone().map(|exch_id| OrderCancelTarget {
+                    local_id: record.local_id.clone(),
+                    exch_id,
+                })
+            })
             .collect()
     }
 
@@ -1080,6 +1093,257 @@ impl GatewayState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderSubmitResult {
+    pub exch_id: Option<ExchangeOrderId>,
+    pub remote_status_code: Option<Arc<str>>,
+    pub unsigned_payload_json: String,
+    pub signed_payload_json: String,
+    pub signature: String,
+    pub signer_address: String,
+    pub nonce_or_salt: Option<String>,
+    pub expiration: Option<i64>,
+    pub exchange_payload_hash: String,
+    pub rest_request_json: String,
+    pub rest_response_json: Option<String>,
+    pub rest_status_code: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCancelTarget {
+    pub local_id: LocalOrderId,
+    pub exch_id: ExchangeOrderId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCancelRejected {
+    pub exch_id: ExchangeOrderId,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCancelResult {
+    pub local_ids: Vec<LocalOrderId>,
+    pub not_canceled: Vec<OrderCancelRejected>,
+    pub rest_request_json: String,
+    pub rest_response_json: Option<String>,
+    pub rest_status_code: Option<i64>,
+}
+
+pub trait OrderSubmitter: Send + Sync {
+    fn submit<'a>(
+        &'a self,
+        request: &'a PlaceOrderRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderSubmitResult>> + Send + 'a>>;
+}
+
+pub trait OrderCancelSubmitter: Send + Sync {
+    fn cancel<'a>(
+        &'a self,
+        targets: &'a [OrderCancelTarget],
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>>;
+}
+
+pub struct ClobOrderSubmitter {
+    auth: AuthConfig,
+}
+
+impl ClobOrderSubmitter {
+    pub fn new(auth: AuthConfig) -> Self {
+        Self { auth }
+    }
+}
+
+impl OrderSubmitter for ClobOrderSubmitter {
+    fn submit<'a>(
+        &'a self,
+        request: &'a PlaceOrderRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderSubmitResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let signer =
+                LocalSigner::from_str(&self.auth.private_key)?.with_chain_id(Some(POLYGON));
+            let client = crate::clob_client::build_authenticated_clob_client(&self.auth).await?;
+            let token_id = U256::from_str(request.token_id.as_str())?;
+            let price = request
+                .price
+                .ok_or_else(|| anyhow::anyhow!("limit order price is required"))?;
+            let order_type = clob_order_type(&request.order_type);
+            let order_type_label = order_type.to_string();
+            let signable = client
+                .limit_order()
+                .token_id(token_id)
+                .side(clob_order_side(request.side))
+                .price(price)
+                .size(request.size)
+                .order_type(order_type)
+                .build()
+                .await?;
+            let unsigned_payload_json = serde_json::json!({
+                "payload_debug": format!("{:?}", signable.payload),
+                "order_type": order_type_label,
+            })
+            .to_string();
+            let signed = client.sign(&signer, signable).await?;
+            let signed_payload_json = serde_json::json!({
+                "payload_debug": format!("{:?}", signed.payload),
+                "signature": signed.signature.to_string(),
+                "order_type": signed.order_type.to_string(),
+                "owner": signed.owner.to_string(),
+                "post_only": signed.post_only,
+                "defer_exec": signed.defer_exec,
+            })
+            .to_string();
+            let signature = signed.signature.to_string();
+            let signer_address = signer.address().to_string();
+            let exchange_payload_hash = format!("{:?}", signed.payload);
+            let rest_request_json = signed_payload_json.clone();
+            let response = client.post_order(signed).await?;
+            let rest_response_json = serde_json::json!({
+                "error_msg": response.error_msg,
+                "making_amount": response.making_amount.to_string(),
+                "taking_amount": response.taking_amount.to_string(),
+                "orderID": response.order_id,
+                "status": order_status_label(&response.status),
+                "success": response.success,
+                "transaction_hashes": response.transaction_hashes.iter().map(|value| value.to_string()).collect::<Vec<_>>(),
+                "trade_ids": response.trade_ids,
+            })
+            .to_string();
+            if !response.success {
+                return Err(anyhow::anyhow!(
+                    "order rejected by CLOB: {}",
+                    response
+                        .error_msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ));
+            }
+            Ok(OrderSubmitResult {
+                exch_id: Some(ExchangeOrderId::from(response.order_id)),
+                remote_status_code: Some(Arc::from(order_status_label(&response.status))),
+                unsigned_payload_json,
+                signed_payload_json,
+                signature,
+                signer_address,
+                nonce_or_salt: None,
+                expiration: None,
+                exchange_payload_hash,
+                rest_request_json,
+                rest_response_json: Some(rest_response_json),
+                rest_status_code: Some(200),
+            })
+        })
+    }
+}
+
+pub struct ClobOrderCancelSubmitter {
+    auth: AuthConfig,
+}
+
+impl ClobOrderCancelSubmitter {
+    pub fn new(auth: AuthConfig) -> Self {
+        Self { auth }
+    }
+}
+
+impl OrderCancelSubmitter for ClobOrderCancelSubmitter {
+    fn cancel<'a>(
+        &'a self,
+        targets: &'a [OrderCancelTarget],
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let client = crate::clob_client::build_authenticated_clob_client(&self.auth).await?;
+            let order_ids = targets
+                .iter()
+                .map(|target| target.exch_id.as_str())
+                .collect::<Vec<_>>();
+            let rest_request_json = serde_json::to_string(&order_ids)?;
+            let response = client.cancel_orders(&order_ids).await?;
+            let canceled = response.canceled;
+            let not_canceled = response.not_canceled;
+            let rest_response_json = serde_json::json!({
+                "canceled": canceled,
+                "not_canceled": not_canceled,
+            })
+            .to_string();
+            Ok(OrderCancelResult {
+                local_ids: targets
+                    .iter()
+                    .filter(|target| {
+                        canceled
+                            .iter()
+                            .any(|exch_id| exch_id == target.exch_id.as_str())
+                    })
+                    .map(|target| target.local_id.clone())
+                    .collect(),
+                not_canceled: not_canceled
+                    .into_iter()
+                    .map(|(exch_id, reason)| OrderCancelRejected {
+                        exch_id: ExchangeOrderId::from(exch_id),
+                        reason,
+                    })
+                    .collect(),
+                rest_request_json,
+                rest_response_json: Some(rest_response_json),
+                rest_status_code: Some(200),
+            })
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SimulatedOrderSubmitter;
+
+impl OrderSubmitter for SimulatedOrderSubmitter {
+    fn submit<'a>(
+        &'a self,
+        request: &'a PlaceOrderRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderSubmitResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let exch_id = ExchangeOrderId::from(format!("sim-{}", request.token_id.as_str()));
+            Ok(OrderSubmitResult {
+                exch_id: Some(exch_id.clone()),
+                remote_status_code: Some(Arc::from("open")),
+                unsigned_payload_json: "{}".to_string(),
+                signed_payload_json: "{}".to_string(),
+                signature: "simulated".to_string(),
+                signer_address: "simulated".to_string(),
+                nonce_or_salt: None,
+                expiration: None,
+                exchange_payload_hash: format!("sim-{}", request.local_id.as_str()),
+                rest_request_json: "{}".to_string(),
+                rest_response_json: Some(format!(
+                    "{{\"orderID\":\"{}\",\"status\":\"open\"}}",
+                    exch_id.as_str()
+                )),
+                rest_status_code: Some(200),
+            })
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SimulatedOrderCancelSubmitter;
+
+impl OrderCancelSubmitter for SimulatedOrderCancelSubmitter {
+    fn cancel<'a>(
+        &'a self,
+        targets: &'a [OrderCancelTarget],
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(OrderCancelResult {
+                local_ids: targets
+                    .iter()
+                    .map(|target| target.local_id.clone())
+                    .collect(),
+                not_canceled: Vec::new(),
+                rest_request_json: "{}".to_string(),
+                rest_response_json: Some("{\"simulated\":true}".to_string()),
+                rest_status_code: Some(200),
+            })
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderGatewayConfig {
     pub simulation_enabled: bool,
@@ -1117,6 +1381,8 @@ pub struct OrderGateway {
     handle: OrderGatewayHandle,
     state: GatewayState,
     risk: Arc<dyn OrderRiskCheck>,
+    submitter: Arc<dyn OrderSubmitter>,
+    cancel_submitter: Arc<dyn OrderCancelSubmitter>,
     config: OrderGatewayConfig,
     order_store: Option<OrderStore>,
     pending_settlement_tx: tokio::sync::watch::Sender<Vec<SettlementKey>>,
@@ -1133,7 +1399,48 @@ impl OrderGateway {
         OrderEventRing,
         mpsc::Sender<GatewayObservation>,
     ) {
-        Self::new_for_test_inner(config, risk, Some(order_store))
+        Self::new_with_submitters(
+            config,
+            risk,
+            order_store,
+            Arc::new(SimulatedOrderSubmitter),
+            Arc::new(SimulatedOrderCancelSubmitter),
+        )
+    }
+
+    pub fn new_with_submitter(
+        config: OrderGatewayConfig,
+        risk: Arc<dyn OrderRiskCheck>,
+        order_store: OrderStore,
+        submitter: Arc<dyn OrderSubmitter>,
+    ) -> (
+        Self,
+        OrderGatewayHandle,
+        OrderEventRing,
+        mpsc::Sender<GatewayObservation>,
+    ) {
+        Self::new_with_submitters(
+            config,
+            risk,
+            order_store,
+            submitter,
+            Arc::new(SimulatedOrderCancelSubmitter),
+        )
+    }
+
+    pub fn new_with_submitters(
+        config: OrderGatewayConfig,
+        risk: Arc<dyn OrderRiskCheck>,
+        order_store: OrderStore,
+        submitter: Arc<dyn OrderSubmitter>,
+        cancel_submitter: Arc<dyn OrderCancelSubmitter>,
+    ) -> (
+        Self,
+        OrderGatewayHandle,
+        OrderEventRing,
+        mpsc::Sender<GatewayObservation>,
+    ) {
+        Self::new_for_test_inner(config, risk, Some(order_store), submitter, cancel_submitter)
     }
 
     pub fn new_for_test(
@@ -1145,7 +1452,13 @@ impl OrderGateway {
         OrderEventRing,
         mpsc::Sender<GatewayObservation>,
     ) {
-        Self::new_for_test_inner(config, risk, None)
+        Self::new_for_test_inner(
+            config,
+            risk,
+            None,
+            Arc::new(SimulatedOrderSubmitter),
+            Arc::new(SimulatedOrderCancelSubmitter),
+        )
     }
 
     pub fn new_for_test_with_store(
@@ -1158,13 +1471,56 @@ impl OrderGateway {
         OrderEventRing,
         mpsc::Sender<GatewayObservation>,
     ) {
-        Self::new_for_test_inner(config, risk, Some(order_store))
+        Self::new_for_test_inner(
+            config,
+            risk,
+            Some(order_store),
+            Arc::new(SimulatedOrderSubmitter),
+            Arc::new(SimulatedOrderCancelSubmitter),
+        )
+    }
+
+    pub fn new_for_test_with_store_and_submitter(
+        config: OrderGatewayConfig,
+        risk: Arc<dyn OrderRiskCheck>,
+        order_store: OrderStore,
+        submitter: Arc<dyn OrderSubmitter>,
+    ) -> (
+        Self,
+        OrderGatewayHandle,
+        OrderEventRing,
+        mpsc::Sender<GatewayObservation>,
+    ) {
+        Self::new_for_test_inner(
+            config,
+            risk,
+            Some(order_store),
+            submitter,
+            Arc::new(SimulatedOrderCancelSubmitter),
+        )
+    }
+
+    pub fn new_for_test_with_store_and_submitters(
+        config: OrderGatewayConfig,
+        risk: Arc<dyn OrderRiskCheck>,
+        order_store: OrderStore,
+        submitter: Arc<dyn OrderSubmitter>,
+        cancel_submitter: Arc<dyn OrderCancelSubmitter>,
+    ) -> (
+        Self,
+        OrderGatewayHandle,
+        OrderEventRing,
+        mpsc::Sender<GatewayObservation>,
+    ) {
+        Self::new_for_test_inner(config, risk, Some(order_store), submitter, cancel_submitter)
     }
 
     fn new_for_test_inner(
         config: OrderGatewayConfig,
         risk: Arc<dyn OrderRiskCheck>,
         order_store: Option<OrderStore>,
+        submitter: Arc<dyn OrderSubmitter>,
+        cancel_submitter: Arc<dyn OrderCancelSubmitter>,
     ) -> (
         Self,
         OrderGatewayHandle,
@@ -1186,6 +1542,8 @@ impl OrderGateway {
             handle: handle.clone(),
             state: GatewayState::default(),
             risk,
+            submitter,
+            cancel_submitter,
             config,
             order_store,
             pending_settlement_tx,
@@ -1220,13 +1578,11 @@ impl OrderGateway {
             .order_store
             .clone()
             .ok_or_else(|| anyhow::anyhow!("order store is required for gateway recovery"))?;
-        self.state.next_seq = self.state.next_seq.max(store.load_max_order_gateway_event_seq()?);
         let snapshots = store.load_order_gateway_recoverable_orders()?;
         let mut recovered_order_count = 0;
         let mut failed_unrecoverable_count = 0;
 
         for snapshot in snapshots {
-            self.state.next_seq = self.state.next_seq.max(snapshot.last_event_seq);
             let missing_signed_payload = snapshot.exch_id.is_none()
                 && store
                     .load_latest_order_gateway_submission(&snapshot.local_id)?
@@ -1380,32 +1736,9 @@ impl OrderGateway {
         match self.risk.check_place(&request, &self.state) {
             RiskDecision::Allow => {
                 self.state.record_submitted(request.clone());
-                if self.config.simulation_enabled {
-                    let exch_id =
-                        ExchangeOrderId::from(format!("sim-{}", request.token_id.as_str()));
-                    let token_id = request.token_id;
-                    let market_id = request.market_id.unwrap_or_else(|| MarketId::from(""));
-                    for event in self
-                        .state
-                        .apply_observation(GatewayObservation::RestAccepted {
-                            local_id: request.local_id,
-                            exch_id: Some(exch_id.clone()),
-                            ts_ns: self.state.next_seq + 1,
-                            recovery: false,
-                        })
-                    {
-                        self.publish_and_persist(event);
-                    }
-                    for event in self.state.apply_observation(GatewayObservation::WsOpen {
-                        exch_id,
-                        token_id,
-                        market_id,
-                        remote_status_code: Some(Arc::from("open")),
-                        ts_ns: self.state.next_seq + 1,
-                        recovery: false,
-                    }) {
-                        self.publish_and_persist(event);
-                    }
+                match self.submitter.submit(&request).await {
+                    Ok(result) => self.handle_submit_result(request, result),
+                    Err(error) => self.publish_submit_failed(request, error),
                 }
             }
             RiskDecision::Reject { code, reason } => self.publish_local_rejected(
@@ -1416,6 +1749,60 @@ impl OrderGateway {
                 LocalRejectReason::RiskRejected { code, reason },
             ),
         }
+    }
+
+    fn handle_submit_result(&mut self, request: PlaceOrderRequest, result: OrderSubmitResult) {
+        if let Some(store) = &self.order_store {
+            if let Err(error) = persist_order_submission(store, &request, &result) {
+                tracing::warn!(target: "order", error = %error, local_id = request.local_id.as_str(), "order submission 持久化失败");
+            }
+        }
+
+        let exch_id = result.exch_id.clone();
+        for event in self
+            .state
+            .apply_observation(GatewayObservation::RestAccepted {
+                local_id: request.local_id.clone(),
+                exch_id: exch_id.clone(),
+                ts_ns: self.state.next_seq + 1,
+                recovery: false,
+            })
+        {
+            self.publish_and_persist(event);
+        }
+
+        if self.config.simulation_enabled {
+            if let Some(exch_id) = exch_id {
+                let token_id = request.token_id;
+                let market_id = request.market_id.unwrap_or_else(|| MarketId::from(""));
+                for event in self.state.apply_observation(GatewayObservation::WsOpen {
+                    exch_id,
+                    token_id,
+                    market_id,
+                    remote_status_code: result.remote_status_code,
+                    ts_ns: self.state.next_seq + 1,
+                    recovery: false,
+                }) {
+                    self.publish_and_persist(event);
+                }
+            }
+        }
+    }
+
+    fn publish_submit_failed(&mut self, request: PlaceOrderRequest, error: anyhow::Error) {
+        let event = self.strategy_event(
+            request.strategy_id,
+            request.local_id,
+            request.token_id,
+            request.market_id.unwrap_or_else(|| MarketId::from("")),
+            OrderEventKind::Failed,
+            OrderEventPayload::Failed {
+                kind: FailureKind::Transport {
+                    message: Arc::from(error.to_string()),
+                },
+            },
+        );
+        self.publish_and_persist(event);
     }
 
     async fn handle_cancel_request(&mut self, request: CancelOrderRequest) {
@@ -1435,19 +1822,108 @@ impl OrderGateway {
             return;
         }
 
-        for local_id in self.state.cancel_targets(&request) {
-            for event in self
-                .state
-                .apply_observation(GatewayObservation::RestCancelAccepted {
-                    local_id,
-                    reason: CancelReason::Requested,
-                    ts_ns: self.state.next_seq + 1,
-                    recovery: false,
-                })
-            {
-                self.publish_and_persist(event);
+        let targets = self.state.cancel_targets(&request);
+        if targets.is_empty() {
+            return;
+        }
+
+        match self.cancel_submitter.cancel(&targets).await {
+            Ok(result) => {
+                self.persist_cancel_attempts(&targets, &request.scope, &result, "Cancelled", None);
+                for rejected in &result.not_canceled {
+                    tracing::warn!(
+                        target: "order",
+                        exch_id = rejected.exch_id.as_str(),
+                        reason = rejected.reason,
+                        "order cancel 未被交易所接受，保留本地活跃状态"
+                    );
+                }
+                for local_id in result.local_ids {
+                    for event in
+                        self.state
+                            .apply_observation(GatewayObservation::RestCancelAccepted {
+                                local_id,
+                                reason: CancelReason::Requested,
+                                ts_ns: self.state.next_seq + 1,
+                                recovery: false,
+                            })
+                    {
+                        self.publish_and_persist(event);
+                    }
+                }
+            }
+            Err(error) => {
+                self.persist_failed_cancel_attempts(&targets, &request.scope, &error);
+                tracing::warn!(target: "order", error = %error, "order cancel 提交失败，保留本地活跃状态");
             }
         }
+    }
+
+    fn persist_cancel_attempts(
+        &self,
+        targets: &[OrderCancelTarget],
+        scope: &CancelScope,
+        result: &OrderCancelResult,
+        cancel_state: &str,
+        error_code: Option<&str>,
+    ) {
+        let Some(store) = &self.order_store else {
+            return;
+        };
+        let scope = cancel_scope_label(scope);
+        for target in targets {
+            let state = if result
+                .local_ids
+                .iter()
+                .any(|local_id| local_id == &target.local_id)
+            {
+                cancel_state
+            } else {
+                "Rejected"
+            };
+            if let Err(error) =
+                store.insert_order_gateway_cancel_attempt(&OrderGatewayCancelAttemptInsert {
+                    local_id: Some(target.local_id.as_str()),
+                    exch_id: Some(target.exch_id.as_str()),
+                    scope,
+                    rest_request_json: &result.rest_request_json,
+                    rest_response_json: result.rest_response_json.as_deref(),
+                    rest_status_code: result.rest_status_code,
+                    cancel_state: state,
+                    error_code,
+                })
+            {
+                tracing::warn!(target: "order", error = %error, local_id = target.local_id.as_str(), "order cancel attempt 持久化失败");
+            }
+        }
+    }
+
+    fn persist_failed_cancel_attempts(
+        &self,
+        targets: &[OrderCancelTarget],
+        scope: &CancelScope,
+        error: &anyhow::Error,
+    ) {
+        let result = OrderCancelResult {
+            local_ids: Vec::new(),
+            not_canceled: targets
+                .iter()
+                .map(|target| OrderCancelRejected {
+                    exch_id: target.exch_id.clone(),
+                    reason: error.to_string(),
+                })
+                .collect(),
+            rest_request_json: serde_json::json!(
+                targets
+                    .iter()
+                    .map(|target| target.exch_id.as_str())
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            rest_response_json: Some(serde_json::json!({ "error": error.to_string() }).to_string()),
+            rest_status_code: None,
+        };
+        self.persist_cancel_attempts(targets, scope, &result, "Failed", Some("cancel_failed"));
     }
 
     fn publish_local_rejected(
@@ -1469,8 +1945,18 @@ impl OrderGateway {
         self.publish_and_persist(event);
     }
 
-    fn publish_and_persist(&mut self, event: OrderEventEnvelope) {
+    fn publish_and_persist(&mut self, mut event: OrderEventEnvelope) {
         if let Some(store) = &self.order_store {
+            match store.allocate_gateway_seq() {
+                Ok(seq) => {
+                    self.state.next_seq = self.state.next_seq.max(seq);
+                    event.seq = seq;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "order", error = %error, "gateway seq 分配失败，跳过事件发布");
+                    return;
+                }
+            }
             let _ = persist_gateway_event(store, &self.state, &event);
         }
         let _ = self.event_ring.publish(event);
@@ -1607,6 +2093,38 @@ impl OrderEventSubscriber {
     }
 }
 
+fn persist_order_submission(
+    store: &OrderStore,
+    request: &PlaceOrderRequest,
+    result: &OrderSubmitResult,
+) -> anyhow::Result<()> {
+    let price = request.price.map(|value| value.to_string());
+    let size = request.size.to_string();
+    let order_type = gateway_order_type_label(&request.order_type).to_string();
+    store.insert_order_gateway_submission(&OrderGatewaySubmissionInsert {
+        local_id: request.local_id.as_str(),
+        submit_attempt: 1,
+        strategy_id: request.strategy_id.as_str(),
+        token_id: request.token_id.as_str(),
+        side: order_side_label(request.side),
+        order_type: &order_type,
+        price: price.as_deref(),
+        size: &size,
+        exch_id: result.exch_id.as_ref().map(|value| value.as_str()),
+        unsigned_payload_json: &result.unsigned_payload_json,
+        signed_payload_json: &result.signed_payload_json,
+        signature: &result.signature,
+        signer_address: &result.signer_address,
+        nonce_or_salt: result.nonce_or_salt.as_deref(),
+        expiration: result.expiration,
+        exchange_payload_hash: &result.exchange_payload_hash,
+        rest_request_json: &result.rest_request_json,
+        rest_response_json: result.rest_response_json.as_deref(),
+        rest_status_code: result.rest_status_code,
+        submit_state: "Submitted",
+    })
+}
+
 pub fn persist_gateway_event(
     store: &OrderStore,
     state: &GatewayState,
@@ -1672,6 +2190,51 @@ fn terminal_state(state: LocalOrderState) -> bool {
             | LocalOrderState::Failed
             | LocalOrderState::UnknownTerminal
     )
+}
+
+fn order_side_label(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "Buy",
+        OrderSide::Sell => "Sell",
+    }
+}
+
+fn cancel_scope_label(scope: &CancelScope) -> &'static str {
+    match scope {
+        CancelScope::LocalOrderId { .. } => "local_order_id",
+        CancelScope::Token { .. } => "token",
+        CancelScope::Market { .. } => "market",
+        CancelScope::AllForStrategy => "all_for_strategy",
+    }
+}
+
+fn clob_order_side(side: OrderSide) -> ClobSide {
+    match side {
+        OrderSide::Buy => ClobSide::Buy,
+        OrderSide::Sell => ClobSide::Sell,
+    }
+}
+
+fn clob_order_type(order_type: &GatewayOrderType) -> OrderType {
+    match order_type {
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtc,
+        } => OrderType::GTC,
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Gtd { .. },
+        } => OrderType::GTD,
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Ioc,
+        } => OrderType::FAK,
+        GatewayOrderType::Limit {
+            time_in_force: TimeInForce::Fok,
+        }
+        | GatewayOrderType::Market => OrderType::FOK,
+    }
+}
+
+fn order_status_label(status: &OrderStatusType) -> String {
+    status.to_string()
 }
 
 fn order_side_from_label(value: &str) -> Option<OrderSide> {
@@ -1953,6 +2516,7 @@ impl OrderGatewayHandle {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use polymarket_client_sdk_v2::types::Decimal;
 
@@ -2293,6 +2857,34 @@ mod tests {
         assert_eq!(record.remaining_size, dec(6.0));
     }
 
+    #[derive(Default)]
+    struct CountingCancelSubmitter {
+        calls: AtomicUsize,
+        target_count: AtomicUsize,
+    }
+
+    impl OrderCancelSubmitter for CountingCancelSubmitter {
+        fn cancel<'a>(
+            &'a self,
+            targets: &'a [OrderCancelTarget],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.target_count.fetch_add(targets.len(), Ordering::SeqCst);
+                Ok(OrderCancelResult {
+                    local_ids: targets
+                        .iter()
+                        .map(|target| target.local_id.clone())
+                        .collect(),
+                    not_canceled: Vec::new(),
+                    rest_request_json: "{}".to_string(),
+                    rest_response_json: Some("{\"cancelled\":true}".to_string()),
+                    rest_status_code: Some(200),
+                })
+            })
+        }
+    }
+
     struct RejectAllRiskCheck;
 
     impl OrderRiskCheck for RejectAllRiskCheck {
@@ -2396,6 +2988,124 @@ mod tests {
         assert_eq!(active[0].last_event_seq, accepted.seq);
     }
 
+    #[derive(Clone)]
+    struct FakeOrderSubmitter {
+        result: OrderSubmitResult,
+    }
+
+    impl OrderSubmitter for FakeOrderSubmitter {
+        fn submit<'a>(
+            &'a self,
+            _request: &'a PlaceOrderRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<OrderSubmitResult>> + Send + 'a>,
+        > {
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    fn submit_result(exch_id: &str, remote_status_code: &str) -> OrderSubmitResult {
+        OrderSubmitResult {
+            exch_id: Some(ExchangeOrderId::from(exch_id)),
+            remote_status_code: Some(Arc::from(remote_status_code)),
+            unsigned_payload_json: "{\"unsigned\":true}".to_string(),
+            signed_payload_json: "{\"signed\":true}".to_string(),
+            signature: "signature-1".to_string(),
+            signer_address: "0x0000000000000000000000000000000000000000".to_string(),
+            nonce_or_salt: Some("salt-1".to_string()),
+            expiration: None,
+            exchange_payload_hash: "hash-1".to_string(),
+            rest_request_json: "{\"request\":true}".to_string(),
+            rest_response_json: Some(format!(
+                "{{\"orderID\":\"{exch_id}\",\"status\":\"{remote_status_code}\"}}"
+            )),
+            rest_status_code: Some(200),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gateway_uses_submitter_without_simulated_order_id() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store_and_submitter(
+                config,
+                Arc::new(AllowAllRiskCheck),
+                store.clone(),
+                Arc::new(FakeOrderSubmitter {
+                    result: submit_result("real-order-1", "LIVE"),
+                }),
+            );
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("liquidity_reward"));
+
+        handle.set_phase(GatewayPhase::Live);
+        handle
+            .try_send(place_request("live-submit-1"))
+            .expect("send should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let event = subscriber
+            .try_recv_relevant()
+            .expect("accepted event should publish");
+        assert_eq!(event.kind, OrderEventKind::Accepted);
+        assert_eq!(
+            event_exchange_id(&event),
+            Some(&ExchangeOrderId::from("real-order-1"))
+        );
+        assert_ne!(
+            event_exchange_id(&event),
+            Some(&ExchangeOrderId::from("sim-token-1"))
+        );
+        let submission = store
+            .load_latest_order_gateway_submission("live-submit-1")
+            .expect("submission should load")
+            .expect("submission should persist");
+        assert_eq!(submission.submit_state, "Submitted");
+    }
+
+    #[tokio::test]
+    async fn live_gateway_matched_submit_does_not_publish_fill() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store_and_submitter(
+                config,
+                Arc::new(AllowAllRiskCheck),
+                store,
+                Arc::new(FakeOrderSubmitter {
+                    result: submit_result("matched-order-1", "MATCHED"),
+                }),
+            );
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("liquidity_reward"));
+
+        handle.set_phase(GatewayPhase::Live);
+        handle
+            .try_send(place_request("matched-submit-1"))
+            .expect("send should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let accepted = subscriber
+            .try_recv_relevant()
+            .expect("matched submit should publish accepted event");
+        assert_eq!(accepted.kind, OrderEventKind::Accepted);
+        assert_eq!(
+            event_exchange_id(&accepted),
+            Some(&ExchangeOrderId::from("matched-order-1"))
+        );
+        assert!(subscriber.try_recv_relevant().is_err());
+    }
+
     #[tokio::test]
     async fn gateway_runtime_persists_published_acceptance_event() {
         let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
@@ -2423,6 +3133,117 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].local_id, "runtime-persist-1");
         assert_eq!(active[0].local_state, "Open");
+    }
+
+    struct FailingCancelSubmitter;
+
+    impl OrderCancelSubmitter for FailingCancelSubmitter {
+        fn cancel<'a>(
+            &'a self,
+            _targets: &'a [OrderCancelTarget],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>> {
+            Box::pin(async move { Err(anyhow::anyhow!("cancel transport failed")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_cancel_submit_keeps_order_active_locally() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 16,
+        };
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store_and_submitters(
+                config,
+                Arc::new(AllowAllRiskCheck),
+                store,
+                Arc::new(SimulatedOrderSubmitter),
+                Arc::new(FailingCancelSubmitter),
+            );
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("market_maker"));
+        handle.set_phase(GatewayPhase::Live);
+
+        handle
+            .try_send(place_request_for_market(
+                "market_maker",
+                "market-a",
+                "token-yes",
+                "yes-open",
+            ))
+            .expect("place should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+        handle
+            .try_send(OrderRequest::Cancel(CancelOrderRequest {
+                strategy_id: StrategyId::from("market_maker"),
+                scope: CancelScope::Market {
+                    market_id: MarketId::from("market-a"),
+                },
+                reason: Some(Arc::from("replace quote")),
+            }))
+            .expect("cancel should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let record = gateway
+            .state
+            .order(&LocalOrderId::from("yes-open"))
+            .expect("order should still exist");
+        assert_eq!(record.local_state, LocalOrderState::Accepted);
+        assert!(
+            !std::iter::from_fn(|| subscriber.try_recv_relevant().ok())
+                .any(|event| event.kind == OrderEventKind::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_request_calls_cancel_submitter_before_local_cancelled_event() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 16,
+        };
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let cancel_submitter = Arc::new(CountingCancelSubmitter::default());
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store_and_submitters(
+                config,
+                Arc::new(AllowAllRiskCheck),
+                store,
+                Arc::new(SimulatedOrderSubmitter),
+                cancel_submitter.clone(),
+            );
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("market_maker"));
+        handle.set_phase(GatewayPhase::Live);
+
+        handle
+            .try_send(place_request_for_market(
+                "market_maker",
+                "market-a",
+                "token-yes",
+                "yes-open",
+            ))
+            .expect("place should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+        handle
+            .try_send(OrderRequest::Cancel(CancelOrderRequest {
+                strategy_id: StrategyId::from("market_maker"),
+                scope: CancelScope::Market {
+                    market_id: MarketId::from("market-a"),
+                },
+                reason: Some(Arc::from("replace quote")),
+            }))
+            .expect("cancel should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        assert_eq!(cancel_submitter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_submitter.target_count.load(Ordering::SeqCst), 1);
+        assert!(
+            std::iter::from_fn(|| subscriber.try_recv_relevant().ok())
+                .any(|event| event.kind == OrderEventKind::Cancelled)
+        );
     }
 
     #[tokio::test]
@@ -2726,6 +3547,48 @@ mod tests {
         handle
             .try_send(place_request("live-after-startup-recovery"))
             .expect("gateway should be live after startup recovery");
+    }
+
+    #[tokio::test]
+    async fn gateway_recovery_allocates_event_seq_from_shared_allocator() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        store
+            .append_position_journal(&crate::storage::PositionJournalInsert {
+                seq: 49,
+                ts_ms: 1000,
+                event_type: "OrderWorkingRegistered",
+                strategy_id: Some("market_maker"),
+                token_id: "token-1",
+                local_order_id: Some("local-1"),
+                exchange_order_id: Some("exch-1"),
+                side: Some("Buy"),
+                qty: Some("10"),
+                price: Some("0.57"),
+                source: "Live",
+                recovery: false,
+                payload_json: "{}",
+            })
+            .expect("position journal should persist");
+        upsert_recoverable_gateway_order(&store, "recover-open", "exch-recover-open");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, _handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store(config, Arc::new(AllowAllRiskCheck), store);
+        let mut strategy_subscriber =
+            ring.subscribe_for_strategy(StrategyId::from("liquidity_reward"));
+
+        gateway
+            .recover_from_gateway_store()
+            .expect("gateway recovery should run");
+
+        let recovered = strategy_subscriber
+            .try_recv_relevant()
+            .expect("recovered event should publish");
+        assert_eq!(recovered.seq, 50);
     }
 
     #[tokio::test]

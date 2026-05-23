@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use polymarket_client_sdk_v2::types::Decimal;
 
+use crate::notification::{NotificationEvent, Notifier, RiskEventNotification};
 use crate::order_gateway::{
     CancelOrderRequest, CancelScope, GatewayOrderType, LocalOrderId, LocalOrderState, MarketId,
     OrderRecord, OrderRequest, OrderSide, PlaceOrderRequest, StrategyId, TimeInForce, TokenId,
@@ -34,6 +35,7 @@ pub struct MarketMakerStrategy {
     rules: Arc<[MarketMakerRule]>,
     registration: Arc<StrategyRegistration>,
     config: Arc<MarketMakerStrategyConfig>,
+    notifier: Option<Notifier>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -553,6 +555,22 @@ fn enter_cooldown(
     };
     cooldowns.insert(cooldown_key(rule), cooldown.clone());
     cooldown
+}
+
+fn cooldown_risk_notification(
+    rule: &MarketMakerRule,
+    intent: &TargetBuyQuoteIntent,
+    cooldown: &CooldownState,
+) -> NotificationEvent {
+    NotificationEvent::RiskEvent(RiskEventNotification {
+        source: "market_maker_cooldown".to_string(),
+        strategy_id: Some(MARKET_MAKER_NAME.to_string()),
+        local_order_id: None,
+        market_id: (!rule.condition_id.is_empty()).then(|| rule.condition_id.clone()),
+        token_id: Some(intent.token_id.clone()),
+        risk_code: cooldown.code.to_string(),
+        reason: cooldown.reason.clone(),
+    })
 }
 
 fn cooldown_cancel_requests(rule: &MarketMakerRule) -> Vec<CancelOrderRequest> {
@@ -1144,7 +1162,13 @@ impl MarketMakerStrategy {
             rules: Arc::<[MarketMakerRule]>::from(rules),
             registration,
             config: Arc::new(config),
+            notifier: None,
         }))
+    }
+
+    pub fn with_notifier(mut self, notifier: Option<Notifier>) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     pub fn rules(&self) -> &[MarketMakerRule] {
@@ -1169,6 +1193,7 @@ impl Strategy for MarketMakerStrategy {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let config = self.config.clone();
+            let notifier = self.notifier.clone();
             let mut books: HashMap<String, Arc<CleanOrderbook>> = HashMap::new();
             let mut price_history: HashMap<String, VecDeque<(u64, Decimal)>> = HashMap::new();
             let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
@@ -1253,6 +1278,13 @@ impl Strategy for MarketMakerStrategy {
                                     cooldown_ms = cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms),
                                     "market_maker 进入冷静期并撤单"
                                 );
+                                if let Some(notifier) = notifier.as_ref() {
+                                    notifier.try_notify(cooldown_risk_notification(
+                                        risk_ctx.rule,
+                                        risk_ctx.intent,
+                                        &cooldown,
+                                    ));
+                                }
                                 send_cooldown_cancel_requests(&order_gateway, rule);
                                 entered_cooldown = true;
                                 break;
@@ -2209,6 +2241,52 @@ mod tests {
                 reason: "fair midpoint out of safe range".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn cooldown_risk_notification_contains_market_maker_context() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "maker-token-1".to_string(),
+            token2: "maker-token-2".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+        let intent = TargetBuyQuoteIntent {
+            token_id: "maker-token-1".to_string(),
+            quote: TargetQuote {
+                token_side: TargetTokenSide::Yes,
+                level: 1,
+                price: dec(49, 100),
+                size: Decimal::from(100u32),
+                size_usd: Decimal::from(49u32),
+                adjusted_mid: dec(50, 100),
+                distance: dec(1, 100),
+                raw_bid: dec(49, 100),
+            },
+        };
+        let cooldown = CooldownState {
+            until_ms: 1100,
+            code: "price_volatility",
+            reason: "price volatility too high".to_string(),
+            triggered_at_ms: 100,
+        };
+
+        let event = cooldown_risk_notification(&rule, &intent, &cooldown);
+
+        match event {
+            crate::notification::NotificationEvent::RiskEvent(risk) => {
+                assert_eq!(risk.source, "market_maker_cooldown");
+                assert_eq!(risk.strategy_id.as_deref(), Some("market_maker"));
+                assert_eq!(risk.local_order_id, None);
+                assert_eq!(risk.market_id.as_deref(), Some("0xabc"));
+                assert_eq!(risk.token_id.as_deref(), Some("maker-token-1"));
+                assert_eq!(risk.risk_code, "price_volatility");
+                assert_eq!(risk.reason, "price volatility too high");
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
     }
 
     #[test]
