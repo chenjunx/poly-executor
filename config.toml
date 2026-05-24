@@ -56,8 +56,8 @@ volatility_cooldown_ms = 300000
 fair_midpoint_cooldown_ms = 600000
 
 # fair midpoint 安全区间；低于 min 或高于 max 时暂停该市场报价
-fair_midpoint_min = 0.15
-fair_midpoint_max = 0.85
+fair_midpoint_min = 0.1
+fair_midpoint_max = 0.9
 # 市场盘口 spread > max_spread * 该倍数时认为异常
 abnormal_market_spread_multiplier = 2.0
 
