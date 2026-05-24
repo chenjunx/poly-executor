@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use log::{debug, warn};
 use polymarket_client_sdk_v2::clob::types::AssetType;
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::response::BalanceAllowanceResponse;
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{debug, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
 use crate::config::AuthConfig;
@@ -55,7 +55,7 @@ async fn run(auth: AuthConfig, tx: tokio::sync::watch::Sender<Option<AccountFund
     let client = match build_authenticated_clob_client(&auth).await {
         Ok(client) => client,
         Err(error) => {
-            warn!(target: "order", error = %error, "account_monitor 构建 CLOB 客户端失败，账户资金监控退出");
+            warn!(target: "order", "account_monitor 构建 CLOB 客户端失败，账户资金监控退出 error={}", error);
             return;
         }
     };
@@ -63,18 +63,11 @@ async fn run(auth: AuthConfig, tx: tokio::sync::watch::Sender<Option<AccountFund
     loop {
         match fetch_account_fund_snapshot(&client).await {
             Ok(snapshot) => {
-                debug!(
-                    target: "order",
-                    checked_at_ms = snapshot.checked_at_ms,
-                    balance = %snapshot.balance,
-                    balance_raw = %snapshot.balance_raw,
-                    allowances_json = %snapshot.allowances_json,
-                    "account_monitor 账户资金快照同步完成"
-                );
+                debug!(target: "order", "account_monitor 账户资金快照同步完成 checked_at_ms={:?} balance={} balance_raw={} allowances_json={}", snapshot.checked_at_ms, snapshot.balance, snapshot.balance_raw, snapshot.allowances_json);
                 tx.send_replace(Some(snapshot));
             }
             Err(error) => {
-                warn!(target: "order", error = %error, "account_monitor 查询账户资金快照失败");
+                warn!(target: "order", "account_monitor 查询账户资金快照失败 error={}", error);
             }
         }
         tokio::time::sleep(ACCOUNT_MONITOR_POLL_INTERVAL).await;

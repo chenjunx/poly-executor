@@ -58,8 +58,7 @@ RUN_DIR="$REMOTE_DIR/run"
 LOG_DIR="$REMOTE_DIR/logs"
 PID_FILE="$RUN_DIR/poly-executor.pid"
 STDOUT_LOG="$LOG_DIR/stdout.log"
-ALERT_LOG="$REMOTE_DIR/alerts.log"
-ORDER_LOG="$REMOTE_DIR/orders.log"
+APP_LOG="$REMOTE_DIR/poly-executor.log"
 REPO_URL="$1"
 
 mkdir -p "$BIN_DIR" "$RUN_DIR" "$LOG_DIR"
@@ -170,8 +169,7 @@ set -euo pipefail
 REMOTE_DIR="/root/poly-executor"
 RUN_DIR="$REMOTE_DIR/run"
 PID_FILE="$RUN_DIR/poly-executor.pid"
-ALERT_LOG="$REMOTE_DIR/alerts.log"
-ORDER_LOG="$REMOTE_DIR/orders.log"
+APP_LOG="$REMOTE_DIR/poly-executor.log"
 ACTION="${1:-}"
 LINES="${2:-50}"
 
@@ -198,11 +196,8 @@ case "$ACTION" in
   health)
     status
     ;;
-  logs-alerts)
-    tail -n "$LINES" "$ALERT_LOG"
-    ;;
-  logs-orders)
-    tail -n "$LINES" "$ORDER_LOG"
+  logs)
+    tail -n "$LINES" "$APP_LOG"
     ;;
   restart)
     bash "$REMOTE_DIR/bin/restart_poly_executor.sh"
@@ -264,7 +259,7 @@ INNER
 chmod +x "$BIN_DIR/deploy_poly_executor.sh"
 
 cat > /etc/logrotate.d/poly-executor <<'LOGROTATE'
-/root/poly-executor/orders.log /root/poly-executor/alerts.log {
+/root/poly-executor/poly-executor.log {
     size 20M
     rotate 5
     copytruncate

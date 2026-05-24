@@ -4,8 +4,8 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use anyhow::Context;
 use dashmap::DashMap;
+use log::{info, warn};
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{info, warn};
 
 use crate::clob_client::build_authenticated_clob_client;
 use crate::config::AuthConfig;
@@ -40,12 +40,15 @@ pub async fn load_for_tokens(tokens: &[String], auth: &AuthConfig, map: &TickSiz
         return;
     }
     let default_tick = Decimal::try_from(0.01_f64).unwrap_or(Decimal::ONE);
-    info!(token_count = tokens.len(), "正在初始化 tick_size 缓存");
+    info!("正在初始化 tick_size 缓存 token_count={:?}", tokens.len());
 
     let client = match build_authenticated_clob_client(auth).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "tick_size 初始化：CLOB 客户端构建失败，全部使用默认值 0.01");
+            warn!(
+                "tick_size 初始化：CLOB 客户端构建失败，全部使用默认值 0.01 error={}",
+                e
+            );
             for token in tokens {
                 map.entry(token.clone()).or_insert(default_tick);
             }
@@ -75,16 +78,19 @@ pub async fn load_for_tokens(tokens: &[String], auth: &AuthConfig, map: &TickSiz
         match result {
             Ok(resp) => {
                 let tick = Decimal::from(resp.minimum_tick_size);
-                info!(token = %token, tick = %tick, "tick_size 已加载");
+                info!("tick_size 已加载 token={} tick={}", token, tick);
                 map.insert(token.clone(), tick);
                 ok += 1;
             }
             Err(e) => {
-                warn!(token = %token, error = %e, "tick_size 查询失败，使用默认值 0.01");
+                warn!(
+                    "tick_size 查询失败，使用默认值 0.01 token={} error={}",
+                    token, e
+                );
                 map.entry(token.clone()).or_insert(default_tick);
                 failed += 1;
             }
         }
     }
-    info!(ok, failed, "tick_size 缓存初始化完成");
+    info!("tick_size 缓存初始化完成 ok={:?} failed={:?}", ok, failed);
 }

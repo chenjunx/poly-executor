@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use tracing::warn;
+use log::warn;
 
 use crate::order_gateway::OrderGatewayHandle;
 
@@ -97,11 +97,14 @@ pub fn spawn_market_subscription_mux(
                 match topic_rx.recv().await {
                     Ok(event) => {
                         if tx.try_send(event).is_err() {
-                            warn!(topic = %topic, "策略本地行情队列已满，丢弃 topic event");
+                            warn!("策略本地行情队列已满，丢弃 topic event topic={}", topic);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(topic = %topic, skipped, "策略 topic 行情订阅落后，跳过旧事件");
+                        warn!(
+                            "策略 topic 行情订阅落后，跳过旧事件 topic={} skipped={:?}",
+                            topic, skipped
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

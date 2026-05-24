@@ -25,9 +25,8 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 alloy = { version = "1", default-features = false, features = ["contract", "provider-http", "network", "signer-local", "reqwest"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tracing-appender = "0.2"
+log = "0.4"
+log4rs = "1"
 arc-swap = "1"
 
 [profile.release]

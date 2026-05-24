@@ -3,12 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use log::{info, warn};
 use polymarket_client_sdk_v2::types::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
 use url::form_urlencoded;
 
 use crate::config::DingtalkConfig;
@@ -157,7 +157,7 @@ impl Notifier {
 
     pub(crate) fn try_notify(&self, event: NotificationEvent) {
         if let Err(error) = self.tx.try_send(event) {
-            warn!(target: "notification", error = %error, "通知队列已满或已关闭，丢弃通知事件");
+            warn!(target: "notification", "通知队列已满或已关闭，丢弃通知事件 error={}", error);
         }
     }
 }
@@ -169,7 +169,7 @@ async fn run_dingtalk_worker(config: DingtalkConfig, mut rx: mpsc::Receiver<Noti
     {
         Ok(client) => client,
         Err(error) => {
-            warn!(target: "notification", error = %error, "初始化钉钉通知 HTTP client 失败");
+            warn!(target: "notification", "初始化钉钉通知 HTTP client 失败 error={}", error);
             return;
         }
     };
@@ -178,7 +178,7 @@ async fn run_dingtalk_worker(config: DingtalkConfig, mut rx: mpsc::Receiver<Noti
 
     while let Some(event) = rx.recv().await {
         if let Err(error) = send_dingtalk_message(&client, &config, &event).await {
-            warn!(target: "notification", error = %error, "发送钉钉通知失败");
+            warn!(target: "notification", "发送钉钉通知失败 error={}", error);
         }
     }
 }
@@ -211,64 +211,25 @@ async fn send_dingtalk_message(
 
     match event {
         NotificationEvent::LiquidityRewardFill(fill) => {
-            info!(
-                target: "notification",
-                local_order_id = %fill.local_order_id,
-                remote_order_id = %fill.remote_order_id,
-                delta_size = %fill.delta_size,
-                "钉钉 liquidity_reward 成交通知发送成功"
-            );
+            info!(target: "notification", "钉钉 liquidity_reward 成交通知发送成功 local_order_id={} remote_order_id={} delta_size={}", fill.local_order_id, fill.remote_order_id, fill.delta_size);
         }
         NotificationEvent::LiquidityRewardUnwindAction(unwind) => {
-            info!(
-                target: "notification",
-                local_order_id = %unwind.local_order_id,
-                action = %unwind.action,
-                attempts = unwind.attempts,
-                "钉钉 liquidity_reward 市价止损动作通知发送成功"
-            );
+            info!(target: "notification", "钉钉 liquidity_reward 市价止损动作通知发送成功 local_order_id={} action={} attempts={:?}", unwind.local_order_id, unwind.action, unwind.attempts);
         }
         NotificationEvent::LiquidityRewardPoolRemoval(removal) => {
-            info!(
-                target: "notification",
-                condition_id = %removal.condition_id,
-                reason = %removal.reason,
-                "钉钉 liquidity_reward 奖励池剔除通知发送成功"
-            );
+            info!(target: "notification", "钉钉 liquidity_reward 奖励池剔除通知发送成功 condition_id={} reason={}", removal.condition_id, removal.reason);
         }
         NotificationEvent::LiquidityRewardManualAttention(attention) => {
-            info!(
-                target: "notification",
-                token = %attention.token,
-                attempts = attention.attempts,
-                "钉钉 liquidity_reward 人工处理通知发送成功"
-            );
+            info!(target: "notification", "钉钉 liquidity_reward 人工处理通知发送成功 token={} attempts={:?}", attention.token, attention.attempts);
         }
         NotificationEvent::OrderSubmitted(submitted) => {
-            info!(
-                target: "notification",
-                strategy_id = %submitted.strategy_id,
-                local_order_id = %submitted.local_order_id,
-                token_id = %submitted.token_id,
-                "钉钉订单提交通知发送成功"
-            );
+            info!(target: "notification", "钉钉订单提交通知发送成功 strategy_id={} local_order_id={} token_id={}", submitted.strategy_id, submitted.local_order_id, submitted.token_id);
         }
         NotificationEvent::OrderFilled(fill) => {
-            info!(
-                target: "notification",
-                strategy_id = %fill.strategy_id,
-                local_order_id = %fill.local_order_id,
-                fill_qty = %fill.fill_qty,
-                "钉钉订单成交通知发送成功"
-            );
+            info!(target: "notification", "钉钉订单成交通知发送成功 strategy_id={} local_order_id={} fill_qty={}", fill.strategy_id, fill.local_order_id, fill.fill_qty);
         }
         NotificationEvent::RiskEvent(risk) => {
-            info!(
-                target: "notification",
-                source = %risk.source,
-                risk_code = %risk.risk_code,
-                "钉钉风控通知发送成功"
-            );
+            info!(target: "notification", "钉钉风控通知发送成功 source={} risk_code={}", risk.source, risk.risk_code);
         }
     }
     Ok(())

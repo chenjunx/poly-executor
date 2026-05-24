@@ -257,6 +257,7 @@ pub enum CancelReason {
     Requested,
     Expired,
     RemoteCancelled,
+    RemoteCancelledOrMatched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,11 +408,17 @@ pub struct SettlementKey {
 }
 
 pub trait SettlementActivityReader: Send + Sync {
-    fn is_trade_activity_confirmed<'a>(
+    fn confirmed_trade_transactions<'a>(
         &'a self,
-        transaction_hash: &'a str,
-        exch_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
+        pending: &'a [SettlementKey],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<std::collections::HashSet<SettlementKey>>,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
 pub struct DataApiSettlementActivityReader {
@@ -436,14 +443,26 @@ impl DataApiSettlementActivityReader {
 }
 
 impl SettlementActivityReader for DataApiSettlementActivityReader {
-    fn is_trade_activity_confirmed<'a>(
+    fn confirmed_trade_transactions<'a>(
         &'a self,
-        transaction_hash: &'a str,
-        _exch_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
-    {
+        pending: &'a [SettlementKey],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<std::collections::HashSet<SettlementKey>>,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            let target_hash: polymarket_client_sdk_v2::types::B256 = transaction_hash.parse()?;
+            let target_hashes = pending
+                .iter()
+                .map(|key| {
+                    key.transaction_hash
+                        .parse::<polymarket_client_sdk_v2::types::B256>()
+                        .map(|hash| (key, hash))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let request =
                 polymarket_client_sdk_v2::data::types::request::ActivityRequest::builder()
                     .user(self.user)
@@ -453,9 +472,9 @@ impl SettlementActivityReader for DataApiSettlementActivityReader {
                     .limit(500)?
                     .build();
             let activities = self.client.activity(&request).await?;
-            Ok(activity_entries_confirm_trade_transaction(
+            Ok(confirmed_settlement_keys_from_activities(
+                target_hashes,
                 activities.iter(),
-                &target_hash,
             ))
         })
     }
@@ -468,45 +487,69 @@ struct TestDataApiSettlementActivityReader {
 
 #[cfg(test)]
 impl SettlementActivityReader for TestDataApiSettlementActivityReader {
-    fn is_trade_activity_confirmed<'a>(
+    fn confirmed_trade_transactions<'a>(
         &'a self,
-        transaction_hash: &'a str,
-        _exch_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
-    {
+        pending: &'a [SettlementKey],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<std::collections::HashSet<SettlementKey>>,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            let target_hash: polymarket_client_sdk_v2::types::B256 = transaction_hash.parse()?;
-            Ok(activity_entries_confirm_trade_transaction(
+            let target_hashes = pending
+                .iter()
+                .map(|key| {
+                    key.transaction_hash
+                        .parse::<polymarket_client_sdk_v2::types::B256>()
+                        .map(|hash| (key, hash))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(confirmed_settlement_keys_from_activities(
+                target_hashes,
                 self.activities.iter(),
-                &target_hash,
             ))
         })
     }
 }
 
-fn activity_entries_confirm_trade_transaction<'a, I>(
+fn confirmed_settlement_keys_from_activities<'a, I>(
+    target_hashes: Vec<(&'a SettlementKey, polymarket_client_sdk_v2::types::B256)>,
     activities: I,
-    transaction_hash: &polymarket_client_sdk_v2::types::B256,
-) -> bool
+) -> std::collections::HashSet<SettlementKey>
 where
     I: IntoIterator<Item = &'a polymarket_client_sdk_v2::data::types::response::Activity>,
 {
-    activities.into_iter().any(|activity| {
-        activity.transaction_hash == *transaction_hash
-            && activity.activity_type == polymarket_client_sdk_v2::data::types::ActivityType::Trade
-    })
+    let confirmed_hashes = activities
+        .into_iter()
+        .filter(|activity| {
+            activity.activity_type == polymarket_client_sdk_v2::data::types::ActivityType::Trade
+        })
+        .map(|activity| activity.transaction_hash)
+        .collect::<std::collections::HashSet<_>>();
+    target_hashes
+        .into_iter()
+        .filter_map(|(key, hash)| confirmed_hashes.contains(&hash).then(|| key.clone()))
+        .collect()
 }
 
 pub struct NoopSettlementActivityReader;
 
 impl SettlementActivityReader for NoopSettlementActivityReader {
-    fn is_trade_activity_confirmed<'a>(
+    fn confirmed_trade_transactions<'a>(
         &'a self,
-        _transaction_hash: &'a str,
-        _exch_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
-    {
-        Box::pin(async { Ok(false) })
+        _pending: &'a [SettlementKey],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<std::collections::HashSet<SettlementKey>>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(std::collections::HashSet::new()) })
     }
 }
 
@@ -518,11 +561,9 @@ pub async fn poll_settlement_activity_once<R>(
 where
     R: SettlementActivityReader,
 {
+    let confirmed = reader.confirmed_trade_transactions(&pending).await?;
     for key in pending {
-        if reader
-            .is_trade_activity_confirmed(key.transaction_hash.as_ref(), key.exch_id.as_str())
-            .await?
-        {
+        if confirmed.contains(&key) {
             let _ = observation_tx
                 .send(GatewayObservation::SettlementActivityConfirmed {
                     exch_id: key.exch_id,
@@ -1918,7 +1959,7 @@ impl OrderGateway {
     fn handle_submit_result(&mut self, request: PlaceOrderRequest, result: OrderSubmitResult) {
         if let Some(store) = &self.order_store {
             if let Err(error) = persist_order_submission(store, &request, &result) {
-                tracing::warn!(target: "order", error = %error, local_id = request.local_id.as_str(), "order submission 持久化失败");
+                log::warn!(target: "order", "order submission 持久化失败 error={} local_id={:?}", error, request.local_id.as_str());
             }
         }
 
@@ -1995,12 +2036,26 @@ impl OrderGateway {
             Ok(result) => {
                 self.persist_cancel_attempts(&targets, &request.scope, &result, "Cancelled", None);
                 for rejected in &result.not_canceled {
-                    tracing::warn!(
-                        target: "order",
-                        exch_id = rejected.exch_id.as_str(),
-                        reason = rejected.reason,
-                        "order cancel 未被交易所接受，保留本地活跃状态"
-                    );
+                    if remote_order_is_gone_after_cancel(&rejected.reason) {
+                        if let Some(target) = targets
+                            .iter()
+                            .find(|target| target.exch_id == rejected.exch_id)
+                        {
+                            log::warn!(target: "order", "order cancel 发现远端订单已不存在，收敛本地活跃状态 exch_id={:?} reason={:?}", rejected.exch_id.as_str(), rejected.reason);
+                            for event in self.state.apply_observation(
+                                GatewayObservation::RestCancelAccepted {
+                                    local_id: target.local_id.clone(),
+                                    reason: CancelReason::RemoteCancelledOrMatched,
+                                    ts_ns: self.state.next_seq + 1,
+                                    recovery: false,
+                                },
+                            ) {
+                                self.publish_and_persist(event);
+                            }
+                            continue;
+                        }
+                    }
+                    log::warn!(target: "order", "order cancel 未被交易所接受，保留本地活跃状态 exch_id={:?} reason={:?}", rejected.exch_id.as_str(), rejected.reason);
                 }
                 for local_id in result.local_ids {
                     for event in
@@ -2018,7 +2073,7 @@ impl OrderGateway {
             }
             Err(error) => {
                 self.persist_failed_cancel_attempts(&targets, &request.scope, &error);
-                tracing::warn!(target: "order", error = %error, "order cancel 提交失败，保留本地活跃状态");
+                log::warn!(target: "order", "order cancel 提交失败，保留本地活跃状态 error={}", error);
             }
         }
     }
@@ -2057,7 +2112,7 @@ impl OrderGateway {
                     error_code,
                 })
             {
-                tracing::warn!(target: "order", error = %error, local_id = target.local_id.as_str(), "order cancel attempt 持久化失败");
+                log::warn!(target: "order", "order cancel attempt 持久化失败 error={} local_id={:?}", error, target.local_id.as_str());
             }
         }
     }
@@ -2117,7 +2172,7 @@ impl OrderGateway {
                     event.seq = seq;
                 }
                 Err(error) => {
-                    tracing::warn!(target: "order", error = %error, "gateway seq 分配失败，跳过事件发布");
+                    log::warn!(target: "order", "gateway seq 分配失败，跳过事件发布 error={}", error);
                     return;
                 }
             }
@@ -2536,6 +2591,18 @@ fn order_record_from_gateway_snapshot(snapshot: OrderGatewayOrderSnapshot) -> Or
     }
 }
 
+fn settlement_activity_poll_delay(error: Option<&anyhow::Error>) -> Duration {
+    match error {
+        Some(error)
+            if error.to_string().contains("429 Too Many Requests")
+                || error.to_string().contains("error code: 1015") =>
+        {
+            Duration::from_secs(30)
+        }
+        _ => Duration::from_secs(5),
+    }
+}
+
 async fn run_settlement_activity_poller<R>(
     reader: R,
     mut pending_rx: tokio::sync::watch::Receiver<Vec<SettlementKey>>,
@@ -2545,21 +2612,22 @@ async fn run_settlement_activity_poller<R>(
 {
     loop {
         let pending = pending_rx.borrow().clone();
-        if !pending.is_empty() {
-            if let Err(error) =
-                poll_settlement_activity_once(&reader, pending, observation_tx.clone()).await
-            {
-                tracing::warn!(target: "order", error = %error, "settlement activity poll failed");
+        if pending.is_empty() {
+            if pending_rx.changed().await.is_err() {
+                return;
             }
+            continue;
         }
-        tokio::select! {
-            changed = pending_rx.changed() => {
-                if changed.is_err() {
-                    return;
+
+        let delay =
+            match poll_settlement_activity_once(&reader, pending, observation_tx.clone()).await {
+                Ok(()) => settlement_activity_poll_delay(None),
+                Err(error) => {
+                    log::warn!(target: "order", "settlement activity poll failed error={}", error);
+                    settlement_activity_poll_delay(Some(&error))
                 }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-        }
+            };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -2568,6 +2636,10 @@ fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+fn remote_order_is_gone_after_cancel(reason: &str) -> bool {
+    reason.contains("order can't be found - already canceled or matched")
 }
 
 fn local_order_state_from_label(value: &str) -> LocalOrderState {
@@ -2837,17 +2909,59 @@ mod tests {
     }
 
     impl SettlementActivityReader for FakeSettlementActivityReader {
-        fn is_trade_activity_confirmed<'a>(
+        fn confirmed_trade_transactions<'a>(
             &'a self,
-            transaction_hash: &'a str,
-            exch_id: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
-        {
+            pending: &'a [SettlementKey],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<std::collections::HashSet<SettlementKey>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             Box::pin(async move {
-                Ok(self
-                    .confirmed
+                Ok(pending
                     .iter()
-                    .any(|(tx, order)| tx == transaction_hash && order == exch_id))
+                    .filter(|key| {
+                        self.confirmed.iter().any(|(tx, order)| {
+                            tx == key.transaction_hash.as_ref() && order == key.exch_id.as_str()
+                        })
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+    }
+
+    struct CountingSettlementActivityReader {
+        calls: AtomicUsize,
+        confirmed: Vec<(String, String)>,
+    }
+
+    impl SettlementActivityReader for CountingSettlementActivityReader {
+        fn confirmed_trade_transactions<'a>(
+            &'a self,
+            pending: &'a [SettlementKey],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<std::collections::HashSet<SettlementKey>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(pending
+                    .iter()
+                    .filter(|key| {
+                        self.confirmed.iter().any(|(tx, order)| {
+                            tx == key.transaction_hash.as_ref() && order == key.exch_id.as_str()
+                        })
+                    })
+                    .cloned()
+                    .collect())
             })
         }
     }
@@ -2879,14 +2993,21 @@ mod tests {
                 polymarket_client_sdk_v2::data::types::ActivityType::Trade,
             )]);
 
-        assert!(
-            reader
-                .is_trade_activity_confirmed(transaction_hash, "exch-1")
-                .await
-                .expect("reader should check fixture")
-        );
+        let confirmed = reader
+            .confirmed_trade_transactions(&[SettlementKey {
+                transaction_hash: Arc::from(transaction_hash),
+                exch_id: ExchangeOrderId::from("exch-1"),
+            }])
+            .await
+            .expect("reader should check fixture");
+
+        assert!(confirmed.contains(&SettlementKey {
+            transaction_hash: Arc::from(transaction_hash),
+            exch_id: ExchangeOrderId::from("exch-1"),
+        }));
     }
 
+    #[tokio::test]
     async fn settlement_activity_poller_sends_confirmation_for_trade_activity() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let reader = FakeSettlementActivityReader {
@@ -2907,6 +3028,68 @@ mod tests {
             GatewayObservation::SettlementActivityConfirmed { ref transaction_hash, ref exch_id, .. }
                 if transaction_hash.as_ref() == "0xabc" && exch_id.as_str() == "exch-1"
         ));
+    }
+
+    #[tokio::test]
+    async fn settlement_activity_poll_batches_pending_transactions_into_one_reader_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let reader = CountingSettlementActivityReader {
+            calls: AtomicUsize::new(0),
+            confirmed: vec![
+                ("0xabc".to_string(), "exch-1".to_string()),
+                ("0xdef".to_string(), "exch-2".to_string()),
+            ],
+        };
+        let pending = vec![
+            SettlementKey {
+                transaction_hash: Arc::from("0xabc"),
+                exch_id: ExchangeOrderId::from("exch-1"),
+            },
+            SettlementKey {
+                transaction_hash: Arc::from("0xdef"),
+                exch_id: ExchangeOrderId::from("exch-2"),
+            },
+            SettlementKey {
+                transaction_hash: Arc::from("0x999"),
+                exch_id: ExchangeOrderId::from("exch-3"),
+            },
+        ];
+
+        poll_settlement_activity_once(&reader, pending, tx)
+            .await
+            .expect("poll should succeed");
+
+        let mut confirmed = Vec::new();
+        while let Ok(GatewayObservation::SettlementActivityConfirmed {
+            transaction_hash,
+            exch_id,
+            ..
+        }) = rx.try_recv()
+        {
+            confirmed.push((transaction_hash.to_string(), exch_id.as_str().to_string()));
+        }
+        confirmed.sort();
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            confirmed,
+            vec![
+                ("0xabc".to_string(), "exch-1".to_string()),
+                ("0xdef".to_string(), "exch-2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn settlement_activity_rate_limit_error_uses_backoff_delay() {
+        let error = anyhow::anyhow!(
+            "Status: error(429 Too Many Requests) making GET call to /activity with error code: 1015"
+        );
+
+        assert_eq!(
+            settlement_activity_poll_delay(Some(&error)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(settlement_activity_poll_delay(None), Duration::from_secs(5));
     }
 
     #[tokio::test]
@@ -3326,6 +3509,104 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>> {
             Box::pin(async move { Err(anyhow::anyhow!("cancel transport failed")) })
         }
+    }
+
+    #[derive(Default)]
+    struct RemoteNotFoundCancelSubmitter {
+        calls: AtomicUsize,
+    }
+
+    impl OrderCancelSubmitter for RemoteNotFoundCancelSubmitter {
+        fn cancel<'a>(
+            &'a self,
+            targets: &'a [OrderCancelTarget],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(OrderCancelResult {
+                    local_ids: Vec::new(),
+                    not_canceled: targets
+                        .iter()
+                        .map(|target| OrderCancelRejected {
+                            exch_id: target.exch_id.clone(),
+                            reason: "order can't be found - already canceled or matched"
+                                .to_string(),
+                        })
+                        .collect(),
+                    rest_request_json: "{}".to_string(),
+                    rest_response_json: Some("{\"not_canceled\":true}".to_string()),
+                    rest_status_code: Some(200),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_not_found_marks_order_remote_cancelled_locally() {
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 16,
+        };
+        let store = OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        let cancel_submitter = Arc::new(RemoteNotFoundCancelSubmitter::default());
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store_and_submitters(
+                config,
+                Arc::new(AllowAllRiskCheck),
+                store,
+                Arc::new(SimulatedOrderSubmitter),
+                cancel_submitter.clone(),
+            );
+        let mut subscriber = ring.subscribe_for_strategy(StrategyId::from("market_maker"));
+        handle.set_phase(GatewayPhase::Live);
+
+        handle
+            .try_send(place_request_for_market(
+                "market_maker",
+                "market-a",
+                "token-yes",
+                "yes-open",
+            ))
+            .expect("place should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+        handle
+            .try_send(OrderRequest::Cancel(CancelOrderRequest {
+                strategy_id: StrategyId::from("market_maker"),
+                scope: CancelScope::Market {
+                    market_id: MarketId::from("market-a"),
+                },
+                reason: Some(Arc::from("replace quote")),
+            }))
+            .expect("cancel should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+        handle
+            .try_send(OrderRequest::Cancel(CancelOrderRequest {
+                strategy_id: StrategyId::from("market_maker"),
+                scope: CancelScope::Market {
+                    market_id: MarketId::from("market-a"),
+                },
+                reason: Some(Arc::from("replace quote")),
+            }))
+            .expect("second cancel should enter gateway");
+        assert!(gateway.run_one_request_for_test().await);
+
+        let record = gateway
+            .state
+            .order(&LocalOrderId::from("yes-open"))
+            .expect("order should still exist");
+        assert_eq!(record.local_state, LocalOrderState::Cancelled);
+        assert_eq!(cancel_submitter.calls.load(Ordering::SeqCst), 1);
+        let cancelled = std::iter::from_fn(|| subscriber.try_recv_relevant().ok())
+            .find(|event| event.kind == OrderEventKind::Cancelled)
+            .expect("remote gone order should publish cancelled event");
+        assert!(matches!(
+            cancelled.payload,
+            OrderEventPayload::Cancelled {
+                reason: CancelReason::RemoteCancelledOrMatched
+            }
+        ));
     }
 
     #[tokio::test]

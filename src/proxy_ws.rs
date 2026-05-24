@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use futures::{SinkExt as _, StreamExt as _};
+use log::info;
 use polymarket_client_sdk_v2::clob::ws::types::response::WsMessage;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -13,7 +14,6 @@ use tokio::net::TcpStream;
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::info;
 use url::Url;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -54,7 +54,7 @@ impl Proxy {
                     continue;
                 }
                 if let Some(proxy) = Self::parse(&val) {
-                    info!(proxy_env = %var, proxy_value = %val, "使用代理配置");
+                    info!("使用代理配置 proxy_env={} proxy_value={}", var, val);
                     return Some(proxy);
                 }
             }
@@ -140,7 +140,7 @@ pub async fn run(
         let host = url.host_str().context("URL 缺少 host")?;
         let port = url.port().unwrap_or(443);
 
-        info!(host = %host, port, "通过代理建立隧道");
+        info!("通过代理建立隧道 host={} port={:?}", host, port);
         let tcp = proxy.tunnel(host, port).await?;
 
         let (ws, _) = tokio_tungstenite::client_async_tls_with_config(WS_URL, tcp, None, None)

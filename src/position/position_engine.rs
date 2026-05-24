@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use arc_swap::ArcSwapOption;
+use log::warn;
 use polymarket_client_sdk_v2::types::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use crate::order_gateway::{
     OrderEventEnvelope, OrderEventPollError, OrderEventSubscriber, OrderSide,
@@ -299,13 +299,18 @@ pub fn recover_keeper(store: &OrderStore) -> anyhow::Result<PositionKeeper> {
     let events = store
         .load_position_journal_after(snapshot_seq)?
         .into_iter()
-        .filter_map(|row| match serde_json::from_str::<PositionEvent>(&row.payload_json) {
-            Ok(event) => Some(event),
-            Err(error) => {
-                warn!(seq = row.seq, error = %error, "position journal payload 解析失败，跳过该记录");
-                None
-            }
-        })
+        .filter_map(
+            |row| match serde_json::from_str::<PositionEvent>(&row.payload_json) {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    warn!(
+                        "position journal payload 解析失败，跳过该记录 seq={:?} error={}",
+                        row.seq, error
+                    );
+                    None
+                }
+            },
+        )
         .collect::<Vec<_>>();
     keeper.apply_replay_events(events)?;
     Ok(keeper)
@@ -323,14 +328,14 @@ pub async fn run_order_event_bridge(
                 };
                 if let Err(error) = ingest_handle.try_ingest(position_event) {
                     ingest_handle.mark_degraded();
-                    warn!(error = ?error, "position engine 投递订单事件失败");
+                    warn!("position engine 投递订单事件失败 error={:?}", error);
                 }
             }
             Err(OrderEventPollError::Lagged { skipped }) => {
                 ingest_handle.mark_degraded();
                 warn!(
-                    skipped,
-                    "position engine 订单事件订阅落后，仓位状态已标记 degraded"
+                    "position engine 订单事件订阅落后，仓位状态已标记 degraded skipped={:?}",
+                    skipped
                 );
             }
             Err(OrderEventPollError::Closed) => {
@@ -348,7 +353,11 @@ pub async fn run_persist_task(
 ) {
     while let Some(record) = persist_rx.recv().await {
         if let Err(error) = persist_record(&store, &record) {
-            warn!(seq = record.seq(), error = %error, "position journal 持久化失败");
+            warn!(
+                "position journal 持久化失败 seq={:?} error={}",
+                record.seq(),
+                error
+            );
         }
     }
 }

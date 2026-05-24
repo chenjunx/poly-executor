@@ -25,15 +25,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use log::info;
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::info;
 
 use config::{AppConfig, load_app_config};
 use order_gateway::{
-    ClobOrderCancelSubmitter, ClobOrderSubmitter, ClobRemoteOrderReader, GatewayOrderType,
-    LocalRejectReason, OrderEventKind, OrderEventPayload, OrderEventSubscriber, OrderGateway,
-    OrderGatewayConfig, OrderSide, SimulatedOrderCancelSubmitter, SimulatedOrderSubmitter,
-    TimeInForce,
+    ClobOrderCancelSubmitter, ClobOrderSubmitter, ClobRemoteOrderReader, LocalRejectReason,
+    OrderEventKind, OrderEventPayload, OrderEventSubscriber, OrderGateway, OrderGatewayConfig,
+    OrderSide, SimulatedOrderCancelSubmitter, SimulatedOrderSubmitter,
 };
 use risk::{
     AccountHandleEquityReader, GatewayRiskEngine, GlobalPortfolioValuationReader,
@@ -96,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     // 读取 config.toml + config.local.toml，后续所有路径和开关都以这里为准。
     let app_config = load_app_config()?;
     let log_path = init_log_path(&app_config);
-    let _log_guards = logging::init_logging(&log_path)?;
+    logging::init_logging(&log_path)?;
     let notifier = notification::spawn_dingtalk_notifier(app_config.notification.dingtalk.clone());
     let (order_store, market_store) = init_stores(&app_config)?;
 
@@ -114,7 +113,10 @@ async fn main() -> anyhow::Result<()> {
     let routing = build_routing(&registrations);
 
     info!("正在连接 Polymarket WebSocket...");
-    info!(routing.token_count, "开始监听 token 价格变动");
+    info!(
+        "开始监听 token 价格变动 routing.token_count={:?}",
+        routing.token_count
+    );
 
     // ws_tx 承载公开行情 raw message。
     let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(256 * routing.topic_tokens.len().max(1));
@@ -317,32 +319,12 @@ fn build_market_maker_strategy_from_csv_file_with_config(
     let strategy = MarketMakerStrategy::from_csv_with_config(csv_file, config)?;
     match strategy.as_ref() {
         Some(strategy) => {
-            info!(
-                target: "order",
-                csv_file,
-                token_count = strategy.registration().related_tokens.len(),
-                market_count = strategy.rules().len(),
-                "market_maker 已加载 CSV"
-            );
+            info!(target: "order", "market_maker 已加载 CSV csv_file={:?} token_count={:?} market_count={:?}", csv_file, strategy.registration().related_tokens.len(), strategy.rules().len());
             for rule in strategy.rules() {
-                info!(
-                    target: "order",
-                    csv_file,
-                    condition_id = %rule.condition_id,
-                    market_slug = %rule.market_slug.as_deref().unwrap_or_default(),
-                    token1 = %rule.token1,
-                    token2 = %rule.token2,
-                    rewards_max_spread = %rule.rewards_max_spread.as_deref().unwrap_or_default(),
-                    rewards_min_size = %rule.rewards_min_size.as_deref().unwrap_or_default(),
-                    "market_maker 加载市场"
-                );
+                info!(target: "order", "market_maker 加载市场 csv_file={:?} condition_id={} market_slug={} token1={} token2={} rewards_max_spread={} rewards_min_size={}", csv_file, rule.condition_id, rule.market_slug.as_deref().unwrap_or_default(), rule.token1, rule.token2, rule.rewards_max_spread.as_deref().unwrap_or_default(), rule.rewards_min_size.as_deref().unwrap_or_default());
             }
         }
-        None => info!(
-            target: "order",
-            csv_file,
-            "market_maker CSV 为空，未启动"
-        ),
+        None => info!(target: "order", "market_maker CSV 为空，未启动 csv_file={:?}", csv_file),
     }
     Ok(strategy)
 }
@@ -452,11 +434,7 @@ async fn run_order_notification_bridge(
             }
             Err(order_gateway::OrderEventPollError::Closed) => break,
             Err(order_gateway::OrderEventPollError::Lagged { skipped }) => {
-                tracing::warn!(
-                    target: "notification",
-                    skipped,
-                    "订单通知订阅落后，部分订单通知可能已跳过"
-                );
+                log::warn!(target: "notification", "订单通知订阅落后，部分订单通知可能已跳过 skipped={:?}", skipped);
             }
             Err(order_gateway::OrderEventPollError::Empty) => {}
         }
@@ -471,29 +449,6 @@ fn notification_from_order_event(
     }
 
     match (&event.kind, &event.payload) {
-        (OrderEventKind::Accepted, OrderEventPayload::Accepted { exch_id }) => {
-            let order = event.order.as_ref();
-            Some(notification::NotificationEvent::OrderSubmitted(
-                notification::OrderSubmittedNotification {
-                    strategy_id: event.strategy_id.as_str().to_string(),
-                    local_order_id: event.local_id.as_str().to_string(),
-                    exchange_order_id: exch_id.as_ref().map(|value| value.as_str().to_string()),
-                    market_id: event.market_id.as_str().to_string(),
-                    token_id: event.token_id.as_str().to_string(),
-                    side: order
-                        .map(|meta| order_side_label(meta.side).to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    order_type: order
-                        .map(|meta| gateway_order_type_label(&meta.order_type).to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    price: order.and_then(|meta| meta.price),
-                    size: order
-                        .map(|meta| meta.original_size)
-                        .unwrap_or(Decimal::ZERO),
-                    event_kind: "Accepted".to_string(),
-                },
-            ))
-        }
         (
             OrderEventKind::PartialFill,
             OrderEventPayload::PartialFill {
@@ -578,24 +533,6 @@ fn order_side_label(side: OrderSide) -> &'static str {
     }
 }
 
-fn gateway_order_type_label(order_type: &GatewayOrderType) -> &'static str {
-    match order_type {
-        GatewayOrderType::Limit {
-            time_in_force: TimeInForce::Gtc,
-        } => "LimitGtc",
-        GatewayOrderType::Limit {
-            time_in_force: TimeInForce::Gtd { .. },
-        } => "LimitGtd",
-        GatewayOrderType::Limit {
-            time_in_force: TimeInForce::Ioc,
-        } => "LimitIoc",
-        GatewayOrderType::Limit {
-            time_in_force: TimeInForce::Fok,
-        } => "LimitFok",
-        GatewayOrderType::Market => "Market",
-    }
-}
-
 fn spawn_market_and_positions(app_config: &AppConfig, runtime: MarketRuntime) {
     let MarketRuntime {
         topic_tokens,
@@ -641,7 +578,7 @@ fn init_log_path(app_config: &AppConfig) -> String {
     let log_filename = if !app_config.app.log_file.is_empty() {
         app_config.app.log_file.as_str()
     } else {
-        "alerts.log"
+        "poly-executor.log"
     };
     resolve_path(log_filename)
 }
@@ -751,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_order_event_maps_to_order_submitted_notification() {
+    fn accepted_order_event_is_ignored_for_dingtalk_notification() {
         let event = sample_order_event(
             order_gateway::OrderEventKind::Accepted,
             order_gateway::OrderEventPayload::Accepted {
@@ -759,24 +696,7 @@ mod tests {
             },
         );
 
-        let notification =
-            notification_from_order_event(&event).expect("should map accepted order");
-
-        match notification {
-            notification::NotificationEvent::OrderSubmitted(submitted) => {
-                assert_eq!(submitted.strategy_id, "market_maker");
-                assert_eq!(submitted.local_order_id, "mm-local-1");
-                assert_eq!(submitted.exchange_order_id.as_deref(), Some("0xorder"));
-                assert_eq!(submitted.market_id, "0xmarket");
-                assert_eq!(submitted.token_id, "token-1");
-                assert_eq!(submitted.side, "Buy");
-                assert_eq!(submitted.order_type, "LimitGtc");
-                assert_eq!(submitted.price, Some(Decimal::try_from(0.42_f64).unwrap()));
-                assert_eq!(submitted.size, Decimal::try_from(10.5_f64).unwrap());
-                assert_eq!(submitted.event_kind, "Accepted");
-            }
-            other => panic!("unexpected notification: {other:?}"),
-        }
+        assert!(notification_from_order_event(&event).is_none());
     }
 
     #[test]

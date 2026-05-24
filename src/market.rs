@@ -5,12 +5,12 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 
+use log::{info, warn};
 use polymarket_client_sdk_v2::clob::types::Side;
 use polymarket_client_sdk_v2::clob::ws::types::response::{
     BookUpdate, PriceChangeBatchEntry, WsMessage,
 };
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::{info, warn};
 
 use crate::proxy_ws;
 use crate::storage::MarketStore;
@@ -204,9 +204,9 @@ pub async fn spawn_subscriptions(
     let all_chunks = build_unique_subscription_chunks(topic_groups, default_threads);
     let token_count: usize = all_chunks.iter().map(Vec::len).sum();
     info!(
+        "全局唯一 token 订阅连接已分配 token_count={:?} connection_count={:?}",
         token_count,
-        connection_count = all_chunks.len(),
-        "全局唯一 token 订阅连接已分配"
+        all_chunks.len()
     );
 
     for chunk in all_chunks {
@@ -215,7 +215,7 @@ pub async fn spawn_subscriptions(
         tokio::spawn(async move {
             loop {
                 if let Err(e) = proxy_ws::run(proxy.clone(), chunk.clone(), tx.clone()).await {
-                    warn!(error = %e, "WS 连接断开，5 秒后重连");
+                    warn!("WS 连接断开，5 秒后重连 error={}", e);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
@@ -275,7 +275,11 @@ pub async fn run_tick_recorder(
 
 fn flush_ticks(store: &MarketStore, buffer: &mut Vec<(String, u16, u32, u16, u32, u64)>) {
     if let Err(e) = store.insert_market_ticks_batch(buffer) {
-        warn!(error = %e, rows = buffer.len(), "market_ticks 批量写入失败");
+        warn!(
+            "market_ticks 批量写入失败 error={} rows={:?}",
+            e,
+            buffer.len()
+        );
     }
     buffer.clear();
 }
@@ -321,7 +325,7 @@ pub async fn run_raw_recorder(
                     &asks_blob,
                     ts_ms as i64,
                 ) {
-                    warn!(error = %e, "book_snapshots 写入失败");
+                    warn!("book_snapshots 写入失败 error={}", e);
                 }
             }
             RawStoreEvent::Trade {
@@ -342,7 +346,7 @@ pub async fn run_raw_recorder(
                     fee_rate.as_deref(),
                     ts_ms,
                 ) {
-                    warn!(error = %e, "trade_events 写入失败");
+                    warn!("trade_events 写入失败 error={}", e);
                 }
             }
         }

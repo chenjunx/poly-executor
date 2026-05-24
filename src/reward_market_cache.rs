@@ -18,7 +18,7 @@ use reqwest::header::HeaderMap;
 use reqwest::{Method, Request};
 use serde::Deserialize;
 use sha2::Sha256;
-use tracing::{info, warn};
+use log::{info, warn};
 
 use crate::clob_client::{AuthenticatedClobClient, build_authenticated_clob_client};
 use crate::config::AuthConfig;
@@ -167,7 +167,7 @@ pub async fn run_reward_market_loader(
     let mut last_success_meta = match load_initial_reward_market_pool_meta(&store) {
         Ok(meta) => meta,
         Err(error) => {
-            warn!(target: "order", error = %error, "reward_market_loader 读取已有奖励市场池构建状态失败，将按需重建");
+            warn!(target: "order", "reward_market_loader 读取已有奖励市场池构建状态失败，将按需重建 error={}", error);
             None
         }
     };
@@ -178,11 +178,7 @@ pub async fn run_reward_market_loader(
             last_success_meta,
             RewardMarketPoolBuildTrigger::Startup,
         ) {
-            info!(
-                target: "order",
-                pool_version = last_success_meta.map(|meta| meta.version),
-                "reward_market_loader 已存在奖励市场池，跳过自动重建"
-            );
+            info!(target: "order", "reward_market_loader 已存在奖励市场池，跳过自动重建 pool_version={:?}", last_success_meta.map(|meta| meta.version));
             tokio::time::sleep(retry_interval).await;
             continue;
         }
@@ -199,22 +195,11 @@ pub async fn run_reward_market_loader(
         {
             Ok(meta) => {
                 last_success_meta = Some(meta);
-                info!(
-                    target: "order",
-                    build_date_utc = %meta.build_date_utc,
-                    pool_version = meta.version,
-                    "reward_market_loader 奖励市场池首次构建完成"
-                );
+                info!(target: "order", "reward_market_loader 奖励市场池首次构建完成 build_date_utc={} pool_version={:?}", meta.build_date_utc, meta.version);
                 tokio::time::sleep(retry_interval).await;
             }
             Err(error) => {
-                warn!(
-                    target: "order",
-                    build_date_utc = %build_date_utc,
-                    retry_secs = retry_interval.as_secs(),
-                    error = %error,
-                    "reward_market_loader 奖励市场池构建失败，保留旧缓存并稍后重试"
-                );
+                warn!(target: "order", "reward_market_loader 奖励市场池构建失败，保留旧缓存并稍后重试 build_date_utc={} retry_secs={:?} error={}", build_date_utc, retry_interval.as_secs(), error);
                 tokio::time::sleep(retry_interval).await;
             }
         }
@@ -315,18 +300,7 @@ async fn load_reward_markets_once(
         built_at_ms,
     };
 
-    info!(
-        target: "order",
-        build_date_utc = %meta.build_date_utc,
-        pool_version = meta.version,
-        loaded_market_count,
-        basic_pool_candidate_count,
-        detailed_pool_candidate_count,
-        reward_market_pool_count,
-        stored_reward_market_pool_count,
-        selected_liquidity_reward_market_count,
-        "reward_market_loader 当前奖励市场加载完成并已写入数据库"
-    );
+    info!(target: "order", "reward_market_loader 当前奖励市场加载完成并已写入数据库 build_date_utc={} pool_version={:?} loaded_market_count={:?} basic_pool_candidate_count={:?} detailed_pool_candidate_count={:?} reward_market_pool_count={:?} stored_reward_market_pool_count={:?} selected_liquidity_reward_market_count={:?}", meta.build_date_utc, meta.version, loaded_market_count, basic_pool_candidate_count, detailed_pool_candidate_count, reward_market_pool_count, stored_reward_market_pool_count, selected_liquidity_reward_market_count);
 
     Ok(meta)
 }
@@ -399,7 +373,7 @@ fn notify_removed_liquidity_reward_pool_entries(
                 reason,
             }))
         {
-            warn!(target: "order", condition_id = %entry.condition_id, error = %error, "reward_market_loader 投递重建移除奖励市场事件失败");
+            warn!(target: "order", "reward_market_loader 投递重建移除奖励市场事件失败 condition_id={} error={}", entry.condition_id, error);
         }
     }
 }
@@ -432,15 +406,15 @@ async fn load_pool_entries(
                         });
                     }
                     Err(error) => {
-                        warn!(target: "order", condition_id = %condition_id, market_slug = %detail.market_slug, error = %error, "reward_market_loader 查询 Gamma 市场成交量失败，跳过市场池候选")
+                        warn!(target: "order", "reward_market_loader 查询 Gamma 市场成交量失败，跳过市场池候选 condition_id={} market_slug={} error={}", condition_id, detail.market_slug, error)
                     }
                 }
             }
             Ok(None) => {
-                warn!(target: "order", condition_id = %condition_id, "reward_market_loader 当前奖励市场详情为空，跳过市场池候选")
+                warn!(target: "order", "reward_market_loader 当前奖励市场详情为空，跳过市场池候选 condition_id={}", condition_id)
             }
             Err(error) => {
-                warn!(target: "order", condition_id = %condition_id, error = %error, "reward_market_loader 查询奖励市场详情失败，跳过市场池候选")
+                warn!(target: "order", "reward_market_loader 查询奖励市场详情失败，跳过市场池候选 condition_id={} error={}", condition_id, error)
             }
         }
     }
@@ -472,7 +446,7 @@ fn pool_entries_to_storage_entries(
             };
             let tokens = &entry.detail.tokens;
             if tokens.len() < 2 {
-                warn!(target: "order", condition_id = %entry.market.market.condition_id, token_count = tokens.len(), "reward_market_loader 奖励市场 token 数不足，跳过入库");
+                warn!(target: "order", "reward_market_loader 奖励市场 token 数不足，跳过入库 condition_id={} token_count={:?}", entry.market.market.condition_id, tokens.len());
                 return None;
             }
             Some(OwnedRewardMarketPoolStorageEntry {

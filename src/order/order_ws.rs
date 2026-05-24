@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use log::{info, warn};
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
 use polymarket_client_sdk_v2::clob::ws::Client;
 use polymarket_client_sdk_v2::clob::ws::types::response::{TradeMessage, WsMessage};
 use polymarket_client_sdk_v2::types::{Address, Decimal};
 use serde_json::json;
-use tracing::{info, warn};
 
 use crate::{config::AuthConfig, storage::OrderStore};
 
@@ -22,7 +22,7 @@ pub async fn run(
         match subscribe_orders(&auth, &order_store, &observation_tx).await {
             Ok(()) => warn!(target: "order", "订单 websocket 已断开，5 秒后重连"),
             Err(error) => {
-                warn!(target: "order", error = %error, "订单 websocket 监听失败，5 秒后重连")
+                warn!(target: "order", "订单 websocket 监听失败，5 秒后重连 error={}", error)
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -47,7 +47,7 @@ async fn subscribe_orders(
     let client = Client::default().authenticate(credentials, address)?;
     let mut stream = Box::pin(client.subscribe_user_events(Vec::new())?);
 
-    info!(target: "order", funder = %auth.funder, "已连接订单 websocket 并开始监听订单变化");
+    info!(target: "order", "已连接订单 websocket 并开始监听订单变化 funder={}", auth.funder);
 
     while let Some(message) = stream.next().await {
         match message {
@@ -55,19 +55,12 @@ async fn subscribe_orders(
                 let local_meta = match order_store.find_order_by_remote(&order.id) {
                     Ok(Some(stored_order)) => {
                         let meta = stored_order.to_local_order_meta();
-                        info!(
-                            target: "order",
-                            order_id = %order.id,
-                            local_order_id = %meta.local_order_id,
-                            strategy = %meta.strategy,
-                            token = %meta.token,
-                            "订单 websocket 从数据库恢复本地订单关联"
-                        );
+                        info!(target: "order", "订单 websocket 从数据库恢复本地订单关联 order_id={} local_order_id={} strategy={} token={}", order.id, meta.local_order_id, meta.strategy, meta.token);
                         Some(meta)
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        warn!(target: "order", order_id = %order.id, error = %error, "订单 websocket 从数据库恢复本地订单关联失败");
+                        warn!(target: "order", "订单 websocket 从数据库恢复本地订单关联失败 order_id={} error={}", order.id, error);
                         None
                     }
                 };
@@ -112,28 +105,7 @@ async fn subscribe_orders(
                 let _ = order_store.update_order_status_by_remote(&order.id, status);
 
                 if let Some(local_meta) = local_meta {
-                    info!(
-                        target: "order",
-                        order_id = %order.id,
-                        local_order_id = %local_meta.local_order_id,
-                        remote_order_id = ?local_meta.remote_order_id,
-                        strategy = %local_meta.strategy,
-                        topic = ?local_meta.topic,
-                        token = %local_meta.token,
-                        local_side = ?local_meta.side,
-                        local_price = %local_meta.price,
-                        local_order_size = %local_meta.order_size,
-                        market = %order.market,
-                        asset_id = %order.asset_id,
-                        side = ?order.side,
-                        price = %order.price,
-                        msg_type = ?order.msg_type,
-                        original_size = ?order.original_size,
-                        size_matched = ?order.size_matched,
-                        timestamp = ?order.timestamp,
-                        status = status,
-                        "收到订单 websocket 更新，并成功关联本地订单"
-                    );
+                    info!(target: "order", "收到订单 websocket 更新，并成功关联本地订单 order_id={} local_order_id={} remote_order_id={:?} strategy={} topic={:?} token={} local_side={:?} local_price={} local_order_size={} market={} asset_id={} side={:?} price={} msg_type={:?} original_size={:?} size_matched={:?} timestamp={:?} status={:?}", order.id, local_meta.local_order_id, local_meta.remote_order_id, local_meta.strategy, local_meta.topic, local_meta.token, local_meta.side, local_meta.price, local_meta.order_size, order.market, order.asset_id, order.side, order.price, order.msg_type, order.original_size, order.size_matched, order.timestamp, status);
                     if let Err(error) =
                         observation_tx.try_send(gateway_private_ws_order_update_observation(
                             order.id.clone(),
@@ -146,64 +118,19 @@ async fn subscribe_orders(
                             Some(status),
                         ))
                     {
-                        warn!(
-                            target: "order",
-                            strategy = %local_meta.strategy,
-                            token = %local_meta.token,
-                            local_order_id = %local_meta.local_order_id,
-                            error = %error,
-                            "订单 websocket observation 投递 Gateway 失败"
-                        );
+                        warn!(target: "order", "订单 websocket observation 投递 Gateway 失败 strategy={} token={} local_order_id={} error={}", local_meta.strategy, local_meta.token, local_meta.local_order_id, error);
                     }
-                    info!(
-                        target: "order",
-                        order_id = %order.id,
-                        local_order_id = %local_meta.local_order_id,
-                        token = %local_meta.token,
-                        side = ?local_meta.side,
-                        current_size_matched = ?current_size_matched,
-                        original_size = ?order.original_size,
-                        "订单 websocket 匹配状态已投递 Gateway，等待 settlement 确认"
-                    );
+                    info!(target: "order", "订单 websocket 匹配状态已投递 Gateway，等待 settlement 确认 order_id={} local_order_id={} token={} side={:?} current_size_matched={:?} original_size={:?}", order.id, local_meta.local_order_id, local_meta.token, local_meta.side, current_size_matched, order.original_size);
                 } else {
-                    info!(
-                        target: "order",
-                        order_id = %order.id,
-                        local_order_id = ?local_order_id,
-                        market = %order.market,
-                        asset_id = %order.asset_id,
-                        side = ?order.side,
-                        price = %order.price,
-                        msg_type = ?order.msg_type,
-                        original_size = ?order.original_size,
-                        size_matched = ?order.size_matched,
-                        timestamp = ?order.timestamp,
-                        status = status,
-                        "收到订单 websocket 更新，但未匹配到本地订单"
-                    );
+                    info!(target: "order", "收到订单 websocket 更新，但未匹配到本地订单 order_id={} local_order_id={:?} market={} asset_id={} side={:?} price={} msg_type={:?} original_size={:?} size_matched={:?} timestamp={:?} status={:?}", order.id, local_order_id, order.market, order.asset_id, order.side, order.price, order.msg_type, order.original_size, order.size_matched, order.timestamp, status);
                 }
             }
             Ok(WsMessage::Trade(trade)) => {
                 let maker_order_ids = trade_maker_order_ids(&trade);
-                info!(
-                    target: "order",
-                    trade_id = %trade.id,
-                    market = %trade.market,
-                    asset_id = %trade.asset_id,
-                    side = ?trade.side,
-                    status = ?trade.status,
-                    size = %trade.size,
-                    price = %trade.price,
-                    taker_order_id = ?trade.taker_order_id,
-                    maker_order_ids = ?maker_order_ids,
-                    timestamp = ?trade.timestamp,
-                    last_update = ?trade.last_update,
-                    matchtime = ?trade.matchtime,
-                    "收到 trade websocket 更新"
-                );
+                info!(target: "order", "收到 trade websocket 更新 trade_id={} market={} asset_id={} side={:?} status={:?} size={} price={} taker_order_id={:?} maker_order_ids={:?} timestamp={:?} last_update={:?} matchtime={:?}", trade.id, trade.market, trade.asset_id, trade.side, trade.status, trade.size, trade.price, trade.taker_order_id, maker_order_ids, trade.timestamp, trade.last_update, trade.matchtime);
                 for observation in trade_settlement_observations(&trade) {
                     if let Err(error) = observation_tx.try_send(observation) {
-                        warn!(target: "order", trade_id = %trade.id, error = %error, "trade settlement observation 投递 Gateway 失败");
+                        warn!(target: "order", "trade settlement observation 投递 Gateway 失败 trade_id={} error={}", trade.id, error);
                     }
                 }
             }

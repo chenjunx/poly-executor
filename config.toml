@@ -5,7 +5,7 @@ rpc_url = "https://polygon-rpc.com"
 
 [proxy]
 # 代理地址，例如 "socks5://127.0.0.1:1080"
-url = "socks5://127.0.0.1:7890"
+url = ""
 
 [auth]
 api_key     = ""
@@ -74,8 +74,8 @@ level_sizes_usd = [10.0, 20.0, 30.0]
 reconcile_size_tolerance = 0.2
 
 [app]
-# 告警日志文件名
-log_file = "alerts.log"
+# 统一日志文件名
+log_file = "poly-executor.log"
 # 资产配置文件名
 assets_file = "assets.csv"
 # 触发告警所需的最小套利空间：1 - (ask0 + ask1) > min_diff
@@ -87,7 +87,7 @@ min_price = 0.02
 max_price = 0.98
 # 默认订阅连接数（未配置 topic 时使用）
 default_threads = 3
-sqlite_path = "orders.db"
+sqlite_path = "/home/admin/orders.db"
 # 行情/模拟/奖励市场池库；留空时默认使用 orders.db 同目录下的 market.db
 market_sqlite_path = ""
 # 是否将 WS 行情 tick 写入 SQLite（best_bid/ask 变化时落盘）

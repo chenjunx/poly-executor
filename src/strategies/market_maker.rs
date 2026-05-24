@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use log::{info, warn};
 
 use polymarket_client_sdk_v2::types::Decimal;
 
@@ -507,19 +507,7 @@ fn log_volatility_state(
         config.volatility_threshold,
         config.volatility_min_samples,
     ) {
-        info!(
-            target: "order",
-            asset_id = %asset_id,
-            window_ms = config.volatility_window_ms,
-            sample_count = state.sample_count,
-            min_samples = config.volatility_min_samples,
-            min_fair_mid = %state.min_fair_mid,
-            max_fair_mid = %state.max_fair_mid,
-            range = %state.range,
-            threshold = %state.threshold,
-            is_volatile = state.is_volatile,
-            "market_maker 5m volatility state"
-        );
+        info!(target: "order", "market_maker 5m volatility state asset_id={} window_ms={:?} sample_count={:?} min_samples={:?} min_fair_mid={} max_fair_mid={} range={} threshold={} is_volatile={:?}", asset_id, config.volatility_window_ms, state.sample_count, config.volatility_min_samples, state.min_fair_mid, state.max_fair_mid, state.range, state.threshold, state.is_volatile);
     }
 }
 
@@ -769,23 +757,7 @@ pub fn fair_midpoint_log_event(event: &MarketEvent) -> FairMidpointLogEvent {
 
 fn log_fair_midpoint(event: &MarketEvent) {
     let log_event = fair_midpoint_log_event(event);
-    info!(
-        target: "order",
-        topic = %log_event.topic,
-        asset_id = %log_event.asset_id,
-        best_bid_price = %price_to_decimal(log_event.best_bid_price),
-        best_ask_price = %price_to_decimal(log_event.best_ask_price),
-        best_bid_size = %size_to_decimal(log_event.best_bid_size),
-        best_ask_size = %size_to_decimal(log_event.best_ask_size),
-        fair_midpoint = %price_to_decimal(log_event.fair_midpoint),
-        raw_best_bid_price = log_event.best_bid_price,
-        raw_best_ask_price = log_event.best_ask_price,
-        raw_best_bid_size = log_event.best_bid_size,
-        raw_best_ask_size = log_event.best_ask_size,
-        raw_fair_midpoint = log_event.fair_midpoint,
-        timestamp_ms = log_event.timestamp_ms,
-        "market_maker fair midpoint"
-    );
+    info!(target: "order", "market_maker fair midpoint topic={} asset_id={} best_bid_price={} best_ask_price={} best_bid_size={} best_ask_size={} fair_midpoint={} raw_best_bid_price={:?} raw_best_ask_price={:?} raw_best_bid_size={:?} raw_best_ask_size={:?} raw_fair_midpoint={:?} timestamp_ms={:?}", log_event.topic, log_event.asset_id, price_to_decimal(log_event.best_bid_price), price_to_decimal(log_event.best_ask_price), size_to_decimal(log_event.best_bid_size), size_to_decimal(log_event.best_ask_size), price_to_decimal(log_event.fair_midpoint), log_event.best_bid_price, log_event.best_ask_price, log_event.best_bid_size, log_event.best_ask_size, log_event.fair_midpoint, log_event.timestamp_ms);
 }
 
 fn current_inventory_state(
@@ -831,24 +803,7 @@ fn log_inventory_state(
     no_fair_mid: Decimal,
     inventory: &InventoryState,
 ) {
-    info!(
-        target: "order",
-        condition_id = %rule.condition_id,
-        market_slug = rule.market_slug.as_deref().unwrap_or(""),
-        yes_token = %rule.token1,
-        no_token = %rule.token2,
-        yes_balance = %yes_balance,
-        no_balance = %no_balance,
-        yes_fair_mid = %yes_fair_mid,
-        no_fair_mid = %no_fair_mid,
-        yes_value_usd = %inventory.yes_value_usd,
-        no_value_usd = %inventory.no_value_usd,
-        inventory_value_usd = %inventory.value_usd,
-        inventory_ratio = %inventory.ratio,
-        inventory_side = ?inventory.side,
-        is_overweight = inventory.is_overweight,
-        "market_maker inventory state"
-    );
+    info!(target: "order", "market_maker inventory state condition_id={} market_slug={:?} yes_token={} no_token={} yes_balance={} no_balance={} yes_fair_mid={} no_fair_mid={} yes_value_usd={} no_value_usd={} inventory_value_usd={} inventory_ratio={} inventory_side={:?} is_overweight={:?}", rule.condition_id, rule.market_slug.as_deref().unwrap_or(""), rule.token1, rule.token2, yes_balance, no_balance, yes_fair_mid, no_fair_mid, inventory.yes_value_usd, inventory.no_value_usd, inventory.value_usd, inventory.ratio, inventory.side, inventory.is_overweight);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1038,14 +993,7 @@ fn send_cooldown_cancel_requests(
 ) {
     for request in cooldown_cancel_requests(rule) {
         if let Err(error) = order_gateway.try_send(OrderRequest::Cancel(request)) {
-            warn!(
-                target: "order",
-                condition_id = %rule.condition_id,
-                token1 = %rule.token1,
-                token2 = %rule.token2,
-                error = ?error,
-                "market_maker 冷静期撤单请求投递失败"
-            );
+            warn!(target: "order", "market_maker 冷静期撤单请求投递失败 condition_id={} token1={} token2={} error={:?}", rule.condition_id, rule.token1, rule.token2, error);
         }
     }
 }
@@ -1267,16 +1215,7 @@ impl Strategy for MarketMakerStrategy {
                             reason.clone(),
                             &config,
                         );
-                        warn!(
-                            target: "order",
-                            condition_id = %rule.condition_id,
-                            token_id = %asset_id,
-                            risk_code = cooldown.code,
-                            reason = %cooldown.reason,
-                            cooldown_until_ms = cooldown.until_ms,
-                            cooldown_ms = cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms),
-                            "market_maker 进入冷静期并撤单"
-                        );
+                        warn!(target: "order", "market_maker 进入冷静期并撤单 condition_id={} token_id={} risk_code={:?} reason={} cooldown_until_ms={:?} cooldown_ms={:?}", rule.condition_id, asset_id, cooldown.code, cooldown.reason, cooldown.until_ms, cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms));
                         send_cooldown_cancel_requests(&order_gateway, rule);
                     }
                     continue;
@@ -1285,16 +1224,7 @@ impl Strategy for MarketMakerStrategy {
                     if let Some(cooldown) =
                         active_cooldown(&mut cooldowns, rule, event.book.timestamp_ms)
                     {
-                        info!(
-                            target: "order",
-                            condition_id = %rule.condition_id,
-                            token1 = %rule.token1,
-                            token2 = %rule.token2,
-                            risk_code = cooldown.code,
-                            reason = %cooldown.reason,
-                            cooldown_until_ms = cooldown.until_ms,
-                            "market_maker 冷静期中，跳过报价"
-                        );
+                        info!(target: "order", "market_maker 冷静期中，跳过报价 condition_id={} token1={} token2={} risk_code={:?} reason={} cooldown_until_ms={:?}", rule.condition_id, rule.token1, rule.token2, cooldown.code, cooldown.reason, cooldown.until_ms);
                         continue;
                     }
                     let (Some(yes_book), Some(no_book)) =
@@ -1339,16 +1269,7 @@ impl Strategy for MarketMakerStrategy {
                                     reason,
                                     &config,
                                 );
-                                warn!(
-                                    target: "order",
-                                    condition_id = %risk_ctx.rule.condition_id,
-                                    token_id = %risk_ctx.intent.token_id,
-                                    risk_code = cooldown.code,
-                                    reason = %cooldown.reason,
-                                    cooldown_until_ms = cooldown.until_ms,
-                                    cooldown_ms = cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms),
-                                    "market_maker 进入冷静期并撤单"
-                                );
+                                warn!(target: "order", "market_maker 进入冷静期并撤单 condition_id={} token_id={} risk_code={:?} reason={} cooldown_until_ms={:?} cooldown_ms={:?}", risk_ctx.rule.condition_id, risk_ctx.intent.token_id, cooldown.code, cooldown.reason, cooldown.until_ms, cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms));
                                 if let Some(notifier) = notifier.as_ref() {
                                     notifier.try_notify(cooldown_risk_notification(
                                         risk_ctx.rule,
@@ -1371,12 +1292,7 @@ impl Strategy for MarketMakerStrategy {
                     {
                         Ok(orders) => filter_current_orders_for_rule(rule, orders),
                         Err(error) => {
-                            warn!(
-                                target: "order",
-                                condition_id = %rule.condition_id,
-                                error = ?error,
-                                "market_maker 查询当前挂单失败，跳过改单"
-                            );
+                            warn!(target: "order", "market_maker 查询当前挂单失败，跳过改单 condition_id={} error={:?}", rule.condition_id, error);
                             continue;
                         }
                     };
@@ -1387,59 +1303,28 @@ impl Strategy for MarketMakerStrategy {
                         quote_params.tick_size,
                         config.reconcile_size_tolerance,
                     );
-                    info!(
-                        target: "order",
-                        condition_id = %rule.condition_id,
-                        token1 = %rule.token1,
-                        token2 = %rule.token2,
-                        target_count = target_intents.len(),
-                        keep_count = reconcile.to_keep.len(),
-                        cancel_count = reconcile.to_cancel.len(),
-                        place_count = reconcile.to_place.len(),
-                        "market_maker reconcile orders"
-                    );
+                    info!(target: "order", "market_maker reconcile orders condition_id={} token1={} token2={} target_count={:?} keep_count={:?} cancel_count={:?} place_count={:?}", rule.condition_id, rule.token1, rule.token2, target_intents.len(), reconcile.to_keep.len(), reconcile.to_cancel.len(), reconcile.to_place.len());
                     for order in reconcile.to_cancel {
                         let request = cancel_request_for_order(&order);
                         match order_gateway.try_send(OrderRequest::Cancel(request)) {
-                            Ok(()) => info!(
-                                target: "order",
-                                condition_id = %rule.condition_id,
-                                local_id = %order.local_id.as_str(),
-                                token_id = %order.token_id.as_str(),
-                                price = ?order.price,
-                                remaining_size = %order.remaining_size,
-                                "market_maker reconcile 撤单请求已投递"
-                            ),
-                            Err(error) => warn!(
-                                target: "order",
-                                condition_id = %rule.condition_id,
-                                local_id = %order.local_id.as_str(),
-                                error = ?error,
-                                "market_maker reconcile 撤单请求投递失败"
-                            ),
+                            Ok(()) => {
+                                info!(target: "order", "market_maker reconcile 撤单请求已投递 condition_id={} local_id={} token_id={} price={:?} remaining_size={}", rule.condition_id, order.local_id.as_str(), order.token_id.as_str(), order.price, order.remaining_size)
+                            }
+                            Err(error) => {
+                                warn!(target: "order", "market_maker reconcile 撤单请求投递失败 condition_id={} local_id={} error={:?}", rule.condition_id, order.local_id.as_str(), error)
+                            }
                         }
                     }
                     for intent in reconcile.to_place {
                         let request =
                             build_place_order_request(rule, &intent, event.book.timestamp_ms);
                         match order_gateway.try_send(OrderRequest::Place(request)) {
-                            Ok(()) => info!(
-                                target: "order",
-                                condition_id = %rule.condition_id,
-                                token_id = %intent.token_id,
-                                level = intent.quote.level,
-                                price = %intent.quote.price,
-                                size = %intent.quote.size,
-                                "market_maker 模拟发单请求已投递"
-                            ),
-                            Err(error) => warn!(
-                                target: "order",
-                                condition_id = %rule.condition_id,
-                                token_id = %intent.token_id,
-                                level = intent.quote.level,
-                                error = ?error,
-                                "market_maker 模拟发单请求投递失败"
-                            ),
+                            Ok(()) => {
+                                info!(target: "order", "market_maker 模拟发单请求已投递 condition_id={} token_id={} level={:?} price={} size={}", rule.condition_id, intent.token_id, intent.quote.level, intent.quote.price, intent.quote.size)
+                            }
+                            Err(error) => {
+                                warn!(target: "order", "market_maker 模拟发单请求投递失败 condition_id={} token_id={} level={:?} error={:?}", rule.condition_id, intent.token_id, intent.quote.level, error)
+                            }
                         }
                     }
                 }

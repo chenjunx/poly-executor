@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use chrono::Local;
 use dashmap::DashMap;
+use log::info;
 use polymarket_client_sdk_v2::types::Decimal;
-use tracing::info;
 
 use crate::strategy::{
     CleanOrderbook, Filters, PairEntry, Strategy, StrategyKind, StrategyMarketSubscriptions,

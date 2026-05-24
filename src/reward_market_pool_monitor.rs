@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tracing::{info, warn};
+use log::{info, warn};
 
 use crate::market::MarketBookCache;
 use crate::notification::{LiquidityRewardPoolRemovalNotification, NotificationEvent, Notifier};
@@ -50,7 +50,7 @@ pub async fn run_reward_market_pool_monitor(
                 let entries = match store.load_active_reward_market_pool_entries() {
                     Ok(entries) => entries,
                     Err(error) => {
-                        warn!(target: "order", error = %error, "reward_market_pool_monitor 读取奖励市场池失败");
+                        warn!(target: "order", "reward_market_pool_monitor 读取奖励市场池失败 error={}", error);
                         continue;
                     }
                 };
@@ -76,13 +76,7 @@ pub async fn run_reward_market_pool_monitor(
                         proxy.clone(),
                         ws_tx.clone(),
                     );
-                    info!(
-                        target: "order",
-                        market_count = pairs_by_condition.len(),
-                        token_count = next_tokens.len(),
-                        connection_count = ws_tasks.len(),
-                        "reward_market_pool_monitor 奖励市场池监听已更新"
-                    );
+                    info!(target: "order", "reward_market_pool_monitor 奖励市场池监听已更新 market_count={:?} token_count={:?} connection_count={:?}", pairs_by_condition.len(), next_tokens.len(), ws_tasks.len());
                     subscribed_tokens = next_tokens;
                 }
             }
@@ -101,7 +95,7 @@ pub async fn run_reward_market_pool_monitor(
                             continue;
                         }
                         if let Err(error) = evaluate_token1_book(&store, pair, &book, &config) {
-                            warn!(target: "order", condition_id = %pair.condition_id, error = %error, "reward_market_pool_monitor 检查奖励市场池行情失败");
+                            warn!(target: "order", "reward_market_pool_monitor 检查奖励市场池行情失败 condition_id={} error={}", pair.condition_id, error);
                         }
                     }
                 }
@@ -161,7 +155,7 @@ fn spawn_reward_pool_subscriptions(
             tokio::spawn(async move {
                 loop {
                     if let Err(error) = proxy_ws::run(proxy.clone(), tokens.clone(), tx.clone()).await {
-                        warn!(target: "order", error = %error, token_count = tokens.len(), "reward_market_pool_monitor WS 连接断开，5 秒后重连");
+                        warn!(target: "order", "reward_market_pool_monitor WS 连接断开，5 秒后重连 error={} token_count={:?}", error, tokens.len());
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -190,7 +184,7 @@ fn evaluate_token1_book(
             config.token1_spread_threshold
         );
         if store.kick_reward_market_pool_entry(&pair.condition_id, &reason, now)? {
-            info!(target: "order", condition_id = %pair.condition_id, token1 = %pair.token1, spread, "reward_market_pool_monitor 奖励市场踢出");
+            info!(target: "order", "reward_market_pool_monitor 奖励市场踢出 condition_id={} token1={} spread={:?}", pair.condition_id, pair.token1, spread);
             notify_pool_removal(pair, &reason, bid, ask, spread, config);
         }
         return Ok(());
@@ -202,7 +196,7 @@ fn evaluate_token1_book(
             config.token1_min_bid, config.token1_max_bid
         );
         if store.kick_reward_market_pool_entry(&pair.condition_id, &reason, now)? {
-            info!(target: "order", condition_id = %pair.condition_id, token1 = %pair.token1, mid, "reward_market_pool_monitor 奖励市场踢出");
+            info!(target: "order", "reward_market_pool_monitor 奖励市场踢出 condition_id={} token1={} mid={:?}", pair.condition_id, pair.token1, mid);
             notify_pool_removal(pair, &reason, bid, ask, spread, config);
         }
     }
@@ -227,7 +221,7 @@ fn notify_pool_removal(
             reason: reason.to_string(),
         }))
     {
-        warn!(target: "order", condition_id = %pair.condition_id, error = %error, "reward_market_pool_monitor 投递奖励池剔除事件失败");
+        warn!(target: "order", "reward_market_pool_monitor 投递奖励池剔除事件失败 condition_id={} error={}", pair.condition_id, error);
     }
 
     if let (true, Some(notifier)) = (pair.used_by_liquidity_reward, config.notifier.as_ref()) {
