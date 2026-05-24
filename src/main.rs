@@ -30,9 +30,10 @@ use tracing::info;
 
 use config::{AppConfig, load_app_config};
 use order_gateway::{
-    ClobOrderCancelSubmitter, ClobOrderSubmitter, GatewayOrderType, LocalRejectReason,
-    OrderEventKind, OrderEventPayload, OrderEventSubscriber, OrderGateway, OrderGatewayConfig,
-    OrderSide, SimulatedOrderCancelSubmitter, SimulatedOrderSubmitter, TimeInForce,
+    ClobOrderCancelSubmitter, ClobOrderSubmitter, ClobRemoteOrderReader, GatewayOrderType,
+    LocalRejectReason, OrderEventKind, OrderEventPayload, OrderEventSubscriber, OrderGateway,
+    OrderGatewayConfig, OrderSide, SimulatedOrderCancelSubmitter, SimulatedOrderSubmitter,
+    TimeInForce,
 };
 use risk::{
     AccountHandleEquityReader, GatewayRiskEngine, GlobalPortfolioValuationReader,
@@ -160,13 +161,24 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(ClobOrderCancelSubmitter::new(app_config.auth.clone()))
         };
     let (mut order_gateway, order_gateway_handle, order_event_ring, order_observation_tx) =
-        OrderGateway::new_with_submitters(
-            gateway_config,
-            Arc::new(risk_engine),
-            order_store.clone(),
-            order_submitter,
-            order_cancel_submitter,
-        );
+        if app_config.simulation.enabled {
+            OrderGateway::new_with_submitters(
+                gateway_config,
+                Arc::new(risk_engine),
+                order_store.clone(),
+                order_submitter,
+                order_cancel_submitter,
+            )
+        } else {
+            OrderGateway::new_with_submitters_and_remote_reader(
+                gateway_config,
+                Arc::new(risk_engine),
+                order_store.clone(),
+                order_submitter,
+                order_cancel_submitter,
+                Arc::new(ClobRemoteOrderReader::new(app_config.auth.clone())),
+            )
+        };
     let pending_settlement_rx = order_gateway.subscribe_pending_settlements();
     tokio::spawn(position_ingestor.run_until_input_closed());
     tokio::spawn(position_engine::run_persist_task(
@@ -185,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
     }
     order_gateway
         .complete_startup_recovery()
+        .await
         .expect("order gateway startup recovery should complete");
     tokio::spawn(order_gateway.run_until_request_channel_closed());
 

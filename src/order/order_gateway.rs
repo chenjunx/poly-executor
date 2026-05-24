@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::{LocalSigner, Signer as _};
+use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType, Side as ClobSide};
 use polymarket_client_sdk_v2::types::{Decimal, U256};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -1144,6 +1145,54 @@ pub trait OrderCancelSubmitter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderCancelResult>> + Send + 'a>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOpenOrderSnapshot {
+    pub exch_id: ExchangeOrderId,
+}
+
+pub trait RemoteOrderReader: Send + Sync {
+    fn open_orders<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<RemoteOpenOrderSnapshot>>> + Send + 'a>>;
+}
+
+pub struct ClobRemoteOrderReader {
+    auth: AuthConfig,
+}
+
+impl ClobRemoteOrderReader {
+    pub fn new(auth: AuthConfig) -> Self {
+        Self { auth }
+    }
+}
+
+impl RemoteOrderReader for ClobRemoteOrderReader {
+    fn open_orders<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<RemoteOpenOrderSnapshot>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let client = crate::clob_client::build_authenticated_clob_client(&self.auth).await?;
+            let request = OrdersRequest::builder().build();
+            let mut cursor = None;
+            let mut orders = Vec::new();
+
+            loop {
+                let page = client.orders(&request, cursor.take()).await?;
+                orders.extend(page.data.into_iter().map(|order| RemoteOpenOrderSnapshot {
+                    exch_id: ExchangeOrderId::from(order.id),
+                }));
+                if page.next_cursor == "LTE=" {
+                    break;
+                }
+                cursor = Some(page.next_cursor);
+            }
+
+            Ok(orders)
+        })
+    }
+}
+
 pub struct ClobOrderSubmitter {
     auth: AuthConfig,
 }
@@ -1383,6 +1432,7 @@ pub struct OrderGateway {
     risk: Arc<dyn OrderRiskCheck>,
     submitter: Arc<dyn OrderSubmitter>,
     cancel_submitter: Arc<dyn OrderCancelSubmitter>,
+    remote_order_reader: Option<Arc<dyn RemoteOrderReader>>,
     config: OrderGatewayConfig,
     order_store: Option<OrderStore>,
     pending_settlement_tx: tokio::sync::watch::Sender<Vec<SettlementKey>>,
@@ -1440,7 +1490,14 @@ impl OrderGateway {
         OrderEventRing,
         mpsc::Sender<GatewayObservation>,
     ) {
-        Self::new_for_test_inner(config, risk, Some(order_store), submitter, cancel_submitter)
+        Self::new_for_test_inner(
+            config,
+            risk,
+            Some(order_store),
+            submitter,
+            cancel_submitter,
+            None,
+        )
     }
 
     pub fn new_for_test(
@@ -1458,6 +1515,7 @@ impl OrderGateway {
             None,
             Arc::new(SimulatedOrderSubmitter),
             Arc::new(SimulatedOrderCancelSubmitter),
+            None,
         )
     }
 
@@ -1477,6 +1535,7 @@ impl OrderGateway {
             Some(order_store),
             Arc::new(SimulatedOrderSubmitter),
             Arc::new(SimulatedOrderCancelSubmitter),
+            None,
         )
     }
 
@@ -1497,6 +1556,7 @@ impl OrderGateway {
             Some(order_store),
             submitter,
             Arc::new(SimulatedOrderCancelSubmitter),
+            None,
         )
     }
 
@@ -1512,7 +1572,58 @@ impl OrderGateway {
         OrderEventRing,
         mpsc::Sender<GatewayObservation>,
     ) {
-        Self::new_for_test_inner(config, risk, Some(order_store), submitter, cancel_submitter)
+        Self::new_for_test_inner(
+            config,
+            risk,
+            Some(order_store),
+            submitter,
+            cancel_submitter,
+            None,
+        )
+    }
+
+    pub fn new_with_submitters_and_remote_reader(
+        config: OrderGatewayConfig,
+        risk: Arc<dyn OrderRiskCheck>,
+        order_store: OrderStore,
+        submitter: Arc<dyn OrderSubmitter>,
+        cancel_submitter: Arc<dyn OrderCancelSubmitter>,
+        remote_order_reader: Arc<dyn RemoteOrderReader>,
+    ) -> (
+        Self,
+        OrderGatewayHandle,
+        OrderEventRing,
+        mpsc::Sender<GatewayObservation>,
+    ) {
+        Self::new_for_test_inner(
+            config,
+            risk,
+            Some(order_store),
+            submitter,
+            cancel_submitter,
+            Some(remote_order_reader),
+        )
+    }
+
+    pub fn new_for_test_with_store_and_remote_reader(
+        config: OrderGatewayConfig,
+        risk: Arc<dyn OrderRiskCheck>,
+        order_store: OrderStore,
+        remote_order_reader: Arc<dyn RemoteOrderReader>,
+    ) -> (
+        Self,
+        OrderGatewayHandle,
+        OrderEventRing,
+        mpsc::Sender<GatewayObservation>,
+    ) {
+        Self::new_for_test_inner(
+            config,
+            risk,
+            Some(order_store),
+            Arc::new(SimulatedOrderSubmitter),
+            Arc::new(SimulatedOrderCancelSubmitter),
+            Some(remote_order_reader),
+        )
     }
 
     fn new_for_test_inner(
@@ -1521,6 +1632,7 @@ impl OrderGateway {
         order_store: Option<OrderStore>,
         submitter: Arc<dyn OrderSubmitter>,
         cancel_submitter: Arc<dyn OrderCancelSubmitter>,
+        remote_order_reader: Option<Arc<dyn RemoteOrderReader>>,
     ) -> (
         Self,
         OrderGatewayHandle,
@@ -1544,6 +1656,7 @@ impl OrderGateway {
             risk,
             submitter,
             cancel_submitter,
+            remote_order_reader,
             config,
             order_store,
             pending_settlement_tx,
@@ -1569,11 +1682,26 @@ impl OrderGateway {
         self.event_ring.publish(event)
     }
 
-    pub fn complete_startup_recovery(&mut self) -> anyhow::Result<()> {
-        self.recover_from_gateway_store()
+    pub async fn complete_startup_recovery(&mut self) -> anyhow::Result<()> {
+        let (recovered_order_count, failed_unrecoverable_count) =
+            self.recover_from_gateway_store_without_completion()?;
+        let unresolved_order_count = self.reconcile_remote_open_orders().await?;
+        self.complete_recovery(
+            recovered_order_count,
+            unresolved_order_count,
+            failed_unrecoverable_count,
+        )
+        .map_err(|error| anyhow::anyhow!("publish recovery completion failed: {error:?}"))
     }
 
     pub fn recover_from_gateway_store(&mut self) -> anyhow::Result<()> {
+        let (recovered_order_count, failed_unrecoverable_count) =
+            self.recover_from_gateway_store_without_completion()?;
+        self.complete_recovery(recovered_order_count, 0, failed_unrecoverable_count)
+            .map_err(|error| anyhow::anyhow!("publish recovery completion failed: {error:?}"))
+    }
+
+    fn recover_from_gateway_store_without_completion(&mut self) -> anyhow::Result<(usize, usize)> {
         let store = self
             .order_store
             .clone()
@@ -1641,8 +1769,44 @@ impl OrderGateway {
             }
         }
 
-        self.complete_recovery(recovered_order_count, 0, failed_unrecoverable_count)
-            .map_err(|error| anyhow::anyhow!("publish recovery completion failed: {error:?}"))
+        Ok((recovered_order_count, failed_unrecoverable_count))
+    }
+
+    async fn reconcile_remote_open_orders(&mut self) -> anyhow::Result<usize> {
+        let Some(reader) = self.remote_order_reader.clone() else {
+            return Ok(0);
+        };
+        let remote_open_order_ids = reader
+            .open_orders()
+            .await?
+            .into_iter()
+            .map(|order| order.exch_id)
+            .collect::<std::collections::HashSet<_>>();
+        let local_missing_remote_orders = self
+            .state
+            .orders
+            .values()
+            .filter(|record| !record.local_state.is_terminal())
+            .filter_map(|record| {
+                let exch_id = record.exch_id.as_ref()?;
+                (!remote_open_order_ids.contains(exch_id)).then(|| record.local_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for local_id in local_missing_remote_orders {
+            for event in self
+                .state
+                .apply_observation(GatewayObservation::RestCancelAccepted {
+                    local_id,
+                    reason: CancelReason::RemoteCancelled,
+                    ts_ns: self.state.next_seq + 1,
+                    recovery: true,
+                })
+            {
+                self.publish_and_persist(event);
+            }
+        }
+
+        Ok(0)
     }
 
     pub fn spawn_private_order_ws(
@@ -2688,6 +2852,24 @@ mod tests {
         }
     }
 
+    struct FakeRemoteOrderReader {
+        open_orders: Vec<RemoteOpenOrderSnapshot>,
+    }
+
+    impl RemoteOrderReader for FakeRemoteOrderReader {
+        fn open_orders<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Vec<RemoteOpenOrderSnapshot>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(self.open_orders.clone()) })
+        }
+    }
+
     #[tokio::test]
     async fn data_api_activity_reader_confirms_trade_by_transaction_hash() {
         let transaction_hash = "0x0000000000000000000000000000000000000000000000000000000000000abc";
@@ -3532,6 +3714,7 @@ mod tests {
 
         gateway
             .complete_startup_recovery()
+            .await
             .expect("startup recovery should run");
 
         assert!(
@@ -3547,6 +3730,65 @@ mod tests {
         handle
             .try_send(place_request("live-after-startup-recovery"))
             .expect("gateway should be live after startup recovery");
+    }
+
+    #[tokio::test]
+    async fn gateway_startup_reconciliation_marks_missing_remote_order_cancelled() {
+        let store = crate::storage::OrderStore::open(":memory:").expect("store should open");
+        store.init_schema().expect("schema should initialize");
+        upsert_recoverable_gateway_order(&store, "remote-cancelled", "exch-remote-cancelled");
+        let config = OrderGatewayConfig {
+            simulation_enabled: false,
+            request_ring_capacity: 8,
+            event_ring_capacity: 8,
+        };
+        let (mut gateway, handle, ring, _observation_tx) =
+            OrderGateway::new_for_test_with_store_and_remote_reader(
+                config,
+                Arc::new(AllowAllRiskCheck),
+                store,
+                Arc::new(FakeRemoteOrderReader {
+                    open_orders: Vec::new(),
+                }),
+            );
+        let mut strategy_subscriber =
+            ring.subscribe_for_strategy(StrategyId::from("liquidity_reward"));
+
+        gateway
+            .complete_startup_recovery()
+            .await
+            .expect("startup recovery should reconcile remote orders");
+
+        let record = gateway
+            .state
+            .order(&LocalOrderId::from("remote-cancelled"))
+            .expect("recovered order should remain queryable");
+        assert_eq!(record.local_state, LocalOrderState::Cancelled);
+        assert!(
+            gateway
+                .state
+                .active_orders_for_strategy(&StrategyId::from("liquidity_reward"))
+                .is_empty()
+        );
+
+        let recovered = strategy_subscriber
+            .try_recv_relevant()
+            .expect("recovered event should publish");
+        let cancelled = strategy_subscriber
+            .try_recv_relevant()
+            .expect("remote cancellation should publish");
+        assert_eq!(recovered.kind, OrderEventKind::Recovered);
+        assert_eq!(cancelled.kind, OrderEventKind::Cancelled);
+        assert!(cancelled.recovery);
+        assert!(matches!(
+            cancelled.payload,
+            OrderEventPayload::Cancelled {
+                reason: CancelReason::RemoteCancelled
+            }
+        ));
+        handle
+            .try_send(place_request("live-after-reconciliation"))
+            .expect("gateway should be live after reconciliation");
     }
 
     #[tokio::test]

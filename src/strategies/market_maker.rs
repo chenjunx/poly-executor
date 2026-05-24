@@ -384,6 +384,17 @@ fn size_to_decimal(size: u32) -> Decimal {
     Decimal::from(size) / Decimal::from(PRICE_SCALE)
 }
 
+fn orderbook_is_crossed(book: &CleanOrderbook) -> bool {
+    book.best_bid_price > book.best_ask_price
+}
+
+fn crossed_orderbook_risk_decision() -> MarketMakerRiskDecision {
+    MarketMakerRiskDecision::Skip {
+        code: "crossed_orderbook",
+        reason: "crossed orderbook".to_string(),
+    }
+}
+
 fn record_fair_midpoint_history(
     history: &mut VecDeque<(u64, Decimal)>,
     timestamp_ms: u64,
@@ -398,6 +409,31 @@ fn record_fair_midpoint_history(
             break;
         }
     }
+}
+
+fn update_book_and_fair_midpoint_history(
+    event: &MarketEvent,
+    books: &mut HashMap<String, Arc<CleanOrderbook>>,
+    price_history: &mut HashMap<String, VecDeque<(u64, Decimal)>>,
+    config: &MarketMakerStrategyConfig,
+) -> Result<(), MarketMakerRiskDecision> {
+    let asset_id = event.asset_id.to_string();
+    if orderbook_is_crossed(&event.book) {
+        books.remove(&asset_id);
+        return Err(crossed_orderbook_risk_decision());
+    }
+
+    log_fair_midpoint(event);
+    let history = price_history.entry(asset_id.clone()).or_default();
+    record_fair_midpoint_history(
+        history,
+        event.book.timestamp_ms,
+        price_to_decimal(compute_fair_midpoint(&event.book)),
+        config.volatility_window_ms,
+    );
+    log_volatility_state(&asset_id, history, config);
+    books.insert(asset_id, event.book.clone());
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -519,7 +555,7 @@ fn cooldown_duration_ms(code: &str, config: &MarketMakerStrategyConfig) -> u64 {
     match code {
         "price_volatility" => config.volatility_cooldown_ms,
         "fair_midpoint_out_of_range" => config.fair_midpoint_cooldown_ms,
-        "abnormal_market_spread" => config.spread_cooldown_ms,
+        "abnormal_market_spread" | "crossed_orderbook" => config.spread_cooldown_ms,
         _ => config.spread_cooldown_ms,
     }
 }
@@ -612,7 +648,8 @@ struct MarketMakerQuoteRiskContext<'a> {
 }
 
 fn check_market_maker_quote_risk(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
-    let checks: [fn(&MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision; 3] = [
+    let checks: [fn(&MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision; 4] = [
+        check_crossed_orderbook,
         check_abnormal_market_spread,
         check_fair_midpoint_safe_range,
         check_quote_volatility,
@@ -625,6 +662,17 @@ fn check_market_maker_quote_risk(ctx: &MarketMakerQuoteRiskContext<'_>) -> Marke
     }
 
     MarketMakerRiskDecision::Allow
+}
+
+fn check_crossed_orderbook(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
+    let Some(book) = ctx.books.get(&ctx.intent.token_id) else {
+        return MarketMakerRiskDecision::Allow;
+    };
+    if orderbook_is_crossed(book) {
+        crossed_orderbook_risk_decision()
+    } else {
+        MarketMakerRiskDecision::Allow
+    }
 }
 
 fn check_abnormal_market_spread(ctx: &MarketMakerQuoteRiskContext<'_>) -> MarketMakerRiskDecision {
@@ -1199,17 +1247,40 @@ impl Strategy for MarketMakerStrategy {
             let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
             let mut rx = spawn_market_subscription_mux(market_subscriptions, 256);
             while let Some(event) = rx.recv().await {
-                log_fair_midpoint(&event);
                 let asset_id = event.asset_id.to_string();
-                let history = price_history.entry(asset_id.clone()).or_default();
-                record_fair_midpoint_history(
-                    history,
-                    event.book.timestamp_ms,
-                    price_to_decimal(compute_fair_midpoint(&event.book)),
-                    config.volatility_window_ms,
-                );
-                log_volatility_state(&asset_id, history, &config);
-                books.insert(asset_id, event.book.clone());
+                if let Err(MarketMakerRiskDecision::Skip { code, reason }) =
+                    update_book_and_fair_midpoint_history(
+                        &event,
+                        &mut books,
+                        &mut price_history,
+                        &config,
+                    )
+                {
+                    for rule in self.rules.iter().filter(|rule| {
+                        rule.token1.as_str() == asset_id || rule.token2.as_str() == asset_id
+                    }) {
+                        let cooldown = enter_cooldown(
+                            &mut cooldowns,
+                            rule,
+                            event.book.timestamp_ms,
+                            code,
+                            reason.clone(),
+                            &config,
+                        );
+                        warn!(
+                            target: "order",
+                            condition_id = %rule.condition_id,
+                            token_id = %asset_id,
+                            risk_code = cooldown.code,
+                            reason = %cooldown.reason,
+                            cooldown_until_ms = cooldown.until_ms,
+                            cooldown_ms = cooldown.until_ms.saturating_sub(cooldown.triggered_at_ms),
+                            "market_maker 进入冷静期并撤单"
+                        );
+                        send_cooldown_cancel_requests(&order_gateway, rule);
+                    }
+                    continue;
+                }
                 for rule in self.rules.iter() {
                     if let Some(cooldown) =
                         active_cooldown(&mut cooldowns, rule, event.book.timestamp_ms)
@@ -2087,6 +2158,77 @@ mod tests {
         assert_eq!(
             history,
             VecDeque::from([(50, dec(50, 100)), (102, dec(60, 100))])
+        );
+    }
+
+    #[test]
+    fn quote_risk_chain_skips_when_orderbook_is_crossed() {
+        let rule = MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "maker-token-1".to_string(),
+            token2: "maker-token-2".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        };
+        let intent = target_intent("maker-token-1", dec(49, 100), Decimal::from(100u32));
+        let price_history = HashMap::new();
+        let books = HashMap::from([(
+            "maker-token-1".to_string(),
+            Arc::new(clean_book(8_700, 8_600, 100, 100)),
+        )]);
+        let config = MarketMakerStrategyConfig::default();
+        let ctx = MarketMakerQuoteRiskContext {
+            rule: &rule,
+            intent: &intent,
+            books: &books,
+            price_history: &price_history,
+            config: &config,
+        };
+
+        let decision = check_market_maker_quote_risk(&ctx);
+
+        assert_eq!(
+            decision,
+            MarketMakerRiskDecision::Skip {
+                code: "crossed_orderbook",
+                reason: "crossed orderbook".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn book_state_update_skips_crossed_orderbook_before_fair_midpoint_history() {
+        let event = MarketEvent {
+            topic: Arc::from("maker-token-1"),
+            asset_id: Arc::from("maker-token-1"),
+            book: Arc::new(clean_book_at(8_700, 8_600, 100, 100, 1_000)),
+        };
+        let mut books = HashMap::from([(
+            "maker-token-1".to_string(),
+            Arc::new(clean_book(4_900, 5_100, 100, 100)),
+        )]);
+        let mut price_history = HashMap::from([(
+            "maker-token-1".to_string(),
+            VecDeque::from([(900, dec(50, 100))]),
+        )]);
+        let config = MarketMakerStrategyConfig::default();
+
+        let decision =
+            update_book_and_fair_midpoint_history(&event, &mut books, &mut price_history, &config)
+                .expect_err("crossed orderbook should trigger risk before fair midpoint history");
+
+        assert_eq!(
+            decision,
+            MarketMakerRiskDecision::Skip {
+                code: "crossed_orderbook",
+                reason: "crossed orderbook".to_string(),
+            }
+        );
+        assert!(!books.contains_key("maker-token-1"));
+        assert_eq!(
+            price_history.get("maker-token-1").unwrap(),
+            &VecDeque::from([(900, dec(50, 100))])
         );
     }
 
