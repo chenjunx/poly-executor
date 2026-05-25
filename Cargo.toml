@@ -26,7 +26,7 @@ sha2 = "0.10"
 base64 = "0.22"
 alloy = { version = "1", default-features = false, features = ["contract", "provider-http", "network", "signer-local", "reqwest"] }
 log = "0.4"
-log4rs = "1"
+log4rs = { version = "1", features = ["gzip"] }
 arc-swap = "1"
 
 [profile.release]
