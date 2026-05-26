@@ -144,6 +144,12 @@ pub(crate) struct MarketMakerConfig {
     pub(crate) level_ratios: Vec<f64>,
     #[serde(default = "default_market_maker_level_sizes_usd")]
     pub(crate) level_sizes_usd: Vec<f64>,
+    #[serde(default = "default_market_maker_rebalance_level_share_ratios")]
+    pub(crate) rebalance_level_share_ratios: Vec<f64>,
+    #[serde(default = "default_market_maker_rebalance_max_usd_per_level")]
+    pub(crate) rebalance_max_usd_per_level: Vec<f64>,
+    #[serde(default = "default_market_maker_rebalance_max_usd_per_cycle")]
+    pub(crate) rebalance_max_usd_per_cycle: f64,
     #[serde(default = "default_market_maker_reconcile_size_tolerance")]
     pub(crate) reconcile_size_tolerance: f64,
 }
@@ -173,6 +179,9 @@ impl Default for MarketMakerConfig {
             overweight_quote_levels: default_market_maker_overweight_quote_levels(),
             level_ratios: default_market_maker_level_ratios(),
             level_sizes_usd: default_market_maker_level_sizes_usd(),
+            rebalance_level_share_ratios: default_market_maker_rebalance_level_share_ratios(),
+            rebalance_max_usd_per_level: default_market_maker_rebalance_max_usd_per_level(),
+            rebalance_max_usd_per_cycle: default_market_maker_rebalance_max_usd_per_cycle(),
             reconcile_size_tolerance: default_market_maker_reconcile_size_tolerance(),
         }
     }
@@ -306,6 +315,18 @@ fn default_market_maker_level_sizes_usd() -> Vec<f64> {
     vec![50.0, 75.0, 100.0]
 }
 
+fn default_market_maker_rebalance_level_share_ratios() -> Vec<f64> {
+    vec![0.3, 0.15, 0.05]
+}
+
+fn default_market_maker_rebalance_max_usd_per_level() -> Vec<f64> {
+    vec![200.0, 150.0, 100.0]
+}
+
+fn default_market_maker_rebalance_max_usd_per_cycle() -> f64 {
+    450.0
+}
+
 fn default_market_maker_reconcile_size_tolerance() -> f64 {
     0.2
 }
@@ -425,6 +446,15 @@ size_usdc = 1.0
         assert_eq!(config.market_maker.overweight_ratio, 0.7);
         assert_eq!(config.market_maker.level_ratios, vec![0.4, 0.55, 0.7]);
         assert_eq!(config.market_maker.level_sizes_usd, vec![50.0, 75.0, 100.0]);
+        assert_eq!(
+            config.market_maker.rebalance_level_share_ratios,
+            vec![0.3, 0.15, 0.05]
+        );
+        assert_eq!(
+            config.market_maker.rebalance_max_usd_per_level,
+            vec![200.0, 150.0, 100.0]
+        );
+        assert_eq!(config.market_maker.rebalance_max_usd_per_cycle, 450.0);
     }
 
     #[test]
@@ -459,6 +489,9 @@ max_inventory_usd = 250.0
 overweight_ratio = 0.6
 level_ratios = [0.25, 0.5]
 level_sizes_usd = [20.0, 40.0]
+rebalance_level_share_ratios = [0.2, 0.1]
+rebalance_max_usd_per_level = [120.0, 80.0]
+rebalance_max_usd_per_cycle = 180.0
 reconcile_size_tolerance = 0.05
 "#;
 
@@ -475,6 +508,15 @@ reconcile_size_tolerance = 0.05
         assert_eq!(config.market_maker.overweight_ratio, 0.6);
         assert_eq!(config.market_maker.level_ratios, vec![0.25, 0.5]);
         assert_eq!(config.market_maker.level_sizes_usd, vec![20.0, 40.0]);
+        assert_eq!(
+            config.market_maker.rebalance_level_share_ratios,
+            vec![0.2, 0.1]
+        );
+        assert_eq!(
+            config.market_maker.rebalance_max_usd_per_level,
+            vec![120.0, 80.0]
+        );
+        assert_eq!(config.market_maker.rebalance_max_usd_per_cycle, 180.0);
         assert_eq!(config.market_maker.reconcile_size_tolerance, 0.05);
     }
 }

@@ -59,6 +59,9 @@ pub struct MarketMakerStrategyConfig {
     pub overweight_quote_levels: usize,
     pub level_ratios: Vec<Decimal>,
     pub level_sizes_usd: Vec<Decimal>,
+    pub rebalance_level_share_ratios: Vec<Decimal>,
+    pub rebalance_max_usd_per_level: Vec<Decimal>,
+    pub rebalance_max_usd_per_cycle: Decimal,
     pub reconcile_size_tolerance: Decimal,
 }
 
@@ -92,6 +95,17 @@ impl Default for MarketMakerStrategyConfig {
                 Decimal::from(75u32),
                 Decimal::from(100u32),
             ],
+            rebalance_level_share_ratios: vec![
+                parse_decimal("0.3"),
+                parse_decimal("0.15"),
+                parse_decimal("0.05"),
+            ],
+            rebalance_max_usd_per_level: vec![
+                Decimal::from(200u32),
+                Decimal::from(150u32),
+                Decimal::from(100u32),
+            ],
+            rebalance_max_usd_per_cycle: Decimal::from(450u32),
             reconcile_size_tolerance: parse_decimal("0.2"),
         }
     }
@@ -159,6 +173,28 @@ impl TryFrom<&crate::config::MarketMakerConfig> for MarketMakerStrategyConfig {
             "market_maker.level_sizes_usd entries must be > 0"
         );
         anyhow::ensure!(
+            config.rebalance_level_share_ratios.len() == config.rebalance_max_usd_per_level.len(),
+            "market_maker.rebalance_level_share_ratios and rebalance_max_usd_per_level must have the same length"
+        );
+        anyhow::ensure!(
+            config
+                .rebalance_level_share_ratios
+                .iter()
+                .all(|value| *value > 0.0),
+            "market_maker.rebalance_level_share_ratios entries must be > 0"
+        );
+        anyhow::ensure!(
+            config
+                .rebalance_max_usd_per_level
+                .iter()
+                .all(|value| *value > 0.0),
+            "market_maker.rebalance_max_usd_per_level entries must be > 0"
+        );
+        anyhow::ensure!(
+            config.rebalance_max_usd_per_cycle > 0.0,
+            "market_maker.rebalance_max_usd_per_cycle must be > 0"
+        );
+        anyhow::ensure!(
             (0.0..=1.0).contains(&config.reconcile_size_tolerance),
             "market_maker.reconcile_size_tolerance must be between 0 and 1"
         );
@@ -193,6 +229,17 @@ impl TryFrom<&crate::config::MarketMakerConfig> for MarketMakerStrategyConfig {
                 .iter()
                 .map(|value| decimal_from_f64(*value))
                 .collect::<anyhow::Result<Vec<_>>>()?,
+            rebalance_level_share_ratios: config
+                .rebalance_level_share_ratios
+                .iter()
+                .map(|value| decimal_from_f64(*value))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            rebalance_max_usd_per_level: config
+                .rebalance_max_usd_per_level
+                .iter()
+                .map(|value| decimal_from_f64(*value))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            rebalance_max_usd_per_cycle: decimal_from_f64(config.rebalance_max_usd_per_cycle)?,
             reconcile_size_tolerance: decimal_from_f64(config.reconcile_size_tolerance)?,
         })
     }
@@ -212,8 +259,15 @@ pub enum InventorySide {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InventoryState {
-    pub yes_value_usd: Decimal,
-    pub no_value_usd: Decimal,
+    pub yes_balance: Decimal,
+    pub no_balance: Decimal,
+    pub paired_shares: Decimal,
+    pub net_yes_shares: Decimal,
+    pub net_no_shares: Decimal,
+    pub yes_gross_value_usd: Decimal,
+    pub no_gross_value_usd: Decimal,
+    pub net_yes_value_usd: Decimal,
+    pub net_no_value_usd: Decimal,
     pub value_usd: Decimal,
     pub ratio: Decimal,
     pub side: InventorySide,
@@ -228,9 +282,14 @@ pub fn compute_inventory_state(
     max_inventory_usd: Decimal,
     overweight_ratio: Decimal,
 ) -> InventoryState {
-    let yes_value_usd = yes_token_balance * yes_fair_mid;
-    let no_value_usd = no_token_balance * no_fair_mid;
-    let value_usd = yes_value_usd - no_value_usd;
+    let yes_gross_value_usd = yes_token_balance * yes_fair_mid;
+    let no_gross_value_usd = no_token_balance * no_fair_mid;
+    let paired_shares = decimal_min(yes_token_balance, no_token_balance);
+    let net_yes_shares = decimal_max(yes_token_balance - no_token_balance, Decimal::ZERO);
+    let net_no_shares = decimal_max(no_token_balance - yes_token_balance, Decimal::ZERO);
+    let net_yes_value_usd = net_yes_shares * yes_fair_mid;
+    let net_no_value_usd = net_no_shares * no_fair_mid;
+    let value_usd = net_yes_value_usd - net_no_value_usd;
     let ratio = if max_inventory_usd > Decimal::ZERO {
         clamp_decimal(value_usd / max_inventory_usd, -Decimal::ONE, Decimal::ONE)
     } else {
@@ -245,8 +304,15 @@ pub fn compute_inventory_state(
     };
 
     InventoryState {
-        yes_value_usd,
-        no_value_usd,
+        yes_balance: yes_token_balance,
+        no_balance: no_token_balance,
+        paired_shares,
+        net_yes_shares,
+        net_no_shares,
+        yes_gross_value_usd,
+        no_gross_value_usd,
+        net_yes_value_usd,
+        net_no_value_usd,
         value_usd,
         ratio,
         side,
@@ -266,6 +332,10 @@ fn clamp_decimal(value: Decimal, min: Decimal, max: Decimal) -> Decimal {
 
 fn decimal_abs(value: Decimal) -> Decimal {
     if value < Decimal::ZERO { -value } else { value }
+}
+
+fn decimal_min(left: Decimal, right: Decimal) -> Decimal {
+    if left < right { left } else { right }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -310,6 +380,9 @@ pub struct TargetQuoteParams {
     pub overweight_quote_levels: usize,
     pub level_ratios: Vec<Decimal>,
     pub level_sizes_usd: Vec<Decimal>,
+    pub rebalance_level_share_ratios: Vec<Decimal>,
+    pub rebalance_max_usd_per_level: Vec<Decimal>,
+    pub rebalance_max_usd_per_cycle: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,6 +397,12 @@ pub struct TargetQuote {
     pub raw_bid: Decimal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TargetQuoteSizing {
+    FixedUsd,
+    RebalanceShares { share_gap: Decimal },
+}
+
 pub fn compute_target_buy_quotes_for_token(
     token_side: TargetTokenSide,
     fair_mid: Decimal,
@@ -331,23 +410,53 @@ pub fn compute_target_buy_quotes_for_token(
     is_overweight: bool,
     params: &TargetQuoteParams,
 ) -> Vec<TargetQuote> {
+    compute_target_buy_quotes_for_token_with_sizing(
+        token_side,
+        fair_mid,
+        skew,
+        is_overweight,
+        params,
+        TargetQuoteSizing::FixedUsd,
+    )
+}
+
+fn compute_target_buy_quotes_for_token_with_sizing(
+    token_side: TargetTokenSide,
+    fair_mid: Decimal,
+    skew: Decimal,
+    is_overweight: bool,
+    params: &TargetQuoteParams,
+    sizing: TargetQuoteSizing,
+) -> Vec<TargetQuote> {
     let adjusted_mid = fair_mid + skew;
     let num_levels = if is_overweight {
         params.overweight_quote_levels
     } else {
         params.normal_quote_levels
     };
+    let mut remaining_rebalance_usd = params.rebalance_max_usd_per_cycle;
     params
         .level_ratios
         .iter()
         .zip(params.level_sizes_usd.iter())
         .take(num_levels)
         .enumerate()
-        .filter_map(|(index, (&level_ratio, &size_usd))| {
+        .filter_map(|(index, (&level_ratio, &fixed_size_usd))| {
             let distance = params.max_spread * level_ratio;
             let raw_bid = adjusted_mid - distance;
             let price = floor_to_tick(raw_bid, params.tick_size);
             if price <= Decimal::ZERO {
+                return None;
+            }
+            let size_usd = target_quote_size_usd(
+                index,
+                price,
+                fixed_size_usd,
+                sizing,
+                params,
+                &mut remaining_rebalance_usd,
+            );
+            if size_usd <= Decimal::ZERO {
                 return None;
             }
             let size = snap_unwind_size_to_lot(decimal_max(size_usd / price, params.min_size));
@@ -363,6 +472,41 @@ pub fn compute_target_buy_quotes_for_token(
             })
         })
         .collect()
+}
+
+fn target_quote_size_usd(
+    level_index: usize,
+    price: Decimal,
+    fixed_size_usd: Decimal,
+    sizing: TargetQuoteSizing,
+    params: &TargetQuoteParams,
+    remaining_rebalance_usd: &mut Decimal,
+) -> Decimal {
+    match sizing {
+        TargetQuoteSizing::FixedUsd => fixed_size_usd,
+        TargetQuoteSizing::RebalanceShares { share_gap } => {
+            if *remaining_rebalance_usd <= Decimal::ZERO {
+                return Decimal::ZERO;
+            }
+            let share_ratio = params
+                .rebalance_level_share_ratios
+                .get(level_index)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let max_level_usd = params
+                .rebalance_max_usd_per_level
+                .get(level_index)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let desired_usd = share_gap * share_ratio * price;
+            let capped_usd = decimal_min(
+                decimal_min(desired_usd, max_level_usd),
+                *remaining_rebalance_usd,
+            );
+            *remaining_rebalance_usd -= capped_usd;
+            capped_usd
+        }
+    }
 }
 
 fn floor_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
@@ -803,7 +947,7 @@ fn log_inventory_state(
     no_fair_mid: Decimal,
     inventory: &InventoryState,
 ) {
-    info!(target: "order", "market_maker inventory state condition_id={} market_slug={:?} yes_token={} no_token={} yes_balance={} no_balance={} yes_fair_mid={} no_fair_mid={} yes_value_usd={} no_value_usd={} inventory_value_usd={} inventory_ratio={} inventory_side={:?} is_overweight={:?}", rule.condition_id, rule.market_slug.as_deref().unwrap_or(""), rule.token1, rule.token2, yes_balance, no_balance, yes_fair_mid, no_fair_mid, inventory.yes_value_usd, inventory.no_value_usd, inventory.value_usd, inventory.ratio, inventory.side, inventory.is_overweight);
+    info!(target: "order", "market_maker inventory state condition_id={} market_slug={:?} yes_token={} no_token={} yes_balance={} no_balance={} yes_fair_mid={} no_fair_mid={} paired_shares={} net_yes_shares={} net_no_shares={} yes_gross_value_usd={} no_gross_value_usd={} net_yes_value_usd={} net_no_value_usd={} inventory_value_usd={} inventory_ratio={} inventory_side={:?} is_overweight={:?}", rule.condition_id, rule.market_slug.as_deref().unwrap_or(""), rule.token1, rule.token2, yes_balance, no_balance, yes_fair_mid, no_fair_mid, inventory.paired_shares, inventory.net_yes_shares, inventory.net_no_shares, inventory.yes_gross_value_usd, inventory.no_gross_value_usd, inventory.net_yes_value_usd, inventory.net_no_value_usd, inventory.value_usd, inventory.ratio, inventory.side, inventory.is_overweight);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -913,39 +1057,83 @@ fn target_buy_quote_intents(
 
     if inventory.ratio <= Decimal::ZERO {
         intents.extend(
-            compute_target_buy_quotes_for_token(
-                TargetTokenSide::Yes,
-                yes_fair_mid,
-                skew.yes_skew,
-                inventory.is_overweight,
-                &params,
-            )
-            .into_iter()
-            .map(|quote| TargetBuyQuoteIntent {
-                token_id: rule.token1.clone(),
-                quote,
-            }),
+            yes_target_buy_quotes(yes_fair_mid, skew.yes_skew, inventory, &params)
+                .into_iter()
+                .map(|quote| TargetBuyQuoteIntent {
+                    token_id: rule.token1.clone(),
+                    quote,
+                }),
         );
     }
 
     if inventory.ratio >= Decimal::ZERO {
         intents.extend(
-            compute_target_buy_quotes_for_token(
-                TargetTokenSide::No,
-                no_fair_mid,
-                skew.no_skew,
-                inventory.is_overweight,
-                &params,
-            )
-            .into_iter()
-            .map(|quote| TargetBuyQuoteIntent {
-                token_id: rule.token2.clone(),
-                quote,
-            }),
+            no_target_buy_quotes(no_fair_mid, skew.no_skew, inventory, &params)
+                .into_iter()
+                .map(|quote| TargetBuyQuoteIntent {
+                    token_id: rule.token2.clone(),
+                    quote,
+                }),
         );
     }
 
     intents
+}
+
+fn yes_target_buy_quotes(
+    fair_mid: Decimal,
+    skew: Decimal,
+    inventory: &InventoryState,
+    params: &TargetQuoteParams,
+) -> Vec<TargetQuote> {
+    if inventory.side == InventorySide::LongNo {
+        compute_target_buy_quotes_for_token_with_sizing(
+            TargetTokenSide::Yes,
+            fair_mid,
+            skew,
+            inventory.is_overweight,
+            params,
+            TargetQuoteSizing::RebalanceShares {
+                share_gap: inventory.net_no_shares,
+            },
+        )
+    } else {
+        compute_target_buy_quotes_for_token(
+            TargetTokenSide::Yes,
+            fair_mid,
+            skew,
+            inventory.is_overweight,
+            params,
+        )
+    }
+}
+
+fn no_target_buy_quotes(
+    fair_mid: Decimal,
+    skew: Decimal,
+    inventory: &InventoryState,
+    params: &TargetQuoteParams,
+) -> Vec<TargetQuote> {
+    if inventory.side == InventorySide::LongYes {
+        compute_target_buy_quotes_for_token_with_sizing(
+            TargetTokenSide::No,
+            fair_mid,
+            skew,
+            inventory.is_overweight,
+            params,
+            TargetQuoteSizing::RebalanceShares {
+                share_gap: inventory.net_yes_shares,
+            },
+        )
+    } else {
+        compute_target_buy_quotes_for_token(
+            TargetTokenSide::No,
+            fair_mid,
+            skew,
+            inventory.is_overweight,
+            params,
+        )
+    }
 }
 
 fn target_quote_params(
@@ -967,6 +1155,9 @@ fn target_quote_params(
         overweight_quote_levels: config.overweight_quote_levels,
         level_ratios: config.level_ratios.clone(),
         level_sizes_usd: config.level_sizes_usd.clone(),
+        rebalance_level_share_ratios: config.rebalance_level_share_ratios.clone(),
+        rebalance_max_usd_per_level: config.rebalance_max_usd_per_level.clone(),
+        rebalance_max_usd_per_cycle: config.rebalance_max_usd_per_cycle,
     }
 }
 
@@ -1405,6 +1596,17 @@ mod tests {
         Decimal::from(numerator) / Decimal::from(denominator)
     }
 
+    fn market_maker_rule() -> MarketMakerRule {
+        MarketMakerRule {
+            condition_id: "0xabc".to_string(),
+            market_slug: None,
+            token1: "yes-token".to_string(),
+            token2: "no-token".to_string(),
+            rewards_max_spread: None,
+            rewards_min_size: None,
+        }
+    }
+
     fn target_intent(token_id: &str, price: Decimal, size: Decimal) -> TargetBuyQuoteIntent {
         TargetBuyQuoteIntent {
             token_id: token_id.to_string(),
@@ -1552,6 +1754,50 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_orders_cancels_current_side_removed_by_paired_share_inventory_target() {
+        let rule = market_maker_rule();
+        let config = MarketMakerStrategyConfig::default();
+        let inventory = compute_inventory_state(
+            Decimal::from(120u32),
+            Decimal::from(100u32),
+            dec(6, 10),
+            dec(4, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+        let targets = target_buy_quote_intents(&rule, dec(6, 10), dec(4, 10), &inventory, &config);
+        let current_yes = active_order(
+            "yes-order",
+            "yes-token",
+            dec(58, 100),
+            Decimal::from(100u32),
+        );
+
+        let result = reconcile_market_maker_orders(
+            &targets,
+            vec![current_yes.clone()],
+            config.tick_size,
+            config.reconcile_size_tolerance,
+        );
+
+        assert_eq!(inventory.side, InventorySide::LongYes);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.token_side)
+                .collect::<Vec<_>>(),
+            vec![
+                TargetTokenSide::No,
+                TargetTokenSide::No,
+                TargetTokenSide::No
+            ]
+        );
+        assert_eq!(result.to_cancel, vec![current_yes]);
+        assert_eq!(result.to_place, targets);
+        assert!(result.to_keep.is_empty());
+    }
+
+    #[test]
     fn default_market_maker_config_matches_existing_quote_parameters() {
         let rule = MarketMakerRule {
             condition_id: "0xabc".to_string(),
@@ -1594,6 +1840,9 @@ mod tests {
             overweight_quote_levels: 1,
             level_ratios: vec![dec(50, 100), Decimal::ONE],
             level_sizes_usd: vec![Decimal::from(10u32), Decimal::from(20u32)],
+            rebalance_level_share_ratios: vec![dec(30, 100), dec(15, 100)],
+            rebalance_max_usd_per_level: vec![Decimal::from(200u32), Decimal::from(150u32)],
+            rebalance_max_usd_per_cycle: Decimal::from(450u32),
         };
 
         let normal_quotes = compute_target_buy_quotes_for_token(
@@ -1628,6 +1877,9 @@ mod tests {
             overweight_quote_levels: 1,
             level_ratios: vec![Decimal::ONE],
             level_sizes_usd: vec![Decimal::from(10u32)],
+            rebalance_level_share_ratios: vec![dec(30, 100)],
+            rebalance_max_usd_per_level: vec![Decimal::from(200u32)],
+            rebalance_max_usd_per_cycle: Decimal::from(450u32),
         };
 
         let quotes = compute_target_buy_quotes_for_token(
@@ -1661,60 +1913,297 @@ mod tests {
     }
 
     #[test]
-    fn inventory_state_values_yes_and_no_with_separate_fair_midpoints() {
+    fn inventory_state_offsets_paired_yes_no_shares_before_valuing_exposure() {
         let state = compute_inventory_state(
             Decimal::from(100u32),
-            Decimal::from(50u32),
-            dec(4, 10),
-            dec(6, 10),
+            Decimal::from(100u32),
+            dec(9, 10),
+            dec(1, 10),
             Decimal::from(100u32),
             dec(7, 10),
         );
 
-        assert_eq!(state.yes_value_usd, Decimal::from(40u32));
-        assert_eq!(state.no_value_usd, Decimal::from(30u32));
-        assert_eq!(state.value_usd, Decimal::from(10u32));
-        assert_eq!(state.ratio, dec(1, 10));
+        assert_eq!(state.paired_shares, Decimal::from(100u32));
+        assert_eq!(state.net_yes_shares, Decimal::ZERO);
+        assert_eq!(state.net_no_shares, Decimal::ZERO);
+        assert_eq!(state.yes_gross_value_usd, Decimal::from(90u32));
+        assert_eq!(state.no_gross_value_usd, Decimal::from(10u32));
+        assert_eq!(state.net_yes_value_usd, Decimal::ZERO);
+        assert_eq!(state.net_no_value_usd, Decimal::ZERO);
+        assert_eq!(state.value_usd, Decimal::ZERO);
+        assert_eq!(state.ratio, Decimal::ZERO);
+        assert_eq!(state.side, InventorySide::Flat);
+        assert!(!state.is_overweight);
+    }
+
+    #[test]
+    fn inventory_state_values_only_net_yes_exposure() {
+        let state = compute_inventory_state(
+            Decimal::from(50u32),
+            Decimal::from(20u32),
+            dec(7, 10),
+            dec(3, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        assert_eq!(state.paired_shares, Decimal::from(20u32));
+        assert_eq!(state.net_yes_shares, Decimal::from(30u32));
+        assert_eq!(state.net_no_shares, Decimal::ZERO);
+        assert_eq!(state.yes_gross_value_usd, Decimal::from(35u32));
+        assert_eq!(state.no_gross_value_usd, Decimal::from(6u32));
+        assert_eq!(state.net_yes_value_usd, Decimal::from(21u32));
+        assert_eq!(state.net_no_value_usd, Decimal::ZERO);
+        assert_eq!(state.value_usd, Decimal::from(21u32));
+        assert_eq!(state.ratio, dec(21, 100));
         assert_eq!(state.side, InventorySide::LongYes);
         assert!(!state.is_overweight);
     }
 
     #[test]
-    fn inventory_state_uses_no_fair_midpoint_for_no_inventory() {
+    fn inventory_state_values_only_net_no_exposure() {
         let state = compute_inventory_state(
-            Decimal::ZERO,
-            Decimal::from(200u32),
-            dec(4, 10),
-            dec(6, 10),
-            Decimal::from(100u32),
+            dec(602, 100),
+            dec(13042, 100),
+            dec(7679, 10000),
+            dec(2321, 10000),
+            Decimal::from(60u32),
             dec(7, 10),
         );
 
-        assert_eq!(state.yes_value_usd, Decimal::ZERO);
-        assert_eq!(state.no_value_usd, Decimal::from(120u32));
-        assert_eq!(state.value_usd, Decimal::from(-120));
-        assert_eq!(state.ratio, -Decimal::ONE);
+        assert_eq!(state.paired_shares, dec(602, 100));
+        assert_eq!(state.net_yes_shares, Decimal::ZERO);
+        assert_eq!(state.net_no_shares, dec(12440, 100));
+        assert_eq!(state.net_yes_value_usd, Decimal::ZERO);
+        assert_eq!(state.net_no_value_usd, dec(2887324, 100000));
+        assert_eq!(state.value_usd, -dec(2887324, 100000));
         assert_eq!(state.side, InventorySide::LongNo);
-        assert!(state.is_overweight);
+        assert!(!state.is_overweight);
     }
 
     #[test]
-    fn inventory_state_is_flat_when_yes_and_no_values_match() {
+    fn inventory_state_is_flat_when_no_shares_are_held() {
         let state = compute_inventory_state(
-            Decimal::from(100u32),
-            Decimal::from(50u32),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            dec(7, 10),
             dec(3, 10),
-            dec(6, 10),
             Decimal::from(100u32),
             dec(7, 10),
         );
 
-        assert_eq!(state.yes_value_usd, Decimal::from(30u32));
-        assert_eq!(state.no_value_usd, Decimal::from(30u32));
+        assert_eq!(state.paired_shares, Decimal::ZERO);
+        assert_eq!(state.net_yes_shares, Decimal::ZERO);
+        assert_eq!(state.net_no_shares, Decimal::ZERO);
         assert_eq!(state.value_usd, Decimal::ZERO);
         assert_eq!(state.ratio, Decimal::ZERO);
         assert_eq!(state.side, InventorySide::Flat);
         assert!(!state.is_overweight);
+    }
+
+    #[test]
+    fn target_quotes_both_sides_when_yes_no_shares_are_fully_paired_even_with_unequal_prices() {
+        let rule = market_maker_rule();
+        let config = MarketMakerStrategyConfig::default();
+        let inventory = compute_inventory_state(
+            Decimal::from(100u32),
+            Decimal::from(100u32),
+            dec(9, 10),
+            dec(1, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        let targets = target_buy_quote_intents(&rule, dec(9, 10), dec(1, 10), &inventory, &config);
+
+        assert_eq!(inventory.side, InventorySide::Flat);
+        assert_eq!(inventory.ratio, Decimal::ZERO);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.token_side)
+                .collect::<Vec<_>>(),
+            vec![
+                TargetTokenSide::Yes,
+                TargetTokenSide::Yes,
+                TargetTokenSide::Yes,
+                TargetTokenSide::No,
+                TargetTokenSide::No,
+                TargetTokenSide::No,
+            ]
+        );
+        assert!(targets.iter().any(|intent| intent.token_id == "yes-token"));
+        assert!(targets.iter().any(|intent| intent.token_id == "no-token"));
+    }
+
+    #[test]
+    fn target_quotes_only_no_when_net_yes_shares_remain_after_pairing() {
+        let rule = market_maker_rule();
+        let config = MarketMakerStrategyConfig::default();
+        let inventory = compute_inventory_state(
+            Decimal::from(120u32),
+            Decimal::from(100u32),
+            dec(6, 10),
+            dec(4, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        let targets = target_buy_quote_intents(&rule, dec(6, 10), dec(4, 10), &inventory, &config);
+
+        assert_eq!(inventory.side, InventorySide::LongYes);
+        assert_eq!(inventory.net_yes_shares, Decimal::from(20u32));
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.token_side)
+                .collect::<Vec<_>>(),
+            vec![
+                TargetTokenSide::No,
+                TargetTokenSide::No,
+                TargetTokenSide::No
+            ]
+        );
+        assert!(targets.iter().all(|intent| intent.token_id == "no-token"));
+    }
+
+    #[test]
+    fn target_quotes_only_yes_when_net_no_shares_remain_after_pairing() {
+        let rule = market_maker_rule();
+        let config = MarketMakerStrategyConfig::default();
+        let inventory = compute_inventory_state(
+            Decimal::from(100u32),
+            Decimal::from(120u32),
+            dec(6, 10),
+            dec(4, 10),
+            Decimal::from(100u32),
+            dec(7, 10),
+        );
+
+        let targets = target_buy_quote_intents(&rule, dec(6, 10), dec(4, 10), &inventory, &config);
+
+        assert_eq!(inventory.side, InventorySide::LongNo);
+        assert_eq!(inventory.net_no_shares, Decimal::from(20u32));
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.token_side)
+                .collect::<Vec<_>>(),
+            vec![
+                TargetTokenSide::Yes,
+                TargetTokenSide::Yes,
+                TargetTokenSide::Yes
+            ]
+        );
+        assert!(targets.iter().all(|intent| intent.token_id == "yes-token"));
+    }
+
+    #[test]
+    fn target_quotes_rebalance_high_price_side_by_share_gap() {
+        let rule = market_maker_rule();
+        let config = MarketMakerStrategyConfig {
+            default_max_spread: Decimal::ZERO,
+            max_skew: Decimal::ZERO,
+            overweight_ratio: Decimal::ONE,
+            ..Default::default()
+        };
+        let inventory = compute_inventory_state(
+            Decimal::ZERO,
+            Decimal::from(1000u32),
+            dec(9, 10),
+            dec(1, 10),
+            Decimal::from(1000u32),
+            Decimal::ONE,
+        );
+
+        let targets = target_buy_quote_intents(&rule, dec(9, 10), dec(1, 10), &inventory, &config);
+
+        assert_eq!(inventory.side, InventorySide::LongNo);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.token_side)
+                .collect::<Vec<_>>(),
+            vec![
+                TargetTokenSide::Yes,
+                TargetTokenSide::Yes,
+                TargetTokenSide::Yes
+            ]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.size)
+                .collect::<Vec<_>>(),
+            vec![dec(22222, 100), Decimal::from(150u32), Decimal::from(50u32)]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.size_usd)
+                .collect::<Vec<_>>(),
+            vec![
+                Decimal::from(200u32),
+                Decimal::from(135u32),
+                Decimal::from(45u32)
+            ]
+        );
+    }
+
+    #[test]
+    fn target_quotes_rebalance_low_price_side_without_overshooting_share_gap() {
+        let rule = market_maker_rule();
+        let config = MarketMakerStrategyConfig {
+            default_max_spread: Decimal::ZERO,
+            max_skew: Decimal::ZERO,
+            overweight_ratio: Decimal::ONE,
+            ..Default::default()
+        };
+        let inventory = compute_inventory_state(
+            Decimal::from(1000u32),
+            Decimal::ZERO,
+            dec(9, 10),
+            dec(1, 10),
+            Decimal::from(10000u32),
+            Decimal::ONE,
+        );
+
+        let targets = target_buy_quote_intents(&rule, dec(9, 10), dec(1, 10), &inventory, &config);
+
+        assert_eq!(inventory.side, InventorySide::LongYes);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.token_side)
+                .collect::<Vec<_>>(),
+            vec![
+                TargetTokenSide::No,
+                TargetTokenSide::No,
+                TargetTokenSide::No
+            ]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.size)
+                .collect::<Vec<_>>(),
+            vec![
+                Decimal::from(300u32),
+                Decimal::from(150u32),
+                Decimal::from(50u32)
+            ]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|intent| intent.quote.size_usd)
+                .collect::<Vec<_>>(),
+            vec![
+                Decimal::from(30u32),
+                Decimal::from(15u32),
+                Decimal::from(5u32)
+            ]
+        );
     }
 
     #[test]
@@ -1810,6 +2299,13 @@ mod tests {
                 Decimal::from(75u32),
                 Decimal::from(100u32),
             ],
+            rebalance_level_share_ratios: vec![dec(30, 100), dec(15, 100), dec(5, 100)],
+            rebalance_max_usd_per_level: vec![
+                Decimal::from(200u32),
+                Decimal::from(150u32),
+                Decimal::from(100u32),
+            ],
+            rebalance_max_usd_per_cycle: Decimal::from(450u32),
         };
         let max_skew = dec(1, 100);
         let yes_fair_mid = dec(5, 10);
@@ -1965,16 +2461,27 @@ mod tests {
             };
 
             println!(
-                "\n场景: {}\n  YES价值 = {} * {} = {} USD\n  NO价值  = {} * {} = {} USD\n  净库存价值 = {} - {} = {} USD\n  原始偏斜比例 = {} / {} = {}\n  截断后偏斜比例 = {}\n  方向 = {:?}\n  是否超重 = {} (阈值: {})",
+                "\n场景: {}\n  配对shares = min({}, {}) = {}\n  净YES shares = {}\n  净NO shares = {}\n  YES总价值 = {} * {} = {} USD\n  NO总价值  = {} * {} = {} USD\n  净YES价值 = {} * {} = {} USD\n  净NO价值  = {} * {} = {} USD\n  净库存价值 = {} - {} = {} USD\n  原始偏斜比例 = {} / {} = {}\n  截断后偏斜比例 = {}\n  方向 = {:?}\n  是否超重 = {} (阈值: {})",
                 case.name,
                 case.yes_balance,
+                case.no_balance,
+                state.paired_shares,
+                state.net_yes_shares,
+                state.net_no_shares,
+                case.yes_balance,
                 case.yes_fair_mid,
-                state.yes_value_usd,
+                state.yes_gross_value_usd,
                 case.no_balance,
                 case.no_fair_mid,
-                state.no_value_usd,
-                state.yes_value_usd,
-                state.no_value_usd,
+                state.no_gross_value_usd,
+                state.net_yes_shares,
+                case.yes_fair_mid,
+                state.net_yes_value_usd,
+                state.net_no_shares,
+                case.no_fair_mid,
+                state.net_no_value_usd,
+                state.net_yes_value_usd,
+                state.net_no_value_usd,
                 state.value_usd,
                 state.value_usd,
                 max_inventory_usd,
